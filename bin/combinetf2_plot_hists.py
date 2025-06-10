@@ -775,16 +775,12 @@ def make_plot(
         text_pieces.extend(selection)
 
     if chi2[0] is not None and data:
-        p_val = int(round(scipy.stats.chi2.sf(chi2[0], chi2[1]) * 100))
+        p_val = round(scipy.stats.chi2.sf(chi2[0], chi2[1]) * 100, 2)
         if saturated_chi2:
             chi2_name = r"$\mathit{\chi}_{\mathrm{sat.}}^2/\mathit{ndf}$"
         else:
             chi2_name = r"$\mathit{\chi}^2/\mathit{ndf}$"
 
-        # chi2_text = [
-        #     chi2_name,
-        #     rf"$= {round(chi2[0],1)}/{chi2[1]}\ (\mathit{{p}}={p_val}\%)$",
-        # ]
         chi2_text = [
             rf"{chi2_name} = ${round(chi2[0],1)}/{chi2[1]}$",
             rf"$(\mathit{{p}}={p_val}\%)$",
@@ -1068,13 +1064,13 @@ def make_plots(
         )
 
 
-def get_chi2(result, no_chi2=True, fittype="postfit"):
-    if fittype == "postfit" and result.get("postfit_profile", False) and not no_chi2:
+def get_chi2(result, fitresult, no_chi2=True, fittype="postfit"):
+    if fittype == "postfit" and not no_chi2:
         # use saturated likelihood test if relevant
-        nllvalfull = result["nllvalfull"]
-        satnllvalfull = result["satnllvalfull"]
+        nllvalfull = fitresult["nllvalfull"]
+        satnllvalfull = fitresult["satnllvalfull"]
         chi2 = 2.0 * (nllvalfull - satnllvalfull)
-        ndf = result["ndfsat"]
+        ndf = fitresult["ndfsat"]
         return chi2, ndf, True
     elif f"chi2_{fittype}" in result and not no_chi2:
         return result[f"chi2_{fittype}"], result[f"ndf_{fittype}"], False
@@ -1132,7 +1128,7 @@ def main():
         proc_colors = getattr(config, "process_colors", {})
         colors = [proc_colors.get(p, cmap(i % cmap.N)) for i, p in enumerate(procs)]
 
-    outdir = output_tools.make_plot_dir(args.outpath, eoscp=args.eoscp)
+    outdir = output_tools.make_plot_dir("/".join(args.outpath.split("/")[:-1]), eoscp=args.eoscp)
 
     opts = dict(
         args=args,
@@ -1165,7 +1161,7 @@ def main():
 
             instance = results[instance_key]
 
-            chi2, ndf, saturated_chi2 = get_chi2(instance, args.noChisq, fittype)
+            chi2, ndf, saturated_chi2 = get_chi2(instance, fitresult, args.noChisq, fittype)
 
             for channel, result in instance["channels"].items():
                 logger.info(f"Make plot for {instance_key} in channel {channel}")
@@ -1184,7 +1180,10 @@ def main():
                 )
 
     if output_tools.is_eosuser_path(args.outpath) and args.eoscp:
-        output_tools.copy_to_eos(outdir, args.outpath, args.outfolder)
+        folders = args.outpath.split("/")
+        if len(folders) > 1:
+            folders = "/".join(folders[:-1]), folders[-1]
+        output_tools.copy_to_eos(outdir, *folders)
 
 
 if __name__ == "__main__":
