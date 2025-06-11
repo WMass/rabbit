@@ -118,8 +118,8 @@ def plotImpacts(
 
     ndisplay = len(df)
     fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(100%,100%,100%,100%)",
+        plot_bgcolor="rgba(100%,100%,100%,100%)",
         xaxis_title=impact_title if impacts else "Pull",
         margin=dict(l=loffset, r=20, t=50, b=20),
         yaxis=dict(range=[-1, ndisplay]),
@@ -468,8 +468,18 @@ def readFitInfoFromFile(
         else:
             pulls, pulls_prefit, constraints, constraints_prefit, impacts, labels = out
             if normalize:
-                idx = np.argwhere(labels == poi)
-                impacts /= impacts[idx].flatten()
+                imp, lab = io_tools.read_impacts_poi(
+                    fitresult,
+                    poi,
+                    True,
+                    pulls=False,
+                    asym=asym,
+                    global_impacts=global_impacts,
+                    add_total=True,
+                )
+
+                idx = np.argwhere(lab == "Total")
+                impacts /= imp[idx].flatten()
 
         if stat > 0 and "stat" in labels:
             idx = np.argwhere(labels == "stat")
@@ -887,7 +897,10 @@ def make_plots(
     outfile = os.path.join(outdir, outfile)
     extensions = [outfile.split(".")[-1], *args.otherExtensions]
 
-    include_ref = "impact_ref" in df.keys() or "constraint_ref" in df.keys()
+    include_ref = any(
+        x in df.keys()
+        for x in ["impact_ref", "absimpact_ref", "pull_ref", "constraint_ref"]
+    )
 
     kwargs = dict(
         pulls=not args.noPulls and not group,
@@ -932,7 +945,6 @@ def load_dataframe_parms(
     grouping=None,
     translate_label={},
 ):
-    poi_type = poi.split("_")[-1] if poi else None
 
     if not group:
         df = readFitInfoFromFile(
@@ -1159,11 +1171,13 @@ def main():
     translate_label = getattr(config, "impact_labels", {})
 
     fitresult, meta = io_tools.get_fitresult(args.inputFile, args.result, meta=True)
-    fitresult_ref = (
-        io_tools.get_fitresult(args.referenceFile, args.refResult)
-        if args.referenceFile
-        else None
-    )
+    if args.referenceFile is not None or args.refResult is not None:
+        referenceFile = (
+            args.referenceFile if args.referenceFile is not None else args.inputFile
+        )
+        fitresult_ref = io_tools.get_fitresult(referenceFile, args.refResult)
+    else:
+        fitresult_ref = None
 
     meta_out = {
         "combinetf2": meta["meta_info"],

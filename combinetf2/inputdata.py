@@ -1,6 +1,7 @@
 import h5py
 import hist
 import numpy as np
+import tensorflow as tf
 
 from combinetf2.h5pyutils import makesparsetensor, maketensor
 
@@ -50,9 +51,6 @@ class FitInputData:
                 self.data_obs = data_obs[:, pseudodata_idx]
             else:
                 self.data_obs = maketensor(f["hdata_obs"])
-
-            hkstat = f["hkstat"]
-            self.kstat = maketensor(hkstat)
 
             # start by creating tensors which read in the hdf5 arrays (optimized for memory consumption)
             self.constraintweights = maketensor(f["hconstraintweights"])
@@ -125,6 +123,18 @@ class FitInputData:
 
             self.systematic_type = self.metadata.get("systematic_type", "log_normal")
 
+            if "hsumw2" in f.keys():
+                self.sumw = maketensor(f["hsumw"])
+                self.sumw2 = maketensor(f["hsumw2"])
+            else:
+                # fallback for older datacards
+                kstat = maketensor(f["hkstat"])
+
+                self.sumw = self.expected_events_nominal()
+                self.sumw2 = self.sumw**2 / kstat
+
+                self.sumw2 = tf.where(kstat == 0.0, self.sumw, self.sumw2)
+
             # compute indices for channels
             ibin = 0
             for channel, info in self.channel_info.items():
@@ -144,3 +154,17 @@ class FitInputData:
                 print(channel, info)
 
             self.axis_procs = hist.axis.StrCategory(self.procs, name="processes")
+
+    @tf.function
+    def expected_events_nominal(self):
+        rnorm = tf.ones(self.nproc, dtype=self.dtype)
+        mrnorm = tf.expand_dims(rnorm, -1)
+
+        if self.sparse:
+            nexpfullcentral = tf.sparse.sparse_dense_matmul(self.norm, mrnorm)
+            nexpfullcentral = tf.squeeze(nexpfullcentral, -1)
+        else:
+            nexpfullcentral = tf.matmul(self.norm, mrnorm)
+            nexpfullcentral = tf.squeeze(nexpfullcentral, -1)
+
+        return nexpfullcentral

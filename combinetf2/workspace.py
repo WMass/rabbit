@@ -18,7 +18,7 @@ def getImpactsAxes(indata):
 
 
 def getGlobalImpactsAxes(indata):
-    impact_names = list(indata.systs.astype(str)[indata.nsystnoconstraint :])
+    impact_names = list(indata.systs.astype(str))
     return hist.axis.StrCategory(impact_names, name="impacts")
 
 
@@ -33,12 +33,12 @@ def getImpactsAxesGrouped(indata, bin_by_bin_stat=False):
 
 
 def get_name_label_expected_hists(
-    name=None, label=None, prefit=False, variations=False, process_axis=None
+    name=None, label=None, prefit=False, variations=False, process_axis=False
 ):
     if name is None:
         name = "hist"
         name += "_prefit" if prefit else "_postfit"
-        if process_axis is None:
+        if process_axis is False:
             name += "_inclusive"
         if variations:
             name += "_variations"
@@ -46,7 +46,7 @@ def get_name_label_expected_hists(
     if label is None:
         label = "expected number of events, "
         label = f"prefit {label}" if prefit else f"postfit {label}"
-        if process_axis is None:
+        if process_axis is False:
             label += "for all processes combined, "
         if variations:
             label += "with variations, "
@@ -195,7 +195,6 @@ class Workspace:
                 model_key=model.key,
                 channel=channel,
             )
-
             self.add_hist(
                 "hist_data_obs",
                 axes,
@@ -332,7 +331,7 @@ class Workspace:
         cov=None,
         impacts=None,
         impacts_grouped=None,
-        process_axis=None,
+        process_axis=False,
         name=None,
         label=None,
         variations=False,
@@ -350,6 +349,7 @@ class Workspace:
 
         for channel, info in model.channel_info.items():
             axes = info["axes"]
+
             opts = dict(
                 start=info.get("start", None),
                 stop=info.get("stop", None),
@@ -358,7 +358,7 @@ class Workspace:
                 channel=channel,
             )
 
-            hist_axes = axes.copy()
+            hist_axes = [a for a in axes]
 
             if len(hist_axes) == 0:
                 hist_axes = [
@@ -366,10 +366,11 @@ class Workspace:
                         0, 1, name="yield", overflow=False, underflow=False
                     )
                 ]
-                axes_names = ["yield"]
 
-            if process_axis is not None:
-                hist_axes.append(process_axis)
+            if process_axis:
+                hist_axes.append(
+                    hist.axis.StrCategory(info["processes"], name="processes")
+                )
 
             self.add_hist(
                 name,

@@ -137,7 +137,7 @@ jobs:
           python tests/make_tensor.py -o $COMBINETF2_OUTDIR/ --sparse --postfix sparse
 
       - name: debug input
-        run: debug_inutdata.py $COMBINETF2_OUTDIR//test_tensor.hdf5
+        run: debug_inputdata.py $COMBINETF2_OUTDIR//test_tensor.hdf5
 
       - name: plot input
         run: >-
@@ -168,40 +168,52 @@ jobs:
       - name: nominal fit
         run: >- 
           combinetf2_fit.py $COMBINETF2_OUTDIR/test_tensor.hdf5 -o $COMBINETF2_OUTDIR/
-          -t 0 --doImpacts --globalImpacts
-          --saveHists --saveHistsPerProcess --computeHistErrors --computeHistCov --computeHistImpacts --computeVariations
+          -t 0 --unblind '.*' --doImpacts --globalImpacts
+          --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
+          --computeHistCov --computeHistImpacts --computeVariations
+          -m Basemodel
+          -m Select ch0 'x:rebin(-5,-2,2,5)'
           -m Project ch1 a 
           -m Project ch1 b 
           -m Project ch0_masked 
           -m Normalize ch0 x
           -m Ratio ch0 ch0 sig sig,bkg
-          -m Ratio ch0 ch1 'None:None' 'b:slice(0,2)'
-          -m Ratio ch0 ch1 'x:slice(None,None,2)' 'a:slice(None),b:slice(None)'
-          -m Normratio ch1 ch1 sig sig,bkg 'b:slice(None)' 'b:2'
+          -m Ratio ch0 ch1 'None:None' 'b:slice(0,2),b:sum'
+          -m Ratio ch0 ch1 'x:slice(None,None,2),x:sum' 'a:sum,b:sum'
+          -m Normratio ch1 ch1 sig sig,bkg 'b:sum' 'b:2'
           -m tests.param_model.Param 'slope_signal' 1 0
+
+      - name: nominal fit blinded
+        run: >- 
+          combinetf2_fit.py $COMBINETF2_OUTDIR/test_tensor.hdf5 -o $COMBINETF2_OUTDIR/
+          -t 0 --postfix blinded --doImpacts --globalImpacts
 
       - name: sparse tensor fit 
         run: >- 
           combinetf2_fit.py $COMBINETF2_OUTDIR/test_tensor_sparse.hdf5 -o $COMBINETF2_OUTDIR/ --postfix sparse
           -t -0 --noBinByBinStat --doImpacts --globalImpacts --computeVariations
-          --saveHists --saveHistsPerProcess --computeHistErrors -m Project ch1 a -m Project ch1 b 
+          --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
+          -m Project ch1 a -m Project ch1 b
 
       - name: pseudodata fit
         run: >- 
           combinetf2_fit.py $COMBINETF2_OUTDIR/test_tensor.hdf5 -o $COMBINETF2_OUTDIR/ --postfix pseudodata
-          -t 0 --pseudoData original --doImpacts --globalImpacts
+          -t 0 --pseudoData original --doImpacts --globalImpacts --unblind ^sig$
 
       - name: chi2 fit
         run: >- 
           combinetf2_fit.py $COMBINETF2_OUTDIR/test_tensor.hdf5 -o $COMBINETF2_OUTDIR/ --postfix chi2
-          -t 0 --chisqFit --externalCovariance --doImpacts --globalImpacts 
-          --saveHists --saveHistsPerProcess --computeHistErrors -m Project ch1 a -m Project ch1 b 
+          -t 0 --unblind '.*' --chisqFit --externalCovariance --doImpacts --globalImpacts 
+          --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
+          -m Project ch1 a -m Project ch1 b
+
 
       - name: linearized solution
         run: >- 
           combinetf2_fit.py $COMBINETF2_OUTDIR/test_tensor_symmetric.hdf5 -o $COMBINETF2_OUTDIR/ --postfix linearized
           -t 0 --chisqFit --doImpacts --globalImpacts --binByBinStatType normal --allowNegativePOI
-          --saveHists --saveHistsPerProcess --computeHistErrors --computeHistImpacts --computeHistCov -m Project ch1 a -m Project ch1 b 
+          --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
+          --computeHistImpacts --computeHistCov -m Project ch1 a -m Project ch1 b 
 
 
   plotting:
@@ -223,6 +235,9 @@ jobs:
           echo "PLOT_DIR=${PLOT_DIR}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v4
+
+      - name: print pulls & constraints blinded
+        run: combinetf2_print_pulls_and_constraints.py $COMBINETF2_OUTDIR/fitresults_blinded.hdf5 
 
       - name: print pulls & constraints
         run: combinetf2_print_pulls_and_constraints.py $COMBINETF2_OUTDIR/fitresults.hdf5 

@@ -42,6 +42,9 @@ def parseArgs():
         "--processes", type=str, nargs="*", default=[], help="Select processes"
     )
     parser.add_argument(
+        "--channels", type=str, nargs="*", default=None, help="Select channels"
+    )
+    parser.add_argument(
         "--splitByProcess",
         action="store_true",
         help="Make a separate plot for each of the selected processes",
@@ -68,7 +71,13 @@ def parseArgs():
         help="List of hists to plot; dash separated for unrolled hists",
     )
     parser.add_argument(
-        "--normToData", action="store_true", help="Normalize MC to data"
+        "--normToData", action="store_true", help="Normalize MC to data", default=False
+    )
+    parser.add_argument(
+        "--pseudodata",
+        type=str,
+        default=None,
+        help="Pseuododata name to plot instead of data.",
     )
     parser.add_argument(
         "--dataName", type=str, default="Data", help="Data name for plot labeling"
@@ -82,7 +91,13 @@ def parseArgs():
     parser.add_argument(
         "--processGrouping", type=str, default=None, help="key for grouping processes"
     )
-
+    parser.add_argument(
+        "--extraTextLoc",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Location in (x,y) for additional text, aligned to upper left",
+    )
     # variations
     parser.add_argument(
         "--varName", type=str, nargs="*", default=[], help="Name of variation hist"
@@ -96,6 +111,11 @@ def parseArgs():
     )
     parser.add_argument(
         "--varColor", type=str, nargs="*", default=[], help="Variation colors"
+    )
+    parser.add_argument(
+        "--oneSidedVariations",
+        action="store_true",
+        help="Plot variations one sided",
     )
     parser.add_argument(
         "-v",
@@ -225,7 +245,19 @@ def parseArgs():
     return args
 
 
-def make_plots(args, config, outdir, indata, hists_proc, hist_data, *opts, **info):
+def make_plots(
+    args,
+    config,
+    outdir,
+    indata,
+    hists_proc,
+    hist_data,
+    *opts,
+    labels=None,
+    colors=None,
+    procs=None,
+    **info,
+):
     # make full unrollsed plot and lower dimensional projections
 
     all_axes_names = [n for n in hists_proc[0].axes.name]
@@ -236,7 +268,7 @@ def make_plots(args, config, outdir, indata, hists_proc, hist_data, *opts, **inf
     axes_combinations = all_axes_names[:]
     # make lower dimensional combinations of axes
     for n in range(2, len(all_axes_names) + 1):
-        axes_combinations += [k for k in itertools.combinations(axes_combinations, n)]
+        axes_combinations += [k for k in itertools.combinations(all_axes_names, n)]
 
     for axes_names in axes_combinations:
         if isinstance(axes_names, str):
@@ -248,17 +280,42 @@ def make_plots(args, config, outdir, indata, hists_proc, hist_data, *opts, **inf
 
         logger.info(f"Make plot(s) with axes {axes_names}")
 
-        make_plot(
-            args,
-            config,
-            outdir,
-            indata,
-            hists_proc,
-            hist_data,
-            axes_names=axes_names,
-            *opts,
-            **info,
-        )
+        if args.splitByProcess:
+
+            for i, hp in enumerate(hists_proc):
+                if (hp.values() != 0).sum() == 0:
+                    # skip processes with all 0
+                    continue
+
+                make_plot(
+                    args,
+                    config,
+                    outdir,
+                    indata,
+                    [hp],
+                    hist_data,
+                    axes_names=axes_names,
+                    *opts,
+                    labels=labels[i],
+                    colors=colors[i],
+                    procs=procs[i],
+                    **info,
+                )
+        else:
+            make_plot(
+                args,
+                config,
+                outdir,
+                indata,
+                hists_proc,
+                hist_data,
+                axes_names=axes_names,
+                *opts,
+                labels=labels,
+                colors=colors,
+                procs=procs,
+                **info,
+            )
 
 
 def make_plot(
@@ -283,10 +340,10 @@ def make_plot(
     colors_syst=None,
     labels_syst=None,
 ):
-    # if args.processGrouping is not None:
-    #     hists_proc, labels, colors, procs = styles.process_grouping(
-    #         args.processGrouping, hists_proc, procs
-    #     )
+    if args.processGrouping is not None:
+        hists_proc, labels, colors, procs = config.process_grouping(
+            args.processGrouping, hists_proc, procs
+        )
 
     if any(x in axes_names for x in ["ptll", "mll", "ptVgen", "ptVGen"]):
         # in case of variable bin width normalize to unit
@@ -411,27 +468,33 @@ def make_plot(
                 zorder=1,
                 flow="none",
             )
-            hep.histplot(
-                hdn,
-                xerr=False,
-                yerr=False,
-                histtype="step",
-                color=color,
-                linestyle="--",
-                binwnorm=binwnorm,
-                ax=ax1,
-                zorder=1,
-                flow="none",
-            )
-
-            if not args.noRatio:
+            if not args.oneSidedVariations:
                 hep.histplot(
-                    [hh.divideHists(hup, h_pred), hh.divideHists(hdn, h_pred)],
+                    hdn,
                     xerr=False,
                     yerr=False,
                     histtype="step",
                     color=color,
-                    linestyle=["-", "--"],
+                    linestyle="--",
+                    binwnorm=binwnorm,
+                    ax=ax1,
+                    zorder=1,
+                    flow="none",
+                )
+
+            if not args.noRatio:
+                h_ratios = (
+                    [hh.divideHists(hup, h_pred)]
+                    if args.oneSidedVariations
+                    else [hh.divideHists(hup, h_pred), hh.divideHists(hdn, h_pred)]
+                )
+                hep.histplot(
+                    h_ratios,
+                    xerr=False,
+                    yerr=False,
+                    histtype="step",
+                    color=color,
+                    linestyle=["-", "--"][: len(h_ratios)],
                     ax=ax2,
                     linewidth=2,
                     flow="none",
@@ -469,25 +532,28 @@ def make_plot(
         scale = max(1, np.divide(*ax1.get_figure().get_size_inches()) * 0.3)
 
         if selections is not None:
+            text = []
             for i, (key, idx) in enumerate(selections.items()):
                 lo, hi = selection_edges[i]
                 if key == "charge":
                     label = f"charge = {'-1' if hi==0 else '+1'}"
                 else:
-                    label = plot_tools.get_axis_label(config, key, key)
+                    label = plot_tools.get_axis_label(config, key, with_unit=False)
                     if lo != None:
                         label = f"{lo} < {label}"
                     if hi != None:
                         label = f"{label} < {hi}"
+                text.append(label)
 
-                plot_tools.wrap_text(
-                    [label],
-                    ax1,
-                    0.05,
-                    0.96 - i * 0.08,
-                    ha="left",
-                    text_size="small",
-                )
+            plot_tools.wrap_text(
+                text,
+                ax1,
+                # 0.05,
+                *args.extraTextLoc,
+                # 0.96 - i * 0.08,
+                ha="left",
+                text_size="small",
+            )
 
         if not args.noRatio:
             plot_tools.fix_axes(ax1, ax2, fig, yscale=args.yscale, noSci=args.noSciy)
@@ -534,7 +600,7 @@ def main():
     global logger
     logger = logging.setup_logger(__file__, args.verbose, args.noColorLogger)
 
-    indata = inputdata.FitInputData(args.infile)
+    indata = inputdata.FitInputData(args.infile, pseudodata=args.pseudodata)
 
     debug = debugdata.FitDebugData(indata)
 
@@ -554,9 +620,14 @@ def main():
         colors_syst.append(color if color is not None else "black")
         labels_syst.append(label if label is not None else syst_labels.get(syst, syst))
 
+    if args.oneSidedVariations:
+        labels_syst = [l.replace(r"\pm", "+") for l in labels_syst]
+
     outdir = output_tools.make_plot_dir(args.outpath, eoscp=args.eoscp)
 
-    for channel, channel_info in indata.channel_info.items():
+    for channel in indata.channel_info.keys():
+        if args.channels is not None and channel not in args.channels:
+            continue
         logger.info(f"Make plots for channel: {channel}")
 
         hist_proc = debug.nominal_hists[channel]
@@ -610,9 +681,6 @@ def main():
 
         info = dict(
             channel=channel,
-            labels=labels,
-            colors=colors,
-            procs=procs,
             systematics=systematics,
             colors_syst=colors_syst,
             labels_syst=labels_syst,
@@ -664,6 +732,9 @@ def main():
                     hs_syst_up,
                     selections=idxs,
                     selection_edges=selection_edges,
+                    labels=labels,
+                    colors=colors,
+                    procs=procs,
                     **info,
                 )
         else:
@@ -676,11 +747,14 @@ def main():
                 hist_data,
                 hists_syst_dn,
                 hists_syst_up,
+                labels=labels,
+                colors=colors,
+                procs=procs,
                 **info,
             )
 
     if output_tools.is_eosuser_path(args.outpath) and args.eoscp:
-        output_tools.copy_to_eos(outdir, args.outpath, args.outfolder)
+        output_tools.copy_to_eos(outdir, args.outpath)
 
 
 if __name__ == "__main__":

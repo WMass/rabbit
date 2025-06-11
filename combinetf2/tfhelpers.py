@@ -95,6 +95,26 @@ def edmval(grad, hess):
 
 def cond_number(hess):
     if is_on_gpu(hess):
-        tf.linalg.cond(hess)
+        return tf.linalg.cond(hess)
     else:
-        scipy_cond_number(hess.__array__())
+        return scipy_cond_number(hess.__array__())
+
+
+def segment_sum_along_axis(x, segment_ids, idx, num_segments):
+    # Move the target axis to the front
+    perm = [idx] + [i for i in range(len(x.shape)) if i != idx]
+    x_transposed = tf.transpose(x, perm)
+
+    # Apply segment_sum along axis 0
+    rebinned = tf.math.segment_sum(x_transposed, segment_ids)
+
+    # Update static shape if possible
+    static_shape = rebinned.shape.as_list()
+    static_shape[0] = num_segments
+    rebinned.set_shape(static_shape)
+
+    # Undo the transposition
+    reverse_perm = [perm.index(i) for i in range(len(perm))]
+    rebinned = tf.transpose(rebinned, reverse_perm)
+
+    return rebinned

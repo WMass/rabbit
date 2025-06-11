@@ -249,7 +249,9 @@ def main():
             model_key = " ".join(margs)
             instance_keys = [k for k in results.keys() if k.startswith(model_key)]
             if len(instance_keys) == 0:
-                raise ValueError(f"No model found under {model_key}")
+                raise ValueError(
+                    f"No model found under {model_key}, available models are {results.keys()}"
+                )
 
         for instance_key in instance_keys:
             instance = results[instance_key]
@@ -356,7 +358,7 @@ def main():
                         )
 
     if output_tools.is_eosuser_path(args.outpath) and args.eoscp:
-        output_tools.copy_to_eos(outdir, args.outpath, args.outfolder)
+        output_tools.copy_to_eos(outdir, args.outpath)
 
 
 if __name__ == "__main__":

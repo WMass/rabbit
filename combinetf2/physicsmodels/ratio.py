@@ -43,11 +43,29 @@ class Ratio(PhysicsModel):
         den_processes=[],
         num_selection={},
         den_selection={},
+        num_axes_rebin=[],
+        den_axes_rebin=[],
+        num_axes_sum=[],
+        den_axes_sum=[],
     ):
         self.key = key
 
-        self.num = helpers.Term(indata, num_channel, num_processes, num_selection)
-        self.den = helpers.Term(indata, den_channel, den_processes, den_selection)
+        self.num = helpers.Term(
+            indata,
+            num_channel,
+            num_processes,
+            num_selection,
+            num_axes_rebin,
+            num_axes_sum,
+        )
+        self.den = helpers.Term(
+            indata,
+            den_channel,
+            den_processes,
+            den_selection,
+            den_axes_rebin,
+            den_axes_sum,
+        )
 
         self.has_data = self.num.has_data and self.den.has_data
 
@@ -90,7 +108,7 @@ class Ratio(PhysicsModel):
     def parse_args(cls, indata, *args):
         """
         parsing the input arguments into the ratio constructor, is has to be called as
-        -m ratio
+        -m Ratio
             <ch num> <ch den>
             <proc_num_0>,<proc_num_1>,... <proc_num_0>,<proc_num_1>,...
             <axis_num_0>:<slice_num_0>,<axis_num_1>,<slice_num_1>... <axis_den_0>,<slice_den_0>,<axis_den_1>,<slice_den_1>...
@@ -112,12 +130,15 @@ class Ratio(PhysicsModel):
         # find axis selections
         if any(a for a in args if ":" in a):
             sel_args = [a for a in args if ":" in a]
-
-            axis_selection_num = helpers.parse_axis_selection(sel_args[0])
-            axis_selection_den = helpers.parse_axis_selection(sel_args[1])
         else:
-            axis_selection_num = None
-            axis_selection_den = None
+            sel_args = ["None:None", "None:None"]
+
+        axis_selection_num, axes_rebin_num, axes_sum_num = helpers.parse_axis_selection(
+            sel_args[0]
+        )
+        axis_selection_den, axes_rebin_den, axes_sum_den = helpers.parse_axis_selection(
+            sel_args[1]
+        )
 
         key = " ".join([cls.__name__, *args])
 
@@ -130,6 +151,10 @@ class Ratio(PhysicsModel):
             procs_den,
             axis_selection_num,
             axis_selection_den,
+            axes_rebin_num,
+            axes_rebin_den,
+            axes_sum_num,
+            axes_sum_den,
         )
 
     def compute_flat(self, params, observables):
@@ -139,10 +164,7 @@ class Ratio(PhysicsModel):
         return num / den
 
     def compute_flat_per_process(self, params, observables):
-        num = self.num.select(observables, inclusive=False)
-        den = self.den.select(observables, inclusive=False)
-
-        return num / den
+        return self.compute_flat(params, observables)
 
 
 class Normratio(Ratio):
@@ -160,12 +182,4 @@ class Normratio(Ratio):
         den = self.den.select(observables, normalize=True, inclusive=True)
         exp = num / den
         exp = tf.reshape(exp, [-1])
-        return exp
-
-    def compute_flat_per_process(self, params, observables):
-        num = self.num.select(observables, normalize=True, inclusive=False)
-        den = self.den.select(observables, normalize=True, inclusive=False)
-        exp = num / den
-        flat_shape = (-1, exp.shape[-1])
-        exp = tf.reshape(exp, flat_shape)
         return exp

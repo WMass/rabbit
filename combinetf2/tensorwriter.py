@@ -170,13 +170,14 @@ class TensorWriter:
 
         if hasattr(h, "axes"):
             axes = [a for a in h.axes]
+            channel_axes = self.channels[channel]["axes"]
 
-            if axes != self.channels[channel]["axes"]:
+            if not all(np.allclose(a, axes[i]) for i, a in enumerate(channel_axes)):
                 raise RuntimeError(
                     f"""
-                    Histogram axes different from channel axes of channel {channel}
-                    \nHistogram axes: {axes}
-                    \nChannel axes: {self.channels[channel]["axes"]}
+                    Histogram axes different have different edges from channel axes of channel {channel}
+                    \nHistogram axes: {[a.edges for a in axes]}
+                    \nChannel axes: {[a.edges for a in channel_axes]}
                     """
                 )
         else:
@@ -735,12 +736,6 @@ class TensorWriter:
 
                 ibin += nbinschan
 
-        # compute poisson parameter for Barlow-Beeston bin-by-bin statistical uncertainties
-        kstat = np.square(sumw) / sumw2
-        # numerical protection to avoid poorly defined constraint
-        kstat = np.where(np.equal(sumw, 0.0), 1.0, kstat)
-        kstat = np.where(np.equal(sumw2, 0.0), 1.0, kstat)
-
         if self.data_covariance is None and (
             self.systscovariance or self.add_bin_by_bin_stat_to_data_cov
         ):
@@ -870,9 +865,12 @@ class TensorWriter:
             )
 
         nbytes += h5pyutils.writeFlatInChunks(
-            kstat, f, "hkstat", maxChunkBytes=self.chunkSize
+            sumw, f, "hsumw", maxChunkBytes=self.chunkSize
         )
-        kstat = None
+
+        nbytes += h5pyutils.writeFlatInChunks(
+            sumw2, f, "hsumw2", maxChunkBytes=self.chunkSize
+        )
 
         if self.sparse:
             nbytes += h5pyutils.writeSparse(

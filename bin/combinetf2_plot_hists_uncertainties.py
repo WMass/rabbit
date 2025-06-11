@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import inspect
 import itertools
 import os
 
@@ -19,21 +20,6 @@ from wums import logging, output_tools, plot_tools  # isort: skip
 hep.style.use(hep.style.ROOT)
 
 logger = None
-
-translate_selection = {
-    "charge": r"$\mathit{q}^\mu$ = ",
-    "qGen": r"$\mathit{q}^\mu$ = ",
-}
-translate_selection_value = {
-    "charge": {
-        -1.0: "-1",
-        1.0: "+1",
-    },
-    "qGen": {
-        -1.0: "-1",
-        1.0: "+1",
-    },
-}
 
 
 def parseArgs():
@@ -178,6 +164,13 @@ def parseArgs():
         """,
     )
     parser.add_argument(
+        "--channels",
+        type=str,
+        nargs="*",
+        default=None,
+        help="List of channels to be plotted, default is all",
+    )
+    parser.add_argument(
         "--flterUncertainties",
         type=str,
         nargs="*",
@@ -194,6 +187,7 @@ def parseArgs():
     parser.add_argument(
         "--selectionAxes",
         type=str,
+        nargs="*",
         default=["charge", "passIso", "passMT", "cosThetaStarll", "qGen"],
         help="List of axes where for each bin a separate plot is created",
     )
@@ -280,7 +274,6 @@ def make_plot(
     colors=None,
     labels=None,
     args=None,
-    variation="",
     suffix="",
     meta=None,
     lumi=None,
@@ -292,7 +285,11 @@ def make_plot(
     if args.ylabel is not None:
         ylabel = args.ylabel
     else:
-        ylabel = r"Relative uncertainty in %" if not args.absolute else "Uncertainty"
+        ylabel = (
+            r"Relative uncertainty in %"
+            if not args.absolute
+            else "Absolute uncertainty"
+        )
 
     if len(axes) > 1:
         if args.invertAxes:
@@ -358,12 +355,7 @@ def make_plot(
             flow="none",
         )
 
-    scale = max(1, np.divide(*ax1.get_figure().get_size_inches()) * 0.3)
-
     text_pieces = []
-    if args.absolute:
-        text_pieces.append(" (absolute)")
-
     if selection is not None:
         text_pieces.extend(selection)
 
@@ -381,7 +373,6 @@ def make_plot(
         ax1,
         args.title,
         args.subtitle,
-        data=False,
         lumi=None,
         loc=args.titlePos,
         text_size=args.legSize,
@@ -419,6 +410,7 @@ def make_plot(
 def make_plots(
     outdir,
     result,
+    config,
     args=None,
     channel="",
     lumi=1,
@@ -443,11 +435,13 @@ def make_plots(
         if hist_impacts is not None:
             hist_impacts = hh.divideHists(hist_impacts, hist_total, rel_unc=True)
             hist_impacts = hh.scaleHist(hist_impacts, 100)  # impacts in %
-            hist_total = hh.scaleHist(hist_total, 100)
 
         hist_total = hh.divideHists(hist_total, hist_total, rel_unc=True)
 
     hist_total.values()[...] = hist_total.variances()[...] ** 0.5
+
+    if not args.absolute:
+        hist_total = hh.scaleHist(hist_total, 100)  # impacts in %
 
     if args.flterUncertainties is not None:
         uncertainties = [p for p in uncertainties if p in args.flterUncertainties]
@@ -473,20 +467,36 @@ def make_plots(
                 )
                 for a, i in zip(selection_axes, bins)
             }
+            idxs_edges = {
+                a.name: (
+                    (a.edges[i], a.edges[i + 1])
+                    if isinstance(a, (hist.axis.Regular, hist.axis.Variable))
+                    else a.edges[i]
+                )
+                for a, i in zip(selection_axes, bins)
+            }
 
             h_impacts = hist_impacts[idxs] if hist_impacts else None
             h_total = hist_total[idxs]
 
-            for a, i in idxs_centers.items():
-                print(a, i)
-            selection = [
-                f"{translate_selection[a]}{translate_selection_value[a][i]}"
-                for a, i in idxs_centers.items()
-            ]
+            ts = getattr(config, "translate_selection", {})
+
+            selection = []
+            for a in selection_axes:
+                n = a.name
+                sel = ts.get(n, lambda x: f"{n}={x}")
+
+                nparams = len(inspect.signature(sel).parameters)
+
+                if nparams == 2:
+                    selection.append(sel(*idxs_edges[n]))
+                elif nparams == 1:
+                    selection.append(sel(idxs_centers[n]))
+
             suffix = f"{channel}_" + "_".join(
                 [
                     f"{a}_{str(i).replace('.','p').replace('-','m')}"
-                    for a, i in idxs_centers.items()
+                    for a, i in idxs.items()
                 ]
             )
             logger.info(
@@ -504,6 +514,7 @@ def make_plots(
                 suffix=suffix,
                 selection=selection,
                 lumi=lumi,
+                config=config,
                 *opts,
                 **kwopts,
             )
@@ -519,6 +530,7 @@ def make_plots(
             args=args,
             suffix=channel,
             lumi=lumi,
+            config=config,
             *opts,
             **kwopts,
         )
@@ -564,21 +576,13 @@ def main():
         args.infile, args.result, meta=True
     )
 
-    meta_info = meta["meta_info"]
-
     plt.rcParams["font.size"] = plt.rcParams["font.size"] * args.scaleTextSize
 
     channel_info = meta["meta_info_input"]["channel_info"]
 
-    if args.correlatedVariations:
-        correlated = "_correlated"
-    else:
-        correlated = ""
-
     opts = dict(
         args=args,
         meta=meta,
-        config=config,
     )
 
     results = fitresult["physics_models"]
@@ -596,19 +600,38 @@ def main():
 
             for channel, result in instance["channels"].items():
                 logger.info(f"Make plot for {instance_key} in channel {channel}")
+                if args.channels is not None and channel not in args.channels:
+                    continue
 
                 info = channel_info.get(channel, {})
+
+                suffix = f"{channel}_{instance_key}"
+                if args.correlatedVariations:
+                    suffix += "_correlated"
+                for sign, rpl in [
+                    (" ", "_"),
+                    (".", "p"),
+                    ("-", "m"),
+                    (":", ""),
+                    (",", ""),
+                    ("slice(None)", ""),
+                    ("(", ""),
+                    (")", ""),
+                    (":", ""),
+                ]:
+                    suffix = suffix.replace(sign, rpl)
 
                 make_plots(
                     outdir,
                     result,
-                    channel=channel,
+                    config,
+                    channel=suffix,
                     lumi=info.get("lumi", None),
                     **opts,
                 )
 
     if output_tools.is_eosuser_path(args.outpath) and args.eoscp:
-        output_tools.copy_to_eos(outdir, args.outpath, args.outfolder)
+        output_tools.copy_to_eos(outdir, args.outpath)
 
 
 if __name__ == "__main__":

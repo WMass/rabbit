@@ -166,6 +166,12 @@ def make_parser():
         help="use prefit uncertainty to define scan range",
     )
     parser.add_argument(
+        "--noHessian",
+        default=False,
+        action="store_true",
+        help="Don't compute the hessian of parameters",
+    )
+    parser.add_argument(
         "--saveHists",
         default=False,
         action="store_true",
@@ -181,7 +187,13 @@ def make_parser():
         "--computeHistErrors",
         default=False,
         action="store_true",
-        help="propagate uncertainties to prefit and postfit histograms",
+        help="propagate uncertainties to inclusive prefit and postfit histograms",
+    )
+    parser.add_argument(
+        "--computeHistErrorsPerProcess",
+        default=False,
+        action="store_true",
+        help="propagate uncertainties to prefit and postfit histograms for each process",
     )
     parser.add_argument(
         "--computeHistCov",
@@ -242,7 +254,7 @@ def make_parser():
         "--physicsModel",
         nargs="+",
         action="append",
-        default=[["Basemodel"]],
+        default=[],
         help="""
         add physics model to perform transformations on observables for the prefit and postfit histograms, 
         specifying the model defined in combinetf2/physicsmodels/ followed by arguments passed in the model __init__, 
@@ -280,6 +292,13 @@ def make_parser():
         default=0.0,
         type=float,
         help="Assumed prefit uncertainty for unconstrained nuisances",
+    )
+    parser.add_argument(
+        "--unblind",
+        type=str,
+        default=[],
+        nargs="*",
+        help="Specify list of regex to unblind matching parameters of interest. E.g. use '^signal$' to unblind a parameter named signal or '.*' to unblind all.",
     )
 
     return parser.parse_args()
@@ -338,7 +357,7 @@ def save_hists(args, models, fitter, ws, prefit=True, profile=False):
             exp, aux = fitter.expected_events(
                 model,
                 inclusive=False,
-                compute_variance=args.computeHistErrors,
+                compute_variance=args.computeHistErrorsPerProcess,
                 profile=profile,
             )
 
@@ -346,7 +365,7 @@ def save_hists(args, models, fitter, ws, prefit=True, profile=False):
                 model,
                 exp,
                 var=aux[0],
-                process_axis=fitter.indata.axis_procs,
+                process_axis=True,
                 prefit=prefit,
             )
 
@@ -415,23 +434,34 @@ def fit(args, fitter, ws, dofit=True):
 
         # compute the covariance matrix and estimated distance to minimum
 
-        val, grad, hess = fitter.loss_val_grad_hess()
+        if not args.noHessian:
 
-        edmval, cov = edmval_cov(grad, hess)
+            val, grad, hess = fitter.loss_val_grad_hess()
 
-        logger.info(f"edmval: {edmval}")
+            edmval, cov = edmval_cov(grad, hess)
 
-        fitter.cov.assign(cov)
+            logger.info(f"edmval: {edmval}")
 
-        del cov
+            fitter.cov.assign(cov)
 
-        if args.doImpacts:
-            ws.add_impacts_hists(*fitter.impacts_parms(hess))
+            del cov
 
-        del hess
+            if fitter.binByBinStat and fitter.diagnostics:
+                # This is the estimated distance to minimum with respect to variations of
+                # the implicit binByBinStat nuisances beta at fixed parameter values.
+                # It should be near-zero by construction as long as the analytic profiling is
+                # correct
+                _, gradbeta, hessbeta = fitter.loss_val_grad_hess_beta()
+                edmvalbeta, covbeta = edmval_cov(gradbeta, hessbeta)
+                logger.info(f"edmvalbeta: {edmvalbeta}")
 
-        if args.globalImpacts:
-            ws.add_global_impacts_hists(*fitter.global_impacts_parms())
+            if args.doImpacts:
+                ws.add_impacts_hists(*fitter.impacts_parms(hess))
+
+            del hess
+
+            if args.globalImpacts:
+                ws.add_global_impacts_hists(*fitter.global_impacts_parms())
 
     nllvalfull = fitter.full_nll().numpy()
     satnllvalfull, ndfsat = fitter.saturated_nll()
@@ -451,11 +481,12 @@ def fit(args, fitter, ws, dofit=True):
 
     ws.add_parms_hist(
         values=fitter.x,
-        variances=tf.linalg.diag_part(fitter.cov),
+        variances=tf.linalg.diag_part(fitter.cov) if not args.noHessian else None,
         hist_name="parms",
     )
 
-    ws.add_cov_hist(fitter.cov)
+    if not args.noHessian:
+        ws.add_cov_hist(fitter.cov)
 
     if args.scan is not None:
         parms = np.array(fitter.parms).astype(str) if len(args.scan) == 0 else args.scan
@@ -527,6 +558,9 @@ def main():
     if args.eager:
         tf.config.run_functions_eagerly(True)
 
+    if args.noHessian and args.doImpacts:
+        raise Exception('option "--noHessian" only works without "--doImpacts"')
+
     global logger
     logger = logging.setup_logger(__file__, args.verbose, args.noColorLogger)
 
@@ -534,6 +568,9 @@ def main():
     ifitter = fitter.Fitter(indata, args)
 
     # physics models for observables and transformations
+    if len(args.physicsModel) == 0 and args.saveHists:
+        # if no model is explicitly added and --saveHists is specified, fall back to Basemodel
+        args.physicsModel = [["Basemodel"]]
     models = []
     for margs in args.physicsModel:
         model = ph.instance_from_class(margs[0], indata, *margs[1:])
@@ -581,6 +618,7 @@ def main():
                 ifitter.nobs.assign(ifitter.expected_yield())
             if ifit == 0:
                 ifitter.nobs.assign(ifitter.indata.data_obs)
+
             elif ifit >= 1:
                 group += f"_toy{ifit}"
                 ifitter.toyassign(
@@ -601,6 +639,7 @@ def main():
                 save_hists(args, models, ifitter, ws, prefit=True)
             prefit_time.append(time.time())
 
+            ifitter.set_blinding_offsets(ifit == 0)
             fit(args, ifitter, ws, dofit=ifit >= 0)
             fit_time.append(time.time())
 

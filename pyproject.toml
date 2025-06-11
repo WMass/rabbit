@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "combinetf2"
-version = "0.1.1"
+version = "0.2.0"
 description = "."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { text = "MIT" }
@@ -38,7 +38,7 @@ convsersion = ["uproot"]
 all = ["plotting", "convsersion"]
 
 [project.scripts]
-combinetf2 = "bin.combinetf2:main"
+combinetf2_fit = "bin.combinetf2_fit:main"
 combinetf2_plot_inputdata = "bin.combinetf2_plot_inputdata:main"
 combinetf2_plot_hists = "bin.combinetf2_plot_hists:main"
 combinetf2_plot_hists_cov = "bin.combinetf2_plot_hists_cov:main"
