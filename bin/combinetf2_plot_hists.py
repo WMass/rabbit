@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import inspect
 import itertools
 import os
 
@@ -22,21 +23,6 @@ from wums import logging, output_tools, plot_tools  # isort: skip
 hep.style.use(hep.style.ROOT)
 
 logger = None
-
-translate_selection = {
-    "charge": r"$\mathit{q}^\mu$ = ",
-    "qGen": r"$\mathit{q}^\mu$ = ",
-}
-translate_selection_value = {
-    "charge": {
-        -1.0: "-1",
-        1.0: "+1",
-    },
-    "qGen": {
-        -1.0: "-1",
-        1.0: "+1",
-    },
-}
 
 
 def parseArgs():
@@ -187,7 +173,9 @@ def parseArgs():
         help="Don't plot the lower panel in the plot",
     )
     parser.add_argument(
-        "--logTransform", action="store_true", help="Log transform the events"
+        "--diff",
+        action="store_true",
+        help="Plot difference in lower panel instead of ratio",
     )
     parser.add_argument(
         "--dataHist",
@@ -233,8 +221,16 @@ def parseArgs():
         help="Don't show given processes in the legends",
     )
     parser.add_argument(
+        "--channels",
+        type=str,
+        nargs="*",
+        default=None,
+        help="List of channels to be plotted, default is all",
+    )
+    parser.add_argument(
         "--selectionAxes",
         type=str,
+        nargs="*",
         default=["charge", "passIso", "passMT", "cosThetaStarll", "qGen"],
         help="List of axes where for each bin a separate plot is created",
     )
@@ -251,7 +247,11 @@ def parseArgs():
         help="Invert the order of the axes when plotting",
     )
     parser.add_argument(
-        "--noChisq", action="store_true", help="skip printing chisq on plot"
+        "--chisq",
+        type=str,
+        default="automatic",
+        choices=["automatic", "saturated", "linear", " ", "none", None],
+        help="Type of chi2 to print on plot (saturated from fit likelihood. linear from observables, or none) 'automatic' means pick saturated for basemodel and otherwise linear",
     )
     parser.add_argument(
         "--dataName", type=str, default="Data", help="Data name for plot labeling"
@@ -304,6 +304,13 @@ def parseArgs():
         help="Only plot one sided variation (1) or two default two-sided (0)",
     )
     parser.add_argument(
+        "--showVariations",
+        type=str,
+        default="lower",
+        choices=["upper", "lower", "both"],
+        help="Plot the variations in the upper, lower panels, or both",
+    )
+    parser.add_argument(
         "--scaleVariation",
         nargs="*",
         type=float,
@@ -323,6 +330,11 @@ def parseArgs():
     parser.add_argument(
         "--unfoldedXsec", action="store_true", help="Plot unfolded cross sections"
     )
+    parser.add_argument(
+        "--noBinWidthNorm",
+        action="store_true",
+        help="Do not normalize bin yields by bin width",
+    )
 
     args = parser.parse_args()
 
@@ -335,6 +347,7 @@ def make_plot(
     h_stack,
     axes,
     outdir,
+    config,
     colors=None,
     labels=None,
     args=None,
@@ -348,22 +361,21 @@ def make_plot(
     saturated_chi2=False,
     lumi=None,
     selection=None,
-    config=None,
     fittype="postfit",
     varNames=None,
     varLabels=None,
     varColors=None,
     is_normalized=False,
+    binwnorm=1.0,
+    counts=True,
 ):
-    ratio = not args.noLowerPanel and not args.logTransform and h_data is not None
-    diff = not args.noLowerPanel and args.logTransform and h_data is not None
+    ratio = not args.noLowerPanel and h_data is not None
+    diff = not args.noLowerPanel and args.diff and h_data is not None
     data = not args.noData and h_data is not None
 
     axes_names = [a.name for a in axes]
     if len(axes_names) == 0:
         axes_names = ["yield"]
-
-    binwnorm = 1.0
 
     if any(x.startswith("pt") or x.startswith("mll") for x in axes_names):
         # in case of variable bin width normalize to unit
@@ -372,9 +384,6 @@ def make_plot(
         )
     else:
         ylabel = r"$Events\,/\,unit$" if not args.unfoldedXsec else r"$d\sigma (pb)$"
-
-    if args.logTransform:
-        ylabel = ylabel.replace("Events", "log(Events)")
 
     if args.ylabel is not None:
         ylabel = args.ylabel
@@ -408,10 +417,6 @@ def make_plot(
 
     histtype_data = "errorbar"
     histtype_mc = "fill" if not args.unfoldedXsec else "errorbar"
-
-    # if any(x in axes_names for x in ["ptVgen", "absYVgen", "helicity"]):
-    #     histtype_data = "step"
-    #     histtype_mc = "errorbar"
 
     if len(h_inclusive.axes) > 1:
         if args.invertAxes:
@@ -463,7 +468,9 @@ def make_plot(
             rlabel = ("Diff." if diff else "Ratio") + " to nominal"
         else:
             rlabel = args.dataName.replace(" ", r"\ ")
-            if not diff:
+            if diff:
+                rlabel += r"\,-\,"
+            else:
                 rlabel += r"\,/\,"
             rlabel = f"${rlabel} Pred.$"
 
@@ -522,10 +529,42 @@ def make_plot(
             flow="none",
         )
 
+    if args.showVariations in ["upper", "both"]:
+        linewidth = 2
+        if hup is not None:
+            hep.histplot(
+                hup,
+                histtype="step",
+                color=varColors,
+                linestyle="-",
+                yerr=False,
+                linewidth=linewidth,
+                label=varLabels,
+                binwnorm=binwnorm,
+                ax=ax1,
+                flow="none",
+            )
+        if (
+            hdown is not None
+            and any(h is not None for h in hdown)
+            and len(args.varOneSided) == 0
+        ):
+            hep.histplot(
+                hdown,
+                histtype="step",
+                color=varColors,
+                linestyle="--",
+                yerr=False,
+                linewidth=linewidth,
+                binwnorm=binwnorm,
+                ax=ax1,
+                flow="none",
+            )
+
     if data:
         hep.histplot(
             h_data,
-            yerr=True,
+            yerr=True if counts else h_data.variances() ** 0.5,
             histtype=histtype_data,
             color="black",
             label=args.dataName,
@@ -543,7 +582,7 @@ def make_plot(
 
             hep.histplot(
                 h_data_stat,
-                yerr=True,
+                yerr=True if counts else h_data_stat.variances() ** 0.5,
                 histtype=histtype_data,
                 color="black",
                 binwnorm=binwnorm,
@@ -566,6 +605,18 @@ def make_plot(
             zorder=2,
             flow="none",
         )
+
+    if args.ylim is None and binwnorm is None:
+        max_y = np.max(h_inclusive.values() + h_inclusive.variances() ** 0.5)
+        min_y = np.min(h_inclusive.values() - h_inclusive.variances() ** 0.5)
+
+        if h_data is not None:
+            max_y = max(max_y, np.max(h_data.values() + h_data.variances() ** 0.5))
+            min_y = min(min_y, np.min(h_data.values() - h_data.variances() ** 0.5))
+
+        range_y = max_y - min_y
+
+        ax1.set_ylim(min_y - range_y * 0.1, max_y + range_y * 0.1)
 
     if len(axes_names) > 1 and args.binSeparationLines is not None:
         # plot dashed vertical lines to sepate makro bins
@@ -650,7 +701,7 @@ def make_plot(
                 h2,
                 histtype="errorbar",
                 color="black",
-                yerr=True if not args.logTransform else h2.variances() ** 0.5,
+                yerr=True if counts else h2.variances() ** 0.5,
                 linewidth=2,
                 ax=ax2,
                 flow="none",
@@ -660,7 +711,7 @@ def make_plot(
                     h2_stat,
                     histtype="errorbar",
                     color="black",
-                    yerr=True,
+                    yerr=True if counts else h2.variances() ** 0.5,
                     linewidth=2,
                     capsize=2,
                     ax=ax2,
@@ -684,7 +735,7 @@ def make_plot(
             hatchstyle = None
             facecolor = "silver"
             # label_unc = "Pred. unc."
-            label_unc = "Model unc."
+            label_unc = "Model unc." if not args.unfoldedXsec else "Prefit unc."
 
             if diff:
                 ax2.fill_between(
@@ -713,7 +764,11 @@ def make_plot(
                     label=label_unc,
                 )
 
-        if hup is not None:
+        if (
+            args.showVariations in ["lower", "both"]
+            and hup is not None
+            and any(h is not None for h in hup)
+        ):
             linewidth = 2
             scaleVariation = [
                 args.scaleVariation[i] if i < len(args.scaleVariation) else 1
@@ -723,6 +778,7 @@ def make_plot(
                 args.varOneSided[i] if i < len(args.varOneSided) else 0
                 for i in range(len(varNames))
             ]
+
             for i, (hu, hd) in enumerate(zip(hup, hdown)):
 
                 if scaleVariation[i] != 1:
@@ -735,21 +791,28 @@ def make_plot(
                         hdiff = hh.scaleHist(hdiff, scaleVariation[i])
                         hd = hh.addHists(hdiff, h_inclusive)
 
+                if diff:
+                    op = lambda h, hI=h_inclusive: hh.addHists(h, hI, scale2=-1)
+                else:
+                    op = lambda h, hI=h_inclusive: hh.divideHists(
+                        h, hI, cutoff=0.01, rel_unc=True
+                    )
+
                 if varOneSided[i]:
-                    hvars = hh.divideHists(hu, h_inclusive, cutoff=0.01, rel_unc=True)
-                    linestyle = "-"
+                    hvars = op(hu)
+                    linestyles = "-"
                 else:
                     hvars = [
-                        hh.divideHists(hu, h_inclusive, cutoff=0.01, rel_unc=True),
-                        hh.divideHists(hd, h_inclusive, cutoff=0.01, rel_unc=True),
+                        op(hu),
+                        op(hd),
                     ]
-                    linestyle = ["-", "--"]
+                    linestyles = ["-", "--"]
 
                 hep.histplot(
                     hvars,
                     histtype="step",
                     color=varColors[i],
-                    linestyle=linestyle,
+                    linestyle=linestyles,
                     yerr=False,
                     linewidth=linewidth,
                     label=varLabels[i] if varOneSided[i] else None,
@@ -775,14 +838,18 @@ def make_plot(
         text_pieces.extend(selection)
 
     if chi2[0] is not None and data:
-        p_val = round(scipy.stats.chi2.sf(chi2[0], chi2[1]) * 100, 2)
+        p_val = int(np.round(scipy.stats.chi2.sf(chi2[0], chi2[1]) * 100))
         if saturated_chi2:
             chi2_name = r"$\mathit{\chi}_{\mathrm{sat.}}^2/\mathit{ndf}$"
         else:
             chi2_name = r"$\mathit{\chi}^2/\mathit{ndf}$"
 
+        # chi2_text = [
+        #     chi2_name,
+        #     rf"$= {round(chi2[0],1)}/{chi2[1]}\ (\mathit{{p}}={p_val}\%)$",
+        # ]
         chi2_text = [
-            rf"{chi2_name} = ${round(chi2[0],1)}/{chi2[1]}$",
+            rf"{chi2_name} = ${np.round(chi2[0],1)}/{chi2[1]}$",
             rf"$(\mathit{{p}}={p_val}\%)$",
         ]
 
@@ -797,6 +864,11 @@ def make_plot(
                 ha="left",
                 va="top",
             )
+
+    if ratio or diff:
+        plot_tools.fix_axes(ax1, ax2, fig, yscale=args.yscale, noSci=args.noSciy)
+    else:
+        plot_tools.fix_axes(ax1, yscale=args.yscale, logy=args.logy)
 
     plot_tools.add_decor(
         ax1,
@@ -830,10 +902,6 @@ def make_plot(
             custom_handlers=["stacked"],
             padding_loc=args.lowerLegPadding,
         )
-    else:
-        ax2 = None
-
-    plot_tools.fix_axes(ax1, ax2, fig, yscale=args.yscale, noSci=args.noSciy)
 
     to_join = [fittype, args.postfix, *axes_names, suffix]
     outfile = "_".join(filter(lambda x: x, to_join))
@@ -869,6 +937,7 @@ def make_plot(
 def make_plots(
     result,
     outdir,
+    config,
     procs=None,
     labels=None,
     colors=None,
@@ -879,6 +948,7 @@ def make_plots(
     varNames=None,
     varLabels=None,
     varColors=None,
+    binwnorm=None,
     *opts,
     **kwopts,
 ):
@@ -915,23 +985,11 @@ def make_plots(
     else:
         hist_var = None
 
-    if args.logTransform:
-        hist_data.variances(flow=True)[...] = (
-            hist_data.variances(flow=True)[...] / hist_data.values(flow=True)[...] ** 2
+    if args.processGrouping is not None:
+        hist_stack, labels, colors, procs = config.process_grouping(
+            args.processGrouping, hist_stack, procs
         )
-        for h in hist_stack:
-            h.variances(flow=True)[...] = (
-                h.variances(flow=True)[...] / h.values(flow=True)[...] ** 2
-            )
 
-        hist_data.values(flow=True)[...] = np.log(hist_data.values(flow=True)[...])
-        for h in hist_stack:
-            h.values(flow=True)[...] = np.log(h.values(flow=True)[...])
-
-    # if args.processGrouping is not None:
-    #     hist_stack, labels, colors, procs = styles.process_grouping(
-    #         args.processGrouping, hist_stack, procs
-    #     )
     labels = [
         l if p not in args.suppressProcsLabel else None for l, p in zip(labels, procs)
     ]
@@ -951,7 +1009,7 @@ def make_plots(
 
     if args.unfoldedXsec:
         # convert number in cross section in pb
-        if lumi is not None:
+        if lumi is not None and binwnorm is not None:
             to_xsc = lambda h: hh.scaleHist(h, 1.0 / (lumi * 1000))
         else:
             to_xsc = lambda h: h
@@ -972,11 +1030,25 @@ def make_plots(
         ]
         other_axes = [a for a in axes if a not in selection_axes]
 
+        ts = getattr(config, "translate_selection", {})
+
         for bins in itertools.product(*selection_bins):
             idxs = {a.name: i for a, i in zip(selection_axes, bins)}
+            # next two dictionaries are built to print the bin values in the plot
+            # if the axis name is not in the configuration dictionary, just use the bin index
+            # (might print the two bin edges, but usually the bin index is enough)
             idxs_centers = {
                 a.name: (
                     a.centers[i]
+                    if isinstance(a, (hist.axis.Regular, hist.axis.Variable))
+                    and a.name in ts
+                    else a.edges[i] if a.name in ts else i
+                )
+                for a, i in zip(selection_axes, bins)
+            }
+            idxs_edges = {
+                a.name: (
+                    (a.edges[i], a.edges[i + 1])
                     if isinstance(a, (hist.axis.Regular, hist.axis.Variable))
                     else a.edges[i]
                 )
@@ -986,7 +1058,7 @@ def make_plots(
             h_inclusive = hist_inclusive[idxs]
             h_stack = [h[idxs] for h in hist_stack]
 
-            if hist_data is None:
+            if hist_data is not None:
                 h_data = hist_data[idxs]
             else:
                 h_data = None
@@ -996,23 +1068,42 @@ def make_plots(
             else:
                 h_data_stat = None
 
-            if hist_var is not None:
-                hdown = [h[idxs] for h in hists_down]
-                hup = [h[idxs] for h in hists_up]
+            if hists_up is not None:
+                hup = [
+                    (
+                        h[{k.replace("Sig", ""): v for k, v in idxs.items()}]
+                        if h is not None
+                        else None
+                    )
+                    for h in hists_up
+                ]
             else:
-                hdown = None
                 hup = None
 
-            for a, i in idxs_centers.items():
-                print(a, i)
-            selection = [
-                f"{translate_selection[a]}{translate_selection_value[a][i]}"
-                for a, i in idxs_centers.items()
-            ]
+            if hists_down is not None:
+                hdown = [h[idxs] if h is not None else None for h in hists_down]
+            else:
+                hdown = None
+
+            selection = []
+            for a in selection_axes:
+                n = a.name
+                if n in ts:
+                    sel = ts.get(n, lambda x: f"{n}={x}")
+                else:
+                    sel = lambda x: f"{n} bin = {int(x)}"
+
+                nparams = len(inspect.signature(sel).parameters)
+
+                if nparams == 2:
+                    selection.append(sel(*idxs_edges[n]))
+                elif nparams == 1:
+                    selection.append(sel(idxs_centers[n]))
+
             suffix = f"{channel}_" + "_".join(
                 [
                     f"{a}_{str(i).replace('.','p').replace('-','m')}"
-                    for a, i in idxs_centers.items()
+                    for a, i in idxs.items()
                 ]
             )
             logger.info(
@@ -1024,6 +1115,7 @@ def make_plots(
                 h_stack,
                 other_axes,
                 outdir,
+                config,
                 labels=labels,
                 colors=colors,
                 args=args,
@@ -1037,6 +1129,7 @@ def make_plots(
                 varNames=varNames,
                 varLabels=varLabels,
                 varColors=varColors,
+                binwnorm=binwnorm,
                 *opts,
                 **kwopts,
             )
@@ -1047,6 +1140,7 @@ def make_plots(
             hist_stack,
             axes,
             outdir,
+            config,
             labels=labels,
             colors=colors,
             args=args,
@@ -1059,21 +1153,24 @@ def make_plots(
             varNames=varNames,
             varLabels=varLabels,
             varColors=varColors,
+            binwnorm=binwnorm,
             *opts,
             **kwopts,
         )
 
 
-def get_chi2(result, fitresult, no_chi2=True, fittype="postfit"):
-    if fittype == "postfit" and not no_chi2:
+def get_chi2(result, no_chi2=True, fittype="postfit"):
+    chi2_key = f"chi2_prefit" if fittype == "prefit" else "chi2"
+    ndf_key = f"ndf_prefit" if fittype == "prefit" else "ndf"
+    if not no_chi2 and fittype == "postfit" and result.get("postfit_profile", False):
         # use saturated likelihood test if relevant
-        nllvalfull = fitresult["nllvalfull"]
-        satnllvalfull = fitresult["satnllvalfull"]
+        nllvalfull = result["nllvalfull"]
+        satnllvalfull = result["satnllvalfull"]
         chi2 = 2.0 * (nllvalfull - satnllvalfull)
-        ndf = fitresult["ndfsat"]
+        ndf = result["ndfsat"]
         return chi2, ndf, True
-    elif f"chi2_{fittype}" in result and not no_chi2:
-        return result[f"chi2_{fittype}"], result[f"ndf_{fittype}"], False
+    elif not no_chi2 and chi2_key in result:
+        return result[chi2_key], result[ndf_key], False
     else:
         return None, None, False
 
@@ -1110,8 +1207,6 @@ def main():
         args.infile, args.result, meta=True
     )
 
-    meta_info = meta["meta_info"]
-
     plt.rcParams["font.size"] = plt.rcParams["font.size"] * args.scaleTextSize
 
     channel_info = meta["meta_info_input"]["channel_info"]
@@ -1128,7 +1223,7 @@ def main():
         proc_colors = getattr(config, "process_colors", {})
         colors = [proc_colors.get(p, cmap(i % cmap.N)) for i, p in enumerate(procs)]
 
-    outdir = output_tools.make_plot_dir("/".join(args.outpath.split("/")[:-1]), eoscp=args.eoscp)
+    outdir = output_tools.make_plot_dir(args.outpath, eoscp=args.eoscp)
 
     opts = dict(
         args=args,
@@ -1136,7 +1231,6 @@ def main():
         labels=labels,
         colors=colors,
         meta=meta,
-        config=config,
         fittype=fittype,
         varNames=varNames,
         varLabels=varLabels,
@@ -1161,29 +1255,69 @@ def main():
 
             instance = results[instance_key]
 
-            chi2, ndf, saturated_chi2 = get_chi2(instance, fitresult, args.noChisq, fittype)
+            chi2, ndf, saturated_chi2 = get_chi2(
+                (
+                    fitresult
+                    if fittype == "postfit"
+                    and (
+                        (instance_key == "Basemodel" and args.chisq != "linear")
+                        or args.chisq == "saturated"
+                    )
+                    else instance
+                ),
+                args.chisq in [" ", "none", None],
+                fittype,
+            )
 
             for channel, result in instance["channels"].items():
+                if args.channels is not None and channel not in args.channels:
+                    continue
                 logger.info(f"Make plot for {instance_key} in channel {channel}")
 
                 info = channel_info.get(channel, {})
 
+                suffix = f"{channel}_{instance_key}"
+                for sign, rpl in [
+                    (" ", "_"),
+                    (".", "p"),
+                    ("-", "m"),
+                    (":", ""),
+                    (",", ""),
+                    ("slice(None)", ""),
+                    ("(", ""),
+                    (")", ""),
+                    (":", ""),
+                ]:
+                    suffix = suffix.replace(sign, rpl)
+
+                counts = not args.unfoldedXsec  # if histograms represent counts or not
+                binwnorm = (
+                    1.0
+                    if any(
+                        instance_key.startswith(x)
+                        for x in ["Basemodel", "Project", "Norm"]
+                    )
+                    and not args.noBinWidthNorm
+                    else None
+                )
+
+                opts["counts"] = counts
+
                 make_plots(
                     result,
                     outdir,
-                    channel=channel,
+                    config,
+                    channel=suffix,
                     chi2=[chi2, ndf],
                     saturated_chi2=saturated_chi2,
                     lumi=info.get("lumi", None),
                     is_normalized=is_normalized,
+                    binwnorm=binwnorm,
                     **opts,
                 )
 
     if output_tools.is_eosuser_path(args.outpath) and args.eoscp:
-        folders = args.outpath.split("/")
-        if len(folders) > 1:
-            folders = "/".join(folders[:-1]), folders[-1]
-        output_tools.copy_to_eos(outdir, *folders)
+        output_tools.copy_to_eos(outdir, args.outpath)
 
 
 if __name__ == "__main__":
