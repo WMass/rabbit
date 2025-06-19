@@ -447,8 +447,8 @@ def make_plot(
             hists_syst_up, hists_syst_dn, colors_syst, labels_syst
         ):
             if args.splitByProcess:
-                hup = hup[{"processes": procs[i]}]
-                hdn = hdn[{"processes": procs[i]}]
+                hup = hup[{"processes": procs}]
+                hdn = hdn[{"processes": procs}]
             else:
                 hup = hup[{"processes": hist.sum}]
                 hdn = hdn[{"processes": hist.sum}]
@@ -578,7 +578,7 @@ def make_plot(
         if not args.noStack:
             outfile += "stack_"
         if args.splitByProcess:
-            outfile += f"{procs[i]}_"
+            outfile += f"{procs}_"
         outfile += "_".join(axes_names)
         outfile += f"_{channel}"
         if selections is not None:

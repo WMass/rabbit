@@ -464,16 +464,36 @@ def fit(args, fitter, ws, dofit=True):
                 ws.add_global_impacts_hists(*fitter.global_impacts_parms())
 
     nllvalfull = fitter.full_nll().numpy()
-    satnllvalfull, ndfsat = fitter.saturated_nll()
+    nllvalreduced = fitter.reduced_nll().numpy()
 
-    satnllvalfull = satnllvalfull.numpy()
-    ndfsat = ndfsat.numpy()
+    ndfsat = (
+        tf.size(fitter.nobs) - fitter.npoi - fitter.indata.nsystnoconstraint
+    ).numpy()
+
+    ln, lc, lb, beta = fitter._compute_nll_components(profile=True, full_nll=True)
+
+    # conversion factor to convert the -log(L) from combineTF2 to combine
+    nobstotal = tf.reduce_sum(fitter.nobs)
+    conversion = tf.reduce_sum(
+        fitter.nobs * tf.math.log(fitter.nobs)
+    ) - nobstotal * tf.math.log(nobstotal)
+    conversion.numpy()
+
+    logger.info(f"-2*log(L_reduced) = {2*nllvalreduced}")
+    logger.info(f"-log(L_combine) = {nllvalreduced-conversion}")
+
+    logger.info(f"-2*log(L_data) = {2*ln}")
+    logger.info(f"-2*log(L_cons) = {2*lc}")
+    if not args.noBinByBinStat:
+        logger.info(f"-2*log(L_beta) = {2*lb}")
+
+    logger.info(f"-2*log(L) = {2*nllvalfull}")
 
     ws.results.update(
         {
             "nllvalfull": nllvalfull,
+            "nllvalreduced": nllvalreduced,
             "edmval": edmval,
-            "satnllvalfull": satnllvalfull,
             "ndfsat": ndfsat,
             "postfit_profile": args.externalPostfit is None,
         }
