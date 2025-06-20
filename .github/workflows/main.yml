@@ -168,7 +168,7 @@ jobs:
       - name: nominal fit
         run: >- 
           rabbit_fit.py $RABBIT_OUTDIR/test_tensor.hdf5 -o $RABBIT_OUTDIR/
-          -t 0 --unblind '.*' --doImpacts --globalImpacts
+          -t 0 --unblind --doImpacts --globalImpacts
           --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
           --computeHistCov --computeHistImpacts --computeVariations
           -m Basemodel
@@ -203,7 +203,7 @@ jobs:
       - name: chi2 fit
         run: >- 
           rabbit_fit.py $RABBIT_OUTDIR/test_tensor.hdf5 -o $RABBIT_OUTDIR/ --postfix chi2
-          -t 0 --unblind '.*' --chisqFit --externalCovariance --doImpacts --globalImpacts 
+          -t 0 --unblind --chisqFit --externalCovariance --doImpacts --globalImpacts 
           --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
           -m Project ch1 a -m Project ch1 b
 

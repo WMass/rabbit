@@ -19,6 +19,14 @@ from wums import output_tools, logging  # isort: skip
 logger = None
 
 
+class OptionalListAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if len(values) == 0:
+            setattr(namespace, self.dest, [".*"])
+        else:
+            setattr(namespace, self.dest, values)
+
+
 def make_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -298,7 +306,11 @@ def make_parser():
         type=str,
         default=[],
         nargs="*",
-        help="Specify list of regex to unblind matching parameters of interest. E.g. use '^signal$' to unblind a parameter named signal or '.*' to unblind all.",
+        action=OptionalListAction,
+        help="""
+        Specify list of regex to unblind matching parameters of interest. 
+        E.g. use '--unblind ^signal$' to unblind a parameter named signal or '--unblind' to unblind all.
+        """,
     )
 
     return parser.parse_args()
