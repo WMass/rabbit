@@ -166,6 +166,12 @@ def make_parser():
         help="use prefit uncertainty to define scan range",
     )
     parser.add_argument(
+        "--prefitOnly",
+        default=False,
+        action="store_true",
+        help="Only compute prefit outputs",
+    )
+    parser.add_argument(
         "--noHessian",
         default=False,
         action="store_true",
@@ -637,19 +643,22 @@ def main():
                 save_hists(args, models, ifitter, ws, prefit=True)
             prefit_time.append(time.time())
 
-            ifitter.set_blinding_offsets(blind=blinded_fits[i])
-            fit(args, ifitter, ws, dofit=ifit >= 0)
-            fit_time.append(time.time())
+            if not args.prefitOnly:
+                ifitter.set_blinding_offsets(blind=blinded_fits[i])
+                fit(args, ifitter, ws, dofit=ifit >= 0)
+                fit_time.append(time.time())
 
-            if args.saveHists:
-                save_hists(
-                    args,
-                    models,
-                    ifitter,
-                    ws,
-                    prefit=False,
-                    profile=args.externalPostfit is None,
-                )
+                if args.saveHists:
+                    save_hists(
+                        args,
+                        models,
+                        ifitter,
+                        ws,
+                        prefit=False,
+                        profile=args.externalPostfit is None,
+                    )
+            else:
+                fit_time.append(time.time())
 
             ws.dump_and_flush(group)
             postfit_time.append(time.time())
