@@ -38,6 +38,12 @@ parser.add_argument(
     default="log_normal",
     help="probability density for systematic variations",
 )
+parser.add_argument(
+    "--addSystToDataCovariance",
+    default=False,
+    action="store_true",
+    help="Add systematics to data covariance matrix, only works with '--systematicType normal'",
+)
 
 args = parser.parse_args()
 
@@ -228,6 +234,7 @@ writer.add_systematic(
     "slope_background",
     "bkg",
     "ch0",
+    add_to_data_covariance=args.addSystToDataCovariance,
     groups=["slopes", "slopes_background"],
 )
 
@@ -241,6 +248,7 @@ writer.add_systematic(
     "slope_signal_ch0",
     "sig",
     "ch0",
+    add_to_data_covariance=args.addSystToDataCovariance,
     groups=["slopes", "slopes_signal"],
     symmetrize="average",
     kfactor=1.2,
@@ -282,6 +290,7 @@ writer.add_systematic(
     "slope_lin_signal_ch0",
     "sig",
     "ch0",
+    add_to_data_covariance=args.addSystToDataCovariance,
     groups=["slopes", "slopes_signal"],
     symmetrize="linear",
 )
@@ -296,6 +305,7 @@ writer.add_systematic(
     "slope_quad_signal_ch0",
     "sig",
     "ch0",
+    add_to_data_covariance=args.addSystToDataCovariance,
     groups=["slopes", "slopes_signal"],
     symmetrize="quadratic",
 )
@@ -314,6 +324,7 @@ writer.add_systematic(
     "slope_background",
     "bkg",
     "ch1",
+    add_to_data_covariance=args.addSystToDataCovariance,
     groups=["slopes", "slopes_background"],
 )
 
@@ -327,6 +338,7 @@ writer.add_systematic(
     "slope_signal_ch1",
     "sig",
     "ch1",
+    add_to_data_covariance=args.addSystToDataCovariance,
     groups=["slopes", "slopes_signal"],
     symmetrize="conservative",
 )
@@ -352,6 +364,7 @@ writer.add_systematic(
     "slope_2_signal_ch1",
     "sig",
     "ch1",
+    add_to_data_covariance=args.addSystToDataCovariance,
     groups=["slopes", "slopes_signal"],
     symmetrize="quadratic" if args.symmetrizeAll else None,
 )

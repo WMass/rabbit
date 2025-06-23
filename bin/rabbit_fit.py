@@ -232,6 +232,12 @@ def make_parser():
         help="probability density for bin-by-bin statistical uncertainties, ('automatic' is 'gamma' except for data covariance where it is 'normal')",
     )
     parser.add_argument(
+        "--binByBinStatMode",
+        default="light",
+        choices=["light", "full"],
+        help="Barlow-Beeston mode bin-by-bin statistical uncertainties",
+    )
+    parser.add_argument(
         "--externalPostfit",
         default=None,
         type=str,
@@ -468,6 +474,17 @@ def fit(args, fitter, ws, dofit=True):
 
     satnllvalfull = satnllvalfull.numpy()
     ndfsat = ndfsat.numpy()
+
+    import scipy
+
+    chi2 = 2.0 * (nllvalfull - satnllvalfull)
+    p_val = scipy.stats.chi2.sf(chi2, ndfsat)
+    print("Saturated chi2:")
+    print("    nllvalfull: ", nllvalfull)
+    print("    satnllvalfull: ", satnllvalfull)
+    print("    ndof: ", ndfsat)
+    print("    2*deltaNLL: ", round(chi2, 2))
+    print("    p-value (%): ", round(p_val * 100, 2))
 
     ws.results.update(
         {
