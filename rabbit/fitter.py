@@ -1321,7 +1321,7 @@ class Fitter:
                     compute_cov=compute_cov,
                     compute_global_impacts=compute_global_impacts,
                     need_observables=model.need_observables,
-                    inclusive=inclusive,
+                    inclusive=inclusive and not model.need_processes,
                 )
             )
             aux = [exp_var, exp_cov, exp_impacts, exp_impacts_grouped]
@@ -1329,13 +1329,13 @@ class Fitter:
             exp = self.expected_variations(
                 fun,
                 correlations=correlated_variations,
-                inclusive=inclusive,
+                inclusive=inclusive and not model.need_processes,
                 need_observables=model.need_observables,
             )
         else:
             exp = self._compute_expected(
                 fun,
-                inclusive=inclusive,
+                inclusive=inclusive and not model.need_processes,
                 profile=profile,
                 need_observables=model.need_observables,
             )

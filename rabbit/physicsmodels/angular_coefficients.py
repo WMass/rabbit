@@ -6,15 +6,14 @@ from rabbit.physicsmodels.physicsmodel import PhysicsModel
 
 class AngularCoefficients(PhysicsModel):
     """
-    A class to compute ratios of channels, processes, or bins.
-    Optionally the numerator and denominator can be normalized.
+    A class to compute the angular coefficients as A_i = sigma_i / sigma_UL
 
     Parameters
     ----------
         indata: Input data used for analysis (e.g., histograms or data structures).
         channel: str
             Name of the channel.
-        channel: str
+        process: str
             Name of the process.
         selection: dict, optional
             Dictionary specifying selection criteria. Keys are axis names, and values are slices or conditions.
@@ -36,6 +35,7 @@ class AngularCoefficients(PhysicsModel):
     ):
         self.key = key
 
+        # sigma_i
         self.num = helpers.Term(
             indata,
             channel,
@@ -43,7 +43,8 @@ class AngularCoefficients(PhysicsModel):
             {helicity_axis: slice(1, None), **selection},
             rebin_axes,
             sum_axes,
-        )  # sigma_i
+        )
+        # sigma_UL
         self.den = helpers.Term(
             indata,
             channel,
@@ -51,7 +52,7 @@ class AngularCoefficients(PhysicsModel):
             {helicity_axis: 0, **selection},
             rebin_axes,
             sum_axes,
-        )  # sigma_UL
+        )
 
         self.has_data = False
 
@@ -75,23 +76,20 @@ class AngularCoefficients(PhysicsModel):
         self.channel_info = {
             channel: {
                 "axes": channel_axes,
-            }
+            },
         }
 
     @classmethod
     def parse_args(cls, indata, *args):
         """
-        parsing the input arguments into the ratio constructor, is has to be called as
+        parsing the input arguments into the AI constructor, it has to be called as
         -m AngularCoefficients
-            <ch > <ch den>
-            <proc_num_0>,<proc_num_1>,... <proc_num_0>,<proc_num_1>,...
-            <axis_num_0>:<slice_num_0>,<axis_num_1>,<slice_num_1>... <axis_den_0>,<slice_den_0>,<axis_den_1>,<slice_den_1>...
+            <ch>
+            <proc_0>,<proc_1>,...
+            <axis_ai_0>:<slice_ai_0>,<axis_ai_1>,<slice_ai_1>...
 
-        Processes selections are optional. But in case on is given for the numerator, the denominator must be specified as well and vice versa.
-        Use 'None' if you don't want to select any for either numerator xor denominator.
-
-        Axes selections are optional. But in case one is given for the numerator, the denominator must be specified as well and vice versa.
-        Use 'None:None' if you don't want to do any for either numerator xor denominator.
+        Processes selections are optional. Use 'None' if you don't want to select any.
+        Axes selections are optional.
         """
 
         if len(args) > 2 and ":" not in args[1]:
@@ -102,7 +100,6 @@ class AngularCoefficients(PhysicsModel):
         # find axis selections
         if any(a for a in args if ":" in a):
             sel_args = [a for a in args if ":" in a]
-
             axis_selection, axes_rebin, axes_sum = helpers.parse_axis_selection(
                 sel_args[0]
             )
@@ -126,16 +123,17 @@ class AngularCoefficients(PhysicsModel):
     def compute_ais(self, observables, inclusive=False):
         num = self.num.select(observables, inclusive=inclusive)
         den = self.den.select(observables, inclusive=inclusive)
-
         den = tf.expand_dims(den, axis=self.helicity_index)
-
         return num / den
 
     def compute_flat(self, params, observables):
-        return self.compute_ais(observables, True)
+        exp = self.compute_ais(observables, True)
+        return tf.reshape(exp, [-1])
 
     def compute_flat_per_process(self, params, observables):
-        return self.compute_ais(observables, False)
+        exp = self.compute_ais(observables, False)
+        flat_shape = (-1, exp.shape[-1])
+        return tf.reshape(exp, [-1, flat_shape])
 
 
 class LamTung(AngularCoefficients):
@@ -143,9 +141,9 @@ class LamTung(AngularCoefficients):
     def __init__(self, indata, key, channel, *args, **kwargs):
         super().__init__(indata, key, channel, *args, **kwargs)
 
-        self.channel_info[channel]["axes"] = [
-            c for c in self.channel_info[channel]["axes"] if c.name != "ai"
-        ]
+        self.channel_info[channel] = {
+            "axes": [c for c in self.channel_info[channel]["axes"] if c.name != "ai"]
+        }
 
     def compute_ais(self, observables, inclusive=False):
         ais = super().compute_ais(observables, inclusive)

@@ -111,8 +111,8 @@ class Term:
     ):
         info = indata.channel_info[channel]
 
-        self.start = info["start"]
-        self.stop = info["stop"]
+        self.start = info["start"]  # first index in observables
+        self.stop = info["stop"]  # last index in observales
 
         channel_axes = info["axes"]
 

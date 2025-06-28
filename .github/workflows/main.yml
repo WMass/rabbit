@@ -183,6 +183,14 @@ jobs:
           -m Normratio ch1 ch1 sig sig,bkg 'b:sum' 'b:2'
           -m tests.param_model.Param 'slope_signal' 1 0
 
+      - name: nominal fit
+        run: >- 
+          rabbit_fit.py $RABBIT_OUTDIR/test_tensor.hdf5 -o $RABBIT_OUTDIR/ --postfix composite
+          -t 0 --unblind '.*' --doImpacts --globalImpacts
+          --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
+          --computeHistCov --computeHistImpacts --computeVariations
+          --compositeModel -m Project ch1 a -m Project ch1 b 
+
       - name: nominal fit blinded
         run: >- 
           rabbit_fit.py $RABBIT_OUTDIR/test_tensor.hdf5 -o $RABBIT_OUTDIR/

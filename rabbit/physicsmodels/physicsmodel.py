@@ -10,6 +10,14 @@ class PhysicsModel:
 
     need_observables = True  # if observables should be provided to the compute function
     has_data = True  # if data histograms are stored or not, and if chi2 is calculated
+
+    skip_prefit = False  # if the physics model doesn't implement the prefit case
+    skip_incusive = False  # if the physics model doesn't implement compute_flat
+    skip_per_process = (
+        False  # if the physics model doesn't implement compute_flat_per_process
+    )
+    need_processes = False  # if observables are required by process in compute_flat
+
     ndf_reduction = 0  # how much will be subtracted from the ndf / number of bins, e.g. for chi2 calculation
 
     def __init__(self, indata, key):
@@ -28,14 +36,14 @@ class PhysicsModel:
 
     # function to compute the transformation of the physics model, has to be differentiable.
     #    For custom physics models, this function should be overridden.
-    #    observables are the provided histograms inclusive in processes: nbins
+    #    observables are the provided histograms inclusive in processes: nbins unless 'need_processes=True'
     #    params are the fit parameters
     def compute_flat(self, params, observables=None):
         return observables
 
     # function to compute the transformation of the physics model, has to be differentiable.
     #    For custom physics models, this function can be overridden.
-    #    observables are the provided histograms per process: nbins x nprocesses
+    #    observables are the provided histograms per process: nbins x nprocesses and the result is expected to be nbins x nprocesses
     #    params are the fit parameters
     def compute_flat_per_process(self, params, observables=None):
         return self.compute_flat(params, observables)
@@ -69,6 +77,63 @@ class PhysicsModel:
         variances_output = tf.linalg.diag_part(cov_output)
 
         return output, variances_output, cov_output
+
+
+class CompositeModel(PhysicsModel):
+    """
+    A composition of different physics models e.g. to compute the covariance across them
+    """
+
+    def __init__(
+        self,
+        models,
+    ):
+        self.key = self.__class__.__name__
+
+        self.channel_info = {}
+
+        self.models = models
+
+        self.ndf_reduction = 0
+        self.has_data = True
+
+        self.need_processes = False
+        self.skip_per_process = False
+
+        # make a composite model with unique channel names
+        for m in models:
+            for k, c in m.channel_info.items():
+                self.channel_info[f"{m.key}_{k}"] = c
+
+            self.ndf_reduction += m.ndf_reduction
+            # if any of the submodels does not process data, the composite model also does not
+            if not m.has_data:
+                self.has_data = False
+            # if any of the submodels needs processes, the composite model also needs processes
+            if m.need_processes:
+                self.need_processes = True
+            # if any of the submodels skips the processes step, the composite model also skip the processes
+            if m.skip_per_process:
+                self.skip_per_process = True
+
+    def compute_flat(self, params, observables=None):
+        exp_list = []
+        for m in self.models:
+            if self.need_processes and not m.need_processes:
+                # in case the composite model requires processes but one of the submodels does not, sum them up again
+                observables = tf.reduce_sum(observables, axis=1)
+            result = m.compute_flat(params, observables)
+            exp_list.append(result)
+
+        exp = tf.concat(exp_list, axis=0)
+        return exp
+
+    def compute_flat_per_process(self, params, observables=None):
+        exp = tf.concat(
+            [m.compute_flat_per_process(params, observables) for m in self.models],
+            axis=0,
+        )
+        return exp
 
 
 class Basemodel(PhysicsModel):

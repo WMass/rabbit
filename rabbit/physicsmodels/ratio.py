@@ -161,7 +161,9 @@ class Ratio(PhysicsModel):
         num = self.num.select(observables, inclusive=True)
         den = self.den.select(observables, inclusive=True)
 
-        return num / den
+        ratio = tf.reshape(num / den, [-1])
+
+        return ratio
 
     def compute_flat_per_process(self, params, observables):
         return self.compute_flat(params, observables)

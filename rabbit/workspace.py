@@ -152,6 +152,7 @@ class Workspace:
             values = values[start:stop]
             if variances is not None:
                 variances = variances[start:stop]
+
         h = self.hist(name, axes, values, variances, label)
         self.dump_hist(h, model_key, channel)
 
@@ -174,10 +175,10 @@ class Workspace:
         )
         values_nobs, variances_nobs, cov_nobs = model.get_data(nobs, nobs_cov_inv)
 
+        start = 0
         for channel, info in model.channel_info.items():
             axes = info["axes"]
-            start = info.get("start", None)
-            stop = info.get("stop", None)
+            stop = start + int(np.prod([a.size for a in axes]))
 
             if info.get("masked", False):
                 continue
@@ -211,6 +212,8 @@ class Workspace:
                 label="observed number of events for fit",
                 **opts,
             )
+
+            start = stop
 
         return hists_data_obs, hists_nobs
 
@@ -347,12 +350,14 @@ class Workspace:
             axis_vars = hist.axis.StrCategory(self.parms, name="vars")
             var_axes = [axis_vars, axis_downUpVar]
 
+        start = 0
         for channel, info in model.channel_info.items():
             axes = info["axes"]
+            stop = start + int(np.prod([a.size for a in axes]))
 
             opts = dict(
-                start=info.get("start", None),
-                stop=info.get("stop", None),
+                start=start,  # first index in output values for this channel
+                stop=stop,  # last index in output values for this channel
                 label=label,
                 model_key=model.key,
                 channel=channel,
@@ -397,6 +402,8 @@ class Workspace:
                     impacts_grouped,
                     **opts,
                 )
+
+            start = stop
 
         if cov is not None:
             # flat axes for covariance matrix, since it can go across channels
