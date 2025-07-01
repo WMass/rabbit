@@ -1164,9 +1164,7 @@ def get_chi2(result, no_chi2=True, fittype="postfit"):
     ndf_key = f"ndf_prefit" if fittype == "prefit" else "ndf"
     if not no_chi2 and fittype == "postfit" and result.get("postfit_profile", False):
         # use saturated likelihood test if relevant
-        nllvalfull = result["nllvalfull"]
-        satnllvalfull = result["satnllvalfull"]
-        chi2 = 2.0 * (nllvalfull - satnllvalfull)
+        chi2 = 2.0 * result["nllvalreduced"]
         ndf = result["ndfsat"]
         return chi2, ndf, True
     elif not no_chi2 and chi2_key in result:

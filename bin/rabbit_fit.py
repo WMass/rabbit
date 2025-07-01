@@ -9,6 +9,7 @@ import time
 
 import h5py
 import numpy as np
+import scipy
 
 from rabbit import fitter, inputdata, io_tools, workspace
 from rabbit.physicsmodels import helpers as ph
@@ -52,6 +53,11 @@ def make_parser():
         action="store_true",
         help="Calculate and print additional info for diagnostics (condition number, edm value)",
     )
+    parser.add_argument(
+        "--fullNll",
+        action="store_true",
+        help="Calculate and store full value of -log(L)",
+    )
     parser.add_argument("filename", help="filename of the main hdf5 input")
     parser.add_argument("-o", "--output", default="./", help="output directory")
     parser.add_argument("--outname", default="fitresults.hdf5", help="output file name")
@@ -80,7 +86,11 @@ def make_parser():
         "--toysSystRandomize",
         default="frequentist",
         choices=["frequentist", "bayesian", "none"],
-        help="Type of randomization for systematic uncertainties (including binByBinStat if present).  Options are 'frequentist' which randomizes the contraint minima a.k.a global observables and 'bayesian' which randomizes the actual nuisance parameters used in the pseudodata generation",
+        help="""
+        Type of randomization for systematic uncertainties (including binByBinStat if present).  
+        Options are 'frequentist' which randomizes the contraint minima a.k.a global observables 
+        and 'bayesian' which randomizes the actual nuisance parameters used in the pseudodata generation
+        """,
     )
     parser.add_argument(
         "--toysDataRandomize",
@@ -487,21 +497,33 @@ def fit(args, fitter, ws, dofit=True):
             if args.globalImpacts:
                 ws.add_global_impacts_hists(*fitter.global_impacts_parms())
 
-    nllvalfull = fitter.full_nll().numpy()
-    satnllvalfull, ndfsat = fitter.saturated_nll()
+    nllvalreduced = fitter.reduced_nll().numpy()
 
-    satnllvalfull = satnllvalfull.numpy()
-    ndfsat = ndfsat.numpy()
+    ndfsat = (
+        tf.size(fitter.nobs) - fitter.npoi - fitter.indata.nsystnoconstraint
+    ).numpy()
+
+    chi2 = 2.0 * nllvalreduced
+    p_val = scipy.stats.chi2.sf(chi2, ndfsat)
+
+    logger.info("Saturated chi2:")
+    logger.info(f"    ndof: {ndfsat}")
+    logger.info(f"    2*deltaNLL: {round(chi2, 2)}")
+    logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
 
     ws.results.update(
         {
-            "nllvalfull": nllvalfull,
-            "edmval": edmval,
-            "satnllvalfull": satnllvalfull,
+            "nllvalreduced": nllvalreduced,
             "ndfsat": ndfsat,
+            "edmval": edmval,
             "postfit_profile": args.externalPostfit is None,
         }
     )
+
+    if args.fullNll:
+        nllvalfull = fitter.full_nll().numpy()
+        logger.info(f"2*deltaNLL(full): {nllvalfull}")
+        ws.results["nllvalfull"] = nllvalfull
 
     ws.add_parms_hist(
         values=fitter.x,
@@ -527,10 +549,10 @@ def fit(args, fitter, ws, dofit=True):
 
     if args.scan2D is not None:
         for param_tuple in args.scan2D:
-            x_scan, yscan, nll_values = fitter.nll_scan2D(
+            x_scan, yscan, dnll_values = fitter.nll_scan2D(
                 param_tuple, args.scanRange, args.scanPoints, args.scanRangeUsePrefit
             )
-            ws.add_nll_scan2D_hist(param_tuple, x_scan, yscan, nll_values - nllvalfull)
+            ws.add_nll_scan2D_hist(param_tuple, x_scan, yscan, dnll_values)
 
     if args.contourScan is not None:
         # do likelihood contour scans
@@ -642,9 +664,9 @@ def main():
             group = "results"
             if ifit == -1:
                 group += "_asimov"
-                ifitter.nobs.assign(ifitter.expected_yield())
+                ifitter.set_nobs(ifitter.expected_yield())
             if ifit == 0:
-                ifitter.nobs.assign(ifitter.indata.data_obs)
+                ifitter.set_nobs(ifitter.indata.data_obs)
 
             elif ifit >= 1:
                 group += f"_toy{ifit}"
