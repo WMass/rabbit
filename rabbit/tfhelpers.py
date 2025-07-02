@@ -28,7 +28,7 @@ def simple_sparse_slice0end(in_sparse, end):
 
 
 def is_diag(x):
-    return tf.math.equal(
+    return tf.equal(
         tf.math.count_nonzero(x), tf.math.count_nonzero(tf.linalg.diag_part(x))
     )
 

@@ -341,7 +341,7 @@ class TensorWriter:
 
         systematic_type = "normal" if add_to_data_covariance else self.systematic_type
 
-        if isinstance(h, (list, tuple, np.ndarray)):
+        if isinstance(h, (list, tuple)):
             self._check_hist_and_channel(h[0], channel)
             self._check_hist_and_channel(h[1], channel)
 

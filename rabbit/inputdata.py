@@ -36,21 +36,22 @@ class FitInputData:
 
             # load data/pseudodata
             if pseudodata is not None:
-                if pseudodata in self.pseudodatanames:
-                    pseudodata_idx = np.where(self.pseudodatanames == pseudodata)[0][0]
-                else:
-                    raise Exception(
-                        "Pseudodata %s not found, available pseudodata sets are %s"
-                        % (pseudodata, self.pseudodatanames)
-                    )
-                print("Run pseudodata fit for index %i: " % (pseudodata_idx))
-                print(self.pseudodatanames[pseudodata_idx])
-                hdata_obs = f["hpseudodata"]
+                print("Initialize pseudodata")
+                hpseudodata_obs = f["hpseudodata"]
 
-                data_obs = maketensor(hdata_obs)
-                self.data_obs = data_obs[:, pseudodata_idx]
-            else:
-                self.data_obs = maketensor(f["hdata_obs"])
+                self.pseudodata_obs = maketensor(hpseudodata_obs)
+
+                # if explicit pseudodata sets are requested, select them (keep all for empty list)
+                if len(pseudodata) > 0:
+                    mask = np.isin(self.pseudodatanames, pseudodata)
+                    indices = np.where(mask)[0]
+
+                    self.pseudodata_obs = tf.gather(
+                        self.pseudodata_obs, indices, axis=1
+                    )
+                    self.pseudodatanames = self.pseudodatanames[indices]
+
+            self.data_obs = maketensor(f["hdata_obs"])
 
             # start by creating tensors which read in the hdf5 arrays (optimized for memory consumption)
             self.constraintweights = maketensor(f["hconstraintweights"])
