@@ -132,6 +132,10 @@ jobs:
         run: >-
           python tests/make_tensor.py -o $RABBIT_OUTDIR/ --symmetrizeAll --systematicType normal --postfix symmetric
 
+      - name: make linearized tensor
+        run: >- 
+          python tests/make_tensor.py -o $RABBIT_OUTDIR/ --symmetrizeAl  --systematicType normal --addSystToDataCovariance --skipMaskedChannels --postfix linearized
+
       - name: make sparse tensor
         run: >-
           python tests/make_tensor.py -o $RABBIT_OUTDIR/ --sparse --postfix sparse
@@ -223,6 +227,10 @@ jobs:
           --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
           --computeHistImpacts --computeHistCov -m Project ch1 a -m Project ch1 b 
 
+      - name: chi2 fit with Barlow--Beeston full
+        run: >- 
+          rabbit_fit.py $RABBIT_OUTDIR/test_tensor_symmetric.hdf5 -o $RABBIT_OUTDIR/ --postfix linearized
+          -t 0 --chisqFit --externalCovariance --doImpacts --globalImpacts --binByBinStatMode full
 
   plotting:
     runs-on: [self-hosted, linux, x64]

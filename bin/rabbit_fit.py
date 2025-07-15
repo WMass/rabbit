@@ -257,6 +257,12 @@ def make_parser():
         help="probability density for bin-by-bin statistical uncertainties, ('automatic' is 'gamma' except for data covariance where it is 'normal')",
     )
     parser.add_argument(
+        "--binByBinStatMode",
+        default="light",
+        choices=["light", "full"],
+        help="Barlow-Beeston mode bin-by-bin statistical uncertainties",
+    )
+    parser.add_argument(
         "--externalPostfit",
         default=None,
         type=str,
