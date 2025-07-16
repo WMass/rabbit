@@ -23,6 +23,10 @@ class Project(Channelmodel):
         info = indata.channel_info[channel]
         channel_axes = {a.name: a for a in info["axes"]}
 
+        if len([n for n in axes_names if n not in channel_axes]) > 0:
+            raise RuntimeError(
+                f"Axes {[n for n in axes_names if n not in channel_axes]} not found. Available axes are {[channel_axes.keys()]}"
+            )
         hist_axes = [channel_axes[n] for n in axes_names]
 
         if len(hist_axes) != len(axes_names):

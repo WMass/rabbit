@@ -175,7 +175,7 @@ class Channelmodel(PhysicsModel):
             }
         }
 
-        self.has_data = not channel_info["masked"]
+        self.has_data = not channel_info.get("masked", False)
 
     def compute(self, params, observables):
         return observables

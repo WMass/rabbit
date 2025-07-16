@@ -118,7 +118,7 @@ class Term:
 
         channel_axes_names = [a.name for a in channel_axes]
 
-        self.has_data = not info["masked"] and len(processes) == 0
+        self.has_data = not info.get("masked", False) and len(processes) == 0
 
         flow = info.get("flow", False)
         self.exp_shape = tuple([a.extent if flow else a.size for a in channel_axes])
