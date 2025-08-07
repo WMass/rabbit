@@ -273,6 +273,9 @@ def parseArgs():
         help="Plot vertical lines for makro bin edges in unrolled plots, specify bin boundaries to plot lines, if empty plot for all",
     )
     parser.add_argument(
+        "--noExtraText", action="store_true", help="Suppress extra text"
+    )
+    parser.add_argument(
         "--extraTextLoc",
         type=float,
         nargs="*",
@@ -506,10 +509,13 @@ def make_plot(
             ),
             automatic_scale=args.customFigureWidth is None,
             subplotsizes=args.subplotSizes,
+            logy=args.logy,
         )
         ax2 = ratio_axes[-1]
     else:
-        fig, ax1 = plot_tools.figure(h_inclusive, xlabel, ylabel, args.ylim)
+        fig, ax1 = plot_tools.figure(
+            h_inclusive, xlabel, ylabel, args.ylim, logy=args.logy
+        )
 
     for (
         h,
@@ -889,7 +895,7 @@ def make_plot(
     if selection is not None:
         text_pieces.extend(selection)
 
-    if chi2[0] is not None and data:
+    if chi2[0] is not None and data and not args.noExtraText:
         p_val = int(np.round(scipy.stats.chi2.sf(chi2[0], chi2[1]) * 100))
         if saturated_chi2:
             chi2_name = r"$\mathit{\chi}_{\mathrm{sat.}}^2/\mathit{ndf}$"
@@ -918,7 +924,9 @@ def make_plot(
             )
 
     if ratio or diff:
-        plot_tools.fix_axes(ax1, ax2, fig, yscale=args.yscale, noSci=args.noSciy)
+        plot_tools.fix_axes(
+            ax1, ax2, fig, yscale=args.yscale, noSci=args.noSciy, logy=args.logy
+        )
     else:
         plot_tools.fix_axes(ax1, yscale=args.yscale, logy=args.logy)
 
@@ -938,7 +946,7 @@ def make_plot(
             ncols=args.legCols,
             loc=args.legPos,
             text_size=args.legSize,
-            extra_text=text_pieces,
+            extra_text=text_pieces if not args.noExtraText else None,
             extra_text_loc=None if args.extraTextLoc is None else args.extraTextLoc[:2],
             padding_loc=args.legPadding,
         )
