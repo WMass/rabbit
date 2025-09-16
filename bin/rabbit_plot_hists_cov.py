@@ -111,7 +111,17 @@ def parseArgs():
         """,
     )
     parser.add_argument(
+        "--params",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Plot parameter matrix, specify list of parameter names to include in the matrix, leave free to plot all parameters",
+    )
+    parser.add_argument(
         "--prefit", action="store_true", help="Make prefit plot, else postfit"
+    )
+    parser.add_argument(
+        "--showNumbers", action="store_true", help="Show numbers in the plot"
     )
     parser.add_argument(
         "--selectionAxes",
@@ -132,18 +142,19 @@ def parseArgs():
 
 def plot_matrix(
     outdir,
-    hist_obj,
+    matrix,
     args,
     channel=None,
     axes=None,
     cmap="coolwarm",
-    annot=False,
     config={},
     meta=None,
     suffix=None,
+    ticklabels=None,
 ):
 
-    matrix = hist_obj.values()
+    if not isinstance(matrix, np.ndarray):
+        matrix = matrix.values()
 
     if len(matrix.shape) > 2:
         flat = np.prod(matrix.shape[: len(matrix.shape) // 2])
@@ -155,24 +166,32 @@ def plot_matrix(
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
+    opts = dict()
+    if ticklabels is not None:
+        opts.update(
+            dict(
+                xticklabels=ticklabels,
+                yticklabels=ticklabels,
+            )
+        )
+
     sns.heatmap(
         matrix,
         cmap=cmap,
-        annot=annot,
+        annot=args.showNumbers,
         fmt=".2g",
         square=True,
         cbar=True,
         linewidths=0.5,
         ax=ax,
-        vmin=-1 if args.correlation else None,
-        vmax=1 if args.correlation else None,
+        **opts,
     )
+    if ticklabels is None:
+        xlabel = plot_tools.get_axis_label(config, axes, args.xlabel, is_bin=True)
+        ylabel = plot_tools.get_axis_label(config, axes, args.ylabel, is_bin=True)
 
-    xlabel = plot_tools.get_axis_label(config, axes, args.xlabel, is_bin=True)
-    ylabel = plot_tools.get_axis_label(config, axes, args.ylabel, is_bin=True)
-
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
 
     plot_tools.add_decor(
         ax,
@@ -235,7 +254,39 @@ def main():
 
     plt.rcParams["font.size"] = plt.rcParams["font.size"] * args.scaleTextSize
 
-    channel_info = meta["meta_info_input"]["channel_info"]
+    if args.params is not None:
+        h_cov = fitresult["cov"].get()
+        axes = h_cov.axes.name
+
+        if len(args.params) > 0:
+            h_param = fitresult["parms"].get()
+            params = np.array([n for n in h_param.axes["parms"]])
+
+            isin = np.isin(args.params, params)
+            if not np.all(isin):
+                missing = args.params[~isin]
+                raise RuntimeError(f"Parameters {missing} not found")
+
+            indices = np.array([np.where(params == val)[0][0] for val in args.params])
+
+            h_cov = h_cov.values()[np.ix_(indices, indices)]
+
+            ticklabels = [
+                config.get("systematics_labels", {}).get(p, p) for p in params[indices]
+            ]
+        else:
+            ticklabels = None
+
+        plot_matrix(
+            outdir,
+            h_cov,
+            args,
+            axes=axes,
+            config=config,
+            meta=meta,
+            suffix="params",
+            ticklabels=ticklabels,
+        )
 
     hist_cov_key = f"hist_{'prefit' if args.prefit else 'postfit'}_inclusive_cov"
 

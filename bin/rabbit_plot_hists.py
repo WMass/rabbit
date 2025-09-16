@@ -70,6 +70,11 @@ def parseArgs():
         help="Luminosity used in the fit, needed to get the absolute cross section",
     )
     parser.add_argument(
+        "--noEnergy",
+        action="store_true",
+        help="Don't include the energy in the upper right corner of the plot",
+    )
+    parser.add_argument(
         "--title",
         default="Rabbit",
         type=str,
@@ -1024,6 +1029,7 @@ def make_plot(
         lumi=lumi,  # if args.dataName == "Data" and not args.noData else None,
         loc=args.titlePos,
         text_size=args.legSize,
+        no_energy=args.noEnergy,
     )
 
     if len(h_stack) < 10:

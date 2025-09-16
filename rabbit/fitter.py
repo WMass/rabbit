@@ -82,6 +82,17 @@ class Fitter:
             )
             for signal in self.indata.signals:
                 self.pois.append(signal)
+
+            if options.expectSignal is not None:
+                indices = []
+                updates = []
+                for signal, value in options.expectSignal:
+                    idx = self.pois.index(signal.encode())
+                    indices.append([idx])
+                    updates.append(float(value))
+
+                poidefault = tf.tensor_scatter_nd_update(poidefault, indices, updates)
+
         elif options.POIMode == "none":
             self.npoi = 0
             poidefault = tf.zeros([], dtype=self.indata.dtype)
@@ -1848,7 +1859,7 @@ class Fitter:
         self.x.assign(xval)
         return x_scans, y_scans, dnlls
 
-    def contour_scan(self, param, nll_min, cl=1):
+    def contour_scan(self, param, nll_min, q=1, signs=[-1, 1], return_all_params=False):
 
         def scipy_grad(xval):
             self.x.assign(xval)
@@ -1865,7 +1876,7 @@ class Fitter:
         def scipy_loss(xval):
             self.x.assign(xval)
             val = self.loss_val()
-            return val.numpy() - nll_min - 0.5 * cl**2
+            return val.numpy() - nll_min - 0.5 * q
 
         nlc = scipy.optimize.NonlinearConstraint(
             fun=scipy_loss,
@@ -1879,25 +1890,30 @@ class Fitter:
         idx = np.where(self.parms.astype(str) == param)[0][0]
         xval = tf.identity(self.x)
 
-        xup = xval[idx] + self.cov[idx, idx] ** 0.5
-        xdn = xval[idx] - self.cov[idx, idx] ** 0.5
+        xerr = (self.cov[idx, idx] * q) ** 0.5
+        xup = xval[idx] + xerr
+        xdn = xval[idx] - xerr
 
         xval_init = xval.numpy()
 
-        intervals = np.full((2, len(self.parms)), np.nan)
-        for i, sign in enumerate([-1.0, 1.0]):
-            if sign == 1.0:
+        if return_all_params:
+            intervals = np.full((len(signs), len(self.parms)), np.nan)
+        else:
+            intervals = np.full((len(signs)), np.nan)
+
+        for i, sign in enumerate(signs):
+            if sign < 0:
                 xval_init[idx] = xdn
             else:
                 xval_init[idx] = xup
 
             # Objective function and its derivatives
             def objective(params):
-                return sign * params[idx]
+                return -sign * params[idx]
 
             def objective_jac(params):
                 jac = np.zeros_like(params)
-                jac[idx] = sign
+                jac[idx] = -sign
                 return jac
 
             def objective_hessp(params, v):
@@ -1919,7 +1935,10 @@ class Fitter:
             )
 
             if res["success"]:
-                intervals[i] = res["x"] - xval.numpy()
+                if return_all_params:
+                    intervals[i] = res["x"] - xval.numpy()
+                else:
+                    intervals[i] = res["x"][idx] - xval.numpy()[idx]
 
             self.x.assign(xval)
 

@@ -4,6 +4,7 @@ import argparse
 import os
 
 import matplotlib.pyplot as plt
+import mplhep as hep
 import numpy as np
 from scipy.stats import chi2
 
@@ -12,7 +13,7 @@ from rabbit import io_tools
 from wums import output_tools, plot_tools  # isort: skip
 
 
-plt.rcParams.update({"font.size": 14})
+hep.style.use(hep.style.ROOT)
 
 
 def writeOutput(fig, outfile, extensions=[], postfix=None, args=None, meta_info=None):
@@ -189,7 +190,7 @@ def plot_scan(
     else:
         right = 0.99
 
-    fig, ax = plt.subplots(figsize=(6, 5))
+    fig, ax = plt.subplots(figsize=(9, 7.5))
     fig.subplots_adjust(left=0.14, bottom=0.14, right=right, top=0.93)
 
     # Plot mean point
@@ -386,8 +387,8 @@ def main():
             h_scan,
             h_contour_params,
             scan_contour=not args.noScanContour,
-            xlabel=plot_tools.get_axis_label(config, px, args.xlabel),
-            ylabel=plot_tools.get_axis_label(config, py, args.ylabel),
+            xlabel=plot_tools.get_axis_label(config, [px], args.xlabel),
+            ylabel=plot_tools.get_axis_label(config, [py], args.ylabel),
             title=args.title,
             subtitle=args.subtitle,
             titlePos=args.titlePos,
