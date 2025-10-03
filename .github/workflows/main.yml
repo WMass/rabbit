@@ -160,6 +160,10 @@ jobs:
         run: >-
           python tests/make_tensor.py -o $RABBIT_OUTDIR/ --symmetrizeAll --systematicType normal --postfix symmetric
 
+      - name: make linearized tensor
+        run: >- 
+          python tests/make_tensor.py -o $RABBIT_OUTDIR/ --symmetrizeAl  --systematicType normal --addSystToDataCovariance --skipMaskedChannels --postfix linearized
+
       - name: make sparse tensor
         run: >-
           python tests/make_tensor.py -o $RABBIT_OUTDIR/ --sparse --postfix sparse
@@ -251,10 +255,14 @@ jobs:
       - name: linearized solution
         run: >- 
           rabbit_fit.py $RABBIT_OUTDIR/test_tensor_symmetric.hdf5 -o $RABBIT_OUTDIR/ --postfix linearized
-          -t 0 --chisqFit --doImpacts --globalImpacts --binByBinStatType normal --allowNegativePOI
+          -t 0 --chisqFit --doImpacts --globalImpacts --binByBinStatType normal-additive --allowNegativePOI
           --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
           --computeHistImpacts --computeHistCov -m Project ch1 a -m Project ch1 b 
 
+      - name: chi2 fit with Barlow--Beeston full
+        run: >- 
+          rabbit_fit.py $RABBIT_OUTDIR/test_tensor_symmetric.hdf5 -o $RABBIT_OUTDIR/ --postfix bb_full
+          -t 0 --globalImpacts --binByBinStatType normal-multiplicative --binByBinStatMode full
 
   plotting:
     runs-on: [self-hosted, linux, x64]
@@ -299,7 +307,7 @@ jobs:
       - name: plot global impacts
         run: >-
           rabbit_plot_pulls_and_impacts.py $RABBIT_OUTDIR/fitresults.hdf5 -o $WEB_DIR/$PLOT_DIR
-          -r $RABBIT_OUTDIR/fitresults_pseudodata.hdf5 --refName "Pseudo data" -s absimpact
+          -r $RABBIT_OUTDIR/fitresults_pseudodata.hdf5 --refResult original --refName "Pseudo data" -s absimpact
           --otherExtensions pdf png -n 50  --config tests/style_config.py --oneSidedImpacts --globalImpacts --diffPullAsym --showNumbers
           --grouping max --subtitle Preliminary --postfix data_vs_pseudodata
 

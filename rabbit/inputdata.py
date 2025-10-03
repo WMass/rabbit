@@ -40,9 +40,21 @@ class FitInputData:
                 hpseudodata_obs = f["hpseudodata"]
 
                 self.pseudodata_obs = maketensor(hpseudodata_obs)
+                if "hpseudodatavar" in f.keys():
+                    hpseudodata_var = f["hpseudodatavar"]
+                    self.pseudodata_var = maketensor(hpseudodata_var)
+                else:
+                    self.pseudodata_var = None
 
                 # if explicit pseudodata sets are requested, select them (keep all for empty list)
                 if len(pseudodata) > 0:
+                    # Check if all pseudodata are in self.pseudodatanames
+                    if not np.all(np.isin(pseudodata, self.pseudodatanames)):
+                        missing = [
+                            pd for pd in pseudodata if pd not in self.pseudodatanames
+                        ]
+                        raise ValueError(f"Missing pseudodata: {missing}")
+
                     mask = np.isin(self.pseudodatanames, pseudodata)
                     indices = np.where(mask)[0]
                     if not indices.size:
@@ -56,6 +68,10 @@ class FitInputData:
                     self.pseudodatanames = self.pseudodatanames[indices]
 
             self.data_obs = maketensor(f["hdata_obs"])
+            if "hdata_var" in f.keys():
+                self.data_var = maketensor(f["hdata_var"])
+            else:
+                self.data_var = None
 
             # start by creating tensors which read in the hdf5 arrays (optimized for memory consumption)
             self.constraintweights = maketensor(f["hconstraintweights"])

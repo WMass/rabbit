@@ -253,8 +253,14 @@ def make_parser():
     parser.add_argument(
         "--binByBinStatType",
         default="automatic",
-        choices=["automatic", "gamma", "normal"],
+        choices=["automatic", *fitter.Fitter.valid_bin_by_bin_stat_types],
         help="probability density for bin-by-bin statistical uncertainties, ('automatic' is 'gamma' except for data covariance where it is 'normal')",
+    )
+    parser.add_argument(
+        "--binByBinStatMode",
+        default="lite",
+        choices=["lite", "full"],
+        help="Barlow-Beeston mode bin-by-bin statistical uncertainties",
     )
     parser.add_argument(
         "--externalPostfit",
@@ -659,19 +665,25 @@ def main():
         prefit_time = []
         postfit_time = []
         fit_time = []
+
         for i, ifit in enumerate(fits):
             group = ["results"]
 
             if args.pseudoData is None:
-                datasets = [
-                    ifitter.indata.data_obs,
-                ]
+                datasets = zip([ifitter.indata.data_obs], [ifitter.indata.data_var])
             else:
                 # shape nobs x npseudodata
-                datasets = tf.transpose(indata.pseudodata_obs)
+                datasets = zip(
+                    tf.transpose(indata.pseudodata_obs),
+                    (
+                        tf.transpose(indata.pseudodata_var)
+                        if indata.pseudodata_var is not None
+                        else [None] * indata.pseudodata_obs.shape[-1]
+                    ),
+                )
 
             # loop over (pseudo)data sets
-            for j, data_values in enumerate(datasets):
+            for j, (data_values, data_variances) in enumerate(datasets):
 
                 ifitter.defaultassign()
                 if ifit == -1:
@@ -684,14 +696,15 @@ def main():
                         group.append(f"toy{ifit}")
                         ifitter.toyassign(
                             data_values,
+                            data_variances,
                             syst_randomize=args.toysSystRandomize,
                             data_randomize=args.toysDataRandomize,
                             data_mode=args.toysDataMode,
                             randomize_parameters=args.toysRandomizeParameters,
                         )
 
-                if np.shape(datasets)[0] > 1:
-                    # in case there are more than 1 pseudodata set, label each one
+                if args.pseudoData is not None:
+                    # label each pseudodata set
                     if j == 0:
                         group.append(indata.pseudodatanames[j])
                     else:
