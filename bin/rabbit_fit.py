@@ -350,6 +350,12 @@ def make_parser():
         Specify list of regex to freeze matching parameters of interest. 
         """,
     )
+    parser.add_argument(
+        "--chisqFitProtectNullBins",
+        default=False,
+        action="store_true",
+        help="Protect against null bins (by discarding them) in chi-square fit",
+    )
 
     return parser.parse_args()
 

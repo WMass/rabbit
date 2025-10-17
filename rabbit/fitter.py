@@ -79,6 +79,7 @@ class Fitter:
         self.minimizer_method = options.minimizerMethod
 
         self.chisqFit = options.chisqFit
+        self.chisqFitProtectNullBins = options.chisqFitProtectNullBins
         self.externalCovariance = options.externalCovariance
         self.prefitUnconstrainedNuisanceUncertainty = (
             options.prefitUnconstrainedNuisanceUncertainty
@@ -343,9 +344,11 @@ class Fitter:
     def set_nobs(self, values):
         if self.chisqFit and not self.externalCovariance:
             # covariance from data stat
-            if tf.math.reduce_any(values <= 0).numpy():
+            if (not self.chisqFitProtectNullBins) and tf.math.reduce_any(
+                self.nobs <= 0
+            ).numpy():
                 raise RuntimeError(
-                    "Bins in 'nobs <= 0' encountered, chi^2 fit can not be performed."
+                    "Bins in 'nobs <= 0' encountered and protection --chisqProtectNullBins is off, chi^2 fit can not be performed."
                 )
         self.nobs.assign(values)
         # compute offset for poisson nll improved numerical precision in minimizatoin
@@ -1217,9 +1220,23 @@ class Fitter:
                             )
                             beta = tf.squeeze(beta, axis=-1)
                         else:
-                            beta = (
-                                sbeta * (self.nobs - nexp_profile) + nobs0 * beta0
-                            ) / (nobs0 + varbeta)
+                            if self.chisqFitProtectNullBins:
+                                # protection for nobs0 = varbeta = 0 in null bins; need 2 layers of protection to protect gradient as well
+                                denom = nobs0 + varbeta
+                                denomsafe = tf.where(
+                                    tf.equal(denom, 0), tf.ones_like(denom), denom
+                                )
+                                beta = tf.where(
+                                    tf.equal(denom, 0),
+                                    tf.zeros_like(denomsafe),
+                                    (sbeta * (self.nobs - nexp_profile) + nobs0 * beta0)
+                                    / denomsafe,
+                                )
+                            else:
+                                beta = (
+                                    sbeta * (self.nobs - nexp_profile) + nobs0 * beta0
+                                ) / (nobs0 + varbeta)
+
                 else:
                     if self.binByBinStatType == "gamma":
                         kstat = self.kstat[: self.indata.nbins]
@@ -1566,9 +1583,25 @@ class Fitter:
             else:
                 # stop_gradient needed in denominator here because it should be considered
                 # constant when evaluating global impacts from observed data
-                ln = 0.5 * tf.reduce_sum(
-                    (nexp - self.nobs) ** 2 / tf.stop_gradient(self.nobs), axis=-1
-                )
+                if self.chisqFitProtectNullBins:
+                    # protection against null bins
+                    nobsnull_0_0 = tf.equal(self.nobs, tf.zeros_like(self.nobs))
+                    nexpnull_0_0 = tf.equal(nexp, tf.zeros_like(nexp))
+                    nobsnan = tf.logical_not(tf.math.is_finite(self.nobs))
+                    nexpnan = tf.logical_not(tf.math.is_finite(nexp))
+                    nobsnull_0 = tf.logical_or(nobsnull_0_0, nobsnan)
+                    nexpnull_0 = tf.logical_or(nexpnull_0_0, nexpnan)
+                    nobsnull = tf.logical_or(nobsnull_0, nexpnull_0)
+                    nobssafe = tf.where(nobsnull, tf.ones_like(self.nobs), self.nobs)
+                    nexpsafe = tf.where(nobsnull, tf.ones_like(self.nobs), nexp)
+
+                    ln = 0.5 * tf.reduce_sum(
+                        (nexpsafe - nobssafe) ** 2 / tf.stop_gradient(nobssafe), axis=-1
+                    )
+                else:
+                    ln = 0.5 * tf.reduce_sum(
+                        (nexp - self.nobs) ** 2 / tf.stop_gradient(self.nobs), axis=-1
+                    )
         else:
             nexpsafe = tf.where(
                 self.nobs == 0.0, tf.constant(1.0, dtype=nexp.dtype), nexp
