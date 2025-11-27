@@ -389,7 +389,7 @@ def save_hists(args, models, fitter, ws, prefit=True, profile=False):
                 compute_variance=args.computeHistErrors,
                 compute_cov=args.computeHistCov,
                 compute_chi2=not args.noChi2 and model.has_data,
-                compute_global_impacts=args.computeHistImpacts and not prefit,
+                compute_global_impacts=args.computeHistImpacts,
                 profile=profile,
             )
 

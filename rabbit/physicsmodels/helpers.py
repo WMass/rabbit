@@ -16,6 +16,7 @@ baseline_models = {
     "Normalize": "project",
     "Ratio": "ratio",
     "Normratio": "ratio",
+    "Asymmetry": "ratio",
     "AngularCoefficients": "angular_coefficients",
     "LamTung": "angular_coefficients",
 }

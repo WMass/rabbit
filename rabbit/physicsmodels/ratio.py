@@ -188,3 +188,19 @@ class Normratio(Ratio):
         exp = num / den
         exp = tf.reshape(exp, [-1])
         return exp
+
+
+class Asymmetry(Ratio):
+    """
+    Same as Ratio but defined as A = (num - den) / (num + den)
+    """
+
+    def init(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def compute_flat(self, params, observables):
+        num = self.num.select(observables, inclusive=True)
+        den = self.den.select(observables, inclusive=True)
+        exp = (num - den) / (num + den)
+        exp = tf.reshape(exp, [-1])
+        return exp
