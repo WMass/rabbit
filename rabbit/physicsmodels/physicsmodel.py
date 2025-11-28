@@ -215,7 +215,7 @@ class Select(Channelmodel):
     @classmethod
     def parse_args(cls, indata, channel, *args):
         """
-        parsing the input arguments into the ratio constructor, is has to be called as
+        parsing the input arguments into the constructor, is has to be called as
         -m Select <ch num>
             <proc_0>,<proc_1>,...
             <axis_0>:<selection_0>,<axis_1>,<selection_1>...

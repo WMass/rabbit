@@ -50,6 +50,13 @@ def parseArgs():
         "--xvals", type=float, nargs="+", default=None, help="x-axis ticks for plotting"
     )
     parser.add_argument(
+        "--biases",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Add additional line to highlight the bias in each point",
+    )
+    parser.add_argument(
         "--scale", type=float, default=1.0, help="Scale limits by this value"
     )
     parser.add_argument(
@@ -124,6 +131,7 @@ def main():
     clb_list = set()
     limits = []
     limits_asimov = []
+    lumi = None
     for infile in args.infiles:
         fitresult_asimov, meta = io_tools.get_fitresult(
             infile, result="asimov", meta=True
@@ -136,11 +144,23 @@ def main():
 
         limits_asimov.append(h_limits_asimov)
 
-        fitresult = io_tools.get_fitresult(infile, meta=False)
+        fitresult, meta = io_tools.get_fitresult(infile, meta=True)
         if fitresult != fitresult_asimov and not args.noObs:
-            h_limits = fitresult["asymptoticLimits"].get()
-            cls_list = cls_list.union(set([cls for cls in h_limits.axes["cls"]]))
-            limits.append(h_limits)
+            if (
+                "asymptoticLimits" in fitresult.keys()
+                and "clb" not in fitresult["asymptoticLimits"].get().axes.name
+            ):
+                h_limits = fitresult["asymptoticLimits"].get()
+                cls_list = cls_list.union(set([cls for cls in h_limits.axes["cls"]]))
+                limits.append(h_limits)
+            else:
+                limits.append(h_limits_asimov[{"clb": "0.5"}])
+
+        channel_info = meta["meta_info_input"]["channel_info"]
+        lumis = set([c.get("lumi", None) for c in channel_info.values()])
+        if len(lumis) > 1 or (lumi is not None and tuple(lumis)[0] != lumi):
+            raise ValueError("Different channels with different luminosity values")
+        lumi = tuple(lumis)[0]
 
     if args.xvals is not None:
         x = np.array(args.xvals)
@@ -205,6 +225,21 @@ def main():
             label="Median expected",
         )
 
+        if args.biases is not None:
+            color_bias = "tab:red"
+            # add right y-axis
+            ax2 = ax.twinx()
+            ax2.plot(
+                x,
+                args.biases,
+                linestyle="--",
+                color=color_bias,
+                linewidth=1.5,
+                label="Expected bias",
+            )
+            ax2.set_ylabel("1 - relative expected bias", color=color_bias)
+            ax2.tick_params(axis="y", labelcolor=color_bias)
+
         if len(limits) > 0:
             # Observed
             ax.plot(x, yobs, color="black", linewidth=1.5, label="Observed")
@@ -214,7 +249,7 @@ def main():
             args.title,
             args.subtitle,
             data=len(limits) > 0,
-            lumi=None,  # if args.dataName == "Data" and not args.noData else None,
+            lumi=lumi,  # if args.dataName == "Data" and not args.noData else None,
             loc=args.titlePos,
             text_size=args.legSize,
         )

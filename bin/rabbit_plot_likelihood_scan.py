@@ -84,6 +84,11 @@ def parseArgs():
         help="Parameters to plot the likelihood scan",
     )
     parser.add_argument(
+        "--noHessian",
+        action="store_true",
+        help="Don't include Hessian likelihood approximation in plot",
+    )
+    parser.add_argument(
         "--combine",
         type=str,
         default=None,
@@ -128,9 +133,10 @@ def plot_scan(
     subtitle=None,
     titlePos=0,
     xlim=None,
+    combine=None,
     ylabel=r"$-2\,\Delta \log L$",
     config={},
-    combine=None,
+    no_hessian=False,
 ):
 
     xlabel = getattr(config, "systematics_labels", {}).get(param, param)
@@ -140,42 +146,54 @@ def plot_scan(
     x = np.array(h_scan.axes["scan"]).astype(float)[mask]
     y = h_scan.values()[mask] * 2
 
+    if xlim is None:
+        xlim = (min(x), max(x))
+
     fig, ax = plot_tools.figure(
         x,
         xlabel,
         ylabel,
-        xlim=(min(x), max(x)),
+        xlim=xlim,
         ylim=(min(y), max(y)),  # logy=args.logy
     )
 
     ax.axhline(y=1, color="gray", linestyle="--", alpha=0.5)
     ax.axhline(y=4, color="gray", linestyle="--", alpha=0.5)
 
-    parabola_vals = param_value + np.linspace(
-        -3 * param_variance**0.5, 3 * param_variance**0.5, 100
-    )
-    parabola_nlls = 1 / param_variance * (parabola_vals - param_value) ** 2
-    ax.plot(
-        parabola_vals,
-        parabola_nlls,
-        marker="",
-        markerfacecolor="none",
-        color="red",
-        linestyle="-",
-        label="Hessian",
-    )
+    if not no_hessian:
+        parabola_vals = param_value + np.linspace(
+            -3 * param_variance**0.5, 3 * param_variance**0.5, 100
+        )
+        parabola_nlls = 1 / param_variance * (parabola_vals - param_value) ** 2
+        ax.plot(
+            parabola_vals,
+            parabola_nlls,
+            marker="",
+            markerfacecolor="none",
+            color="red",
+            linestyle="-",
+            label="Hessian",
+        )
 
     ax.plot(
         x,
         y,
-        marker="x",
-        color="blue",
-        label="Likelihood scan",
+        marker=None,  # "x",
+        color="black",
+        label="Likelihood scan" if combine is None else "Rabbit",
         markeredgewidth=2,
+        linewidth=2,
     )
 
     if combine is not None:
-        ax.plot(*combine, marker="o", color="orange", label="Combine")
+        ax.plot(
+            *combine,
+            marker="o",
+            linestyle=None,
+            linewidth=0,
+            color="orange",
+            label="Combine",
+        )
 
     if h_contours is not None:
         for i, cl in enumerate(h_contours.axes["confidence_level"]):
@@ -201,12 +219,7 @@ def plot_scan(
     ax.legend(loc="upper right")
 
     plot_tools.add_decor(
-        ax,
-        title,
-        subtitle,
-        data=False,
-        lumi=None,
-        loc=titlePos,
+        ax, title, subtitle, data=True, lumi=None, loc=titlePos, no_energy=True
     )
 
     return fig
@@ -269,6 +282,7 @@ def main():
             xlim=args.xlim,
             config=config,
             combine=(vals, nlls) if args.combine is not None else None,
+            no_hessian=args.noHessian,
         )
         os.makedirs(args.outpath, exist_ok=True)
         outfile = os.path.join(args.outpath, f"nll_scan_{param}")

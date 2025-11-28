@@ -9,7 +9,6 @@ import hist
 import matplotlib.pyplot as plt
 import mplhep as hep
 import numpy as np
-from matplotlib import colormaps
 
 import rabbit.io_tools
 
@@ -220,45 +219,9 @@ def parseArgs():
         help="Location in (x,y) for additional text, aligned to upper left",
     )
     parser.add_argument(
-        "--varNames", type=str, nargs="*", default=None, help="Name of variation hist"
-    )
-    parser.add_argument(
-        "--varLabels",
-        type=str,
-        nargs="*",
-        default=None,
-        help="Label(s) of variation hist for plotting",
-    )
-    parser.add_argument(
-        "--varColors",
-        type=str,
-        nargs="*",
-        default=None,
-        help="Color(s) of variation hist for plotting",
-    )
-    parser.add_argument(
-        "--varOneSided",
-        type=int,
-        nargs="*",
-        default=[],
-        help="Only plot one sided variation (1) or two default two-sided (0)",
-    )
-    parser.add_argument(
-        "--scaleVariation",
-        nargs="*",
-        type=float,
-        default=[],
-        help="Scale a variation by this factor",
-    )
-    parser.add_argument(
-        "--subplotSizes",
-        nargs=2,
-        type=int,
-        default=[4, 2],
-        help="Relative sizes for upper and lower panels",
-    )
-    parser.add_argument(
-        "--correlatedVariations", action="store_true", help="Use correlated variations"
+        "--noSciy",
+        action="store_true",
+        help="Don't allow scientific notation for y axis",
     )
     args = parser.parse_args()
 
@@ -304,14 +267,26 @@ def make_plot(
 
     translate_label = getattr(config, "systematics_labels", {})
     grouping = getattr(config, "nuisance_grouping", {}).get(args.grouping, None)
+    # h_impacts[{"impacts": "binByBinStatWmunu"}].values(flow=True)[...] = (
+    #     h_impacts[{"impacts": "binByBinStatW"}].values(flow=True) ** 2
+    #     + h_impacts[{"impacts": "binByBinStatWmunu"}].values(flow=True) ** 2
+    # ) ** 0.5
+
+    labels = labels[uncertainties != "binByBinStatW"]
+    uncertainties = uncertainties[uncertainties != "binByBinStatW"]
+
+    ncols = len(grouping) if grouping is not None else len(labels)
+    cmap = plt.get_cmap("tab10" if ncols <= 10 else "tab20")
+    icol = 0
+
     for (
         u,
-        c,
         l,
-    ) in zip(uncertainties, colors, labels):
+    ) in zip(uncertainties, labels):
 
         if grouping is not None and l not in grouping:
             continue
+        icol += 1
 
         h_impact = h_impacts[{"impacts": u}]
         if len(axes) > 1:
@@ -329,7 +304,7 @@ def make_plot(
             xerr=False,
             yerr=False,
             histtype="step",
-            color=c,
+            color=cmap(icol % cmap.N),
             label=translate_label.get(l, l),
             density=False,
             ax=ax1,
@@ -359,15 +334,7 @@ def make_plot(
     if selection is not None:
         text_pieces.extend(selection)
 
-    plot_tools.addLegend(
-        ax1,
-        ncols=args.legCols,
-        loc=args.legPos,
-        text_size=args.legSize,
-        extra_text=text_pieces,
-        extra_text_loc=None if args.extraTextLoc is None else args.extraTextLoc[:2],
-        padding_loc=args.legPadding,
-    )
+    plot_tools.fix_axes(ax1, None, fig, yscale=args.yscale, noSci=args.noSciy)
 
     plot_tools.add_decor(
         ax1,
@@ -378,7 +345,15 @@ def make_plot(
         text_size=args.legSize,
     )
 
-    plot_tools.fix_axes(ax1, None, fig, yscale=args.yscale, noSci=True)
+    plot_tools.addLegend(
+        ax1,
+        ncols=args.legCols,
+        loc=args.legPos,
+        text_size=args.legSize,
+        extra_text=text_pieces,
+        extra_text_loc=None if args.extraTextLoc is None else args.extraTextLoc[:2],
+        padding_loc=args.legPadding,
+    )
 
     to_join = ["uncertainties", args.postfix, *axes_names, suffix]
     outfile = "_".join(filter(lambda x: x, to_join))
@@ -445,8 +420,7 @@ def make_plots(
 
     if args.flterUncertainties is not None:
         uncertainties = [p for p in uncertainties if p in args.flterUncertainties]
-    cmap = plt.get_cmap("tab10" if len(uncertainties) <= 10 else "tab20")
-    colors = [cmap(i % cmap.N) for i in range(len(uncertainties))]
+
     labels = uncertainties[:]
 
     # make plots in slices (e.g. for charge plus an minus separately)
@@ -509,7 +483,6 @@ def make_plots(
                 other_axes,
                 uncertainties,
                 labels=labels,
-                colors=colors,
                 args=args,
                 suffix=suffix,
                 selection=selection,
@@ -526,7 +499,6 @@ def make_plots(
             axes,
             uncertainties,
             labels=labels,
-            colors=colors,
             args=args,
             suffix=channel,
             lumi=lumi,
@@ -547,29 +519,6 @@ def main():
     config = plot_tools.load_config(args.config)
 
     outdir = output_tools.make_plot_dir(args.outpath, eoscp=args.eoscp)
-    varNames = args.varNames
-    if varNames is not None:
-        varLabels = args.varLabels
-        varColors = args.varColors
-        if len(varLabels) != len(varNames):
-            raise ValueError(
-                "Must specify the same number of args for --varNames, and --varLabels"
-                f" found varNames={len(varNames)} and varLabels={len(varLabels)}"
-            )
-        if varColors is None:
-            varColors = [
-                colormaps["tab10" if len(varNames) < 10 else "tab20"](i)
-                for i in range(len(varNames))
-            ]
-
-        varOneSided = [
-            args.varOneSided[i] if i < len(args.varOneSided) else 0
-            for i in range(len(varNames))
-        ]
-        scaleVariation = [
-            args.scaleVariation[i] if i < len(args.scaleVariation) else 1
-            for i in range(len(varNames))
-        ]
 
     # load .hdf5 file first, must exist in combinetf and rabbit
     fitresult, meta = rabbit.io_tools.get_fitresult(args.infile, args.result, meta=True)
@@ -604,8 +553,7 @@ def main():
                 info = channel_info.get(channel, {})
 
                 suffix = f"{channel}_{instance_key}"
-                if args.correlatedVariations:
-                    suffix += "_correlated"
+
                 for sign, rpl in [
                     (" ", "_"),
                     (".", "p"),
