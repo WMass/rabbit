@@ -464,11 +464,18 @@ class TensorWriter:
     ):
 
         if add_to_data_covariance:
+            if noi:
+                raise ValueError(
+                    f"{name} is maked as 'noi' but an 'noi' can't be added to the data covariance matrix."
+                )
             self.systscovariance.add(name)
         elif not constrained:
             self.systsnoconstraint.add(name)
         else:
             self.systsstandard.add(name)
+
+        if noi:
+            self.systsnoi.add(name)
 
         # below only makes sense if this is an explicit nuisance parameter
         if not add_to_data_covariance:

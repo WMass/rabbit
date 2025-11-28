@@ -334,7 +334,6 @@ writer.add_systematic(
     "slope_signal_ch0",
     "sig",
     "ch0",
-    add_to_data_covariance=args.addSystToDataCovariance,
     groups=["slopes", "slopes_signal"],
     symmetrize="average",
     kfactor=1.2,
