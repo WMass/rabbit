@@ -156,6 +156,10 @@ jobs:
         run: >-
           python tests/make_tensor.py -o $RABBIT_OUTDIR/
 
+      - name: make bsm tensor
+        run: >-
+          python tests/make_tensor.py -o $RABBIT_OUTDIR/ --bsm --postfix bsm --skipMaskedChannels
+
       - name: make symmetric tensor
         run: >-
           python tests/make_tensor.py -o $RABBIT_OUTDIR/ --symmetrizeAll --systematicType normal --postfix symmetric
@@ -250,6 +254,11 @@ jobs:
           -t 0 --unblind --covarianceFit --doImpacts --globalImpacts 
           --saveHists --saveHistsPerProcess --computeHistErrors --computeHistErrorsPerProcess
           -m Project ch1 a -m Project ch1 b
+
+      - name: bsm fit
+        run: >-
+          rabbit_fit.py $RABBIT_OUTDIR/test_tensor_bsm.hdf5 -o $RABBIT_OUTDIR/ --postfix bsm
+          -t 0 --unblind --expectSignal bsm1 0  --expectSignal bsm2 1 --allowNegativePOI --asymptoticLimits bsm1 --cls 0.05
 
       - name: linearized solution
         run: >- 

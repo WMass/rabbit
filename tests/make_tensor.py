@@ -14,6 +14,12 @@ parser.add_argument(
     help="Postfix to append on output file name",
 )
 parser.add_argument(
+    "--bsm",
+    default=False,
+    action="store_true",
+    help="Add BSM signals to model",
+)
+parser.add_argument(
     "--sparse",
     default=False,
     action="store_true",
@@ -148,12 +154,24 @@ h1_bkg_2 = Histogram(ax_x, weighted=True)
 # masked channel e.g. for gen level distribution
 h1_sig_masked = Histogram(ax_x, weighted=True)
 
+if args.bsm:
+    # hypothetical BSM signals for limit testing
+    h1_bsm1 = Histogram(ax_x, weighted=True)
+    h1_bsm2 = Histogram(ax_x, weighted=True)
+
+
 # for pseudodata
 h1_pseudo = Histogram(ax_x, weighted=True)
 h2_pseudo = Histogram(ax_a, ax_b, weighted=True)
 
 # Generate random data for filling
 np.random.seed(42)  # For reproducibility
+
+
+def get_bsm(n, mean=0, std=1.0):
+    # gaussian distributed signal
+    x = np.random.normal(mean, std, n)
+    return x
 
 
 def get_sig(factor=1):
@@ -213,6 +231,14 @@ fill(h2_bkg, a, b, weight=w_ab)
 
 x = get_bkg_2()
 fill(h1_bkg_2, x)
+
+if args.bsm:
+    # Assume BSM at x=-2 with width 0.1
+    x = get_bsm(100, -2, 0.1)
+    fill(h1_bsm1, x)
+    # Assume BSM at x=-3 with width 0.1
+    x = get_bsm(200, -3, 0.1)
+    fill(h1_bsm2, x)
 
 if not args.skipMaskedChannels:
     x, w_x = get_sig_masked(3)
@@ -276,8 +302,12 @@ writer.add_pseudodata(h2_pseudo, "original", "ch1")
 
 writer.add_data_covariance(cov)
 
-writer.add_process(h1_sig, "sig", "ch0", signal=True)
-writer.add_process(h2_sig, "sig", "ch1", signal=True)
+writer.add_process(h1_sig, "sig", "ch0", signal=not args.bsm)
+writer.add_process(h2_sig, "sig", "ch1", signal=not args.bsm)
+
+if args.bsm:
+    writer.add_process(h1_bsm1, "bsm1", "ch0", signal=True)
+    writer.add_process(h1_bsm2, "bsm2", "ch0", signal=True)
 
 writer.add_process(h1_bkg, "bkg", "ch0")
 writer.add_process(h2_bkg, "bkg", "ch1")
@@ -287,7 +317,7 @@ writer.add_process(h1_bkg_2, "bkg_2", "ch0")
 if not args.skipMaskedChannels:
     # add masked channel
     writer.add_channel(h1_sig_masked.axes, "ch0_masked", masked=True)
-    writer.add_process(h1_sig_masked, "sig", "ch0_masked", signal=True)
+    writer.add_process(h1_sig_masked, "sig", "ch0_masked", signal=not args.bsm)
 
 # systematic uncertainties
 

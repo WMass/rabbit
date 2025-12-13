@@ -1,12 +1,14 @@
 import hashlib
 import re
 
+import h5py
 import numpy as np
 import scipy
 import tensorflow as tf
 import tensorflow_probability as tfp
 from wums import logging
 
+from rabbit import io_tools
 from rabbit import tfhelpers as tfh
 
 logger = logging.child_logger(__name__)
@@ -109,11 +111,20 @@ class Fitter:
 
         if options.POIMode == "mu":
             self.npoi = self.indata.nsignals
-            poidefault = options.expectSignal * tf.ones(
-                [self.npoi], dtype=self.indata.dtype
-            )
+            poidefault = tf.ones([self.npoi], dtype=self.indata.dtype)
             for signal in self.indata.signals:
                 self.pois.append(signal)
+
+            if options.expectSignal is not None:
+                indices = []
+                updates = []
+                for signal, value in options.expectSignal:
+                    idx = self.pois.index(signal.encode())
+                    indices.append([idx])
+                    updates.append(float(value))
+
+                poidefault = tf.tensor_scatter_nd_update(poidefault, indices, updates)
+
         elif options.POIMode == "none":
             self.npoi = 0
             poidefault = tf.zeros([], dtype=self.indata.dtype)
@@ -136,8 +147,6 @@ class Fitter:
 
         self.parms = np.concatenate([self.pois, self.indata.systs])
 
-        self.init_frozen_params(options.freezeParameters)
-
         self.allowNegativePOI = options.allowNegativePOI
 
         if self.allowNegativePOI:
@@ -153,6 +162,15 @@ class Fitter:
             xdefault = thetadefault
 
         self.x = tf.Variable(xdefault, trainable=True, name="x")
+
+        # for freezing parameters
+        self.frozen_params = []
+        self.frozen_params_mask = tf.Variable(
+            tf.zeros_like(self.x, dtype=tf.bool), trainable=False, dtype=tf.bool
+        )
+
+        self.frozen_indices = np.array([])
+        self.freeze_params(options.freezeParameters)
 
         # observed number of events per bin
         self.nobs = tf.Variable(
@@ -281,12 +299,57 @@ class Fitter:
             and ((not self.binByBinStat) or self.binByBinStatType == "normal-additive")
         )
 
-    def init_frozen_params(self, frozen_parmeter_expressions):
-        self.frozen_params = match_regexp_params(
-            frozen_parmeter_expressions, self.parms
+    def load_fitresult(self, fitresult_file, fitresult_key):
+        # load results from external fit and set postfit value and covariance elements for common parameters
+        with h5py.File(fitresult_file, "r") as fext:
+            if "x" in fext.keys():
+                # fitresult from combinetf
+                x_ext = fext["x"][...]
+                parms_ext = fext["parms"][...].astype(str)
+                cov_ext = fext["cov"][...]
+            else:
+                # fitresult from rabbit
+                h5results_ext = io_tools.get_fitresult(fext, fitresult_key)
+                h_parms_ext = h5results_ext["parms"].get()
+
+                x_ext = h_parms_ext.values()
+                parms_ext = np.array(h_parms_ext.axes["parms"])
+                cov_ext = h5results_ext["cov"].get().values()
+
+        xvals = self.x.numpy()
+        covval = self.cov.numpy()
+        parms = self.parms.astype(str)
+
+        # Find common elements with their matching indices
+        common_elements, idxs, idxs_ext = np.intersect1d(
+            parms, parms_ext, assume_unique=True, return_indices=True
         )
-        self.frozen_params_mask = np.isin(self.parms, self.frozen_params)
-        self.frozen_indices = np.where(self.frozen_params_mask)[0]
+        xvals[idxs] = x_ext[idxs_ext]
+        covval[np.ix_(idxs, idxs)] = cov_ext[np.ix_(idxs_ext, idxs_ext)]
+
+        self.x.assign(xvals)
+        self.cov.assign(tf.constant(covval))
+
+    def update_frozen_params(self):
+        new_mask_np = np.isin(self.parms, self.frozen_params)
+
+        self.frozen_params_mask.assign(new_mask_np)
+        self.frozen_indices = np.where(new_mask_np)[0]
+
+    def freeze_params(self, frozen_parmeter_expressions):
+        self.frozen_params.extend(
+            match_regexp_params(frozen_parmeter_expressions, self.parms)
+        )
+        self.update_frozen_params()
+
+    def defreeze_params(self, unfrozen_parmeter_expressions):
+        unfrozen_parmeter = match_regexp_params(
+            unfrozen_parmeter_expressions, self.parms
+        )
+        self.frozen_params = [
+            x for x in self.frozen_params if x not in unfrozen_parmeter
+        ]
+        self.update_frozen_params()
 
     def init_blinding_values(self, unblind_parameter_expressions=[]):
 
@@ -1242,6 +1305,7 @@ class Fitter:
         poi = self.get_blinded_poi()
         theta = self.get_blinded_theta()
 
+        poi = tf.where(self.frozen_params_mask[: self.npoi], tf.stop_gradient(poi), poi)
         theta = tf.where(
             self.frozen_params_mask[self.npoi :], tf.stop_gradient(theta), theta
         )
@@ -2267,7 +2331,7 @@ class Fitter:
         self.x.assign(xval)
         return x_scans, y_scans, dnlls
 
-    def contour_scan(self, param, nll_min, cl=1):
+    def contour_scan(self, param, nll_min, q=1, signs=[-1, 1], return_all_params=False):
 
         def scipy_grad(xval):
             self.x.assign(xval)
@@ -2284,7 +2348,7 @@ class Fitter:
         def scipy_loss(xval):
             self.x.assign(xval)
             val = self.loss_val()
-            return val.numpy() - nll_min - 0.5 * cl**2
+            return val.numpy() - nll_min - 0.5 * q
 
         nlc = scipy.optimize.NonlinearConstraint(
             fun=scipy_loss,
@@ -2294,29 +2358,24 @@ class Fitter:
             hess=scipy.optimize.SR1(),  # TODO: use exact hessian or hessian vector product
         )
 
-        # initial guess from covariance
+        # initial values
         idx = np.where(self.parms.astype(str) == param)[0][0]
         xval = tf.identity(self.x)
-
-        xup = xval[idx] + self.cov[idx, idx] ** 0.5
-        xdn = xval[idx] - self.cov[idx, idx] ** 0.5
-
         xval_init = xval.numpy()
 
-        intervals = np.full((2, len(self.parms)), np.nan)
-        for i, sign in enumerate([-1.0, 1.0]):
-            if sign == 1.0:
-                xval_init[idx] = xdn
-            else:
-                xval_init[idx] = xup
+        if return_all_params:
+            intervals = np.full((len(signs), len(self.parms)), np.nan)
+        else:
+            intervals = np.full((len(signs)), np.nan)
 
+        for i, sign in enumerate(signs):
             # Objective function and its derivatives
             def objective(params):
-                return sign * params[idx]
+                return -sign * params[idx]
 
             def objective_jac(params):
                 jac = np.zeros_like(params)
-                jac[idx] = sign
+                jac[idx] = -sign
                 return jac
 
             def objective_hessp(params, v):
@@ -2338,7 +2397,10 @@ class Fitter:
             )
 
             if res["success"]:
-                intervals[i] = res["x"] - xval.numpy()
+                if return_all_params:
+                    intervals[i] = res["x"] - xval.numpy()
+                else:
+                    intervals[i] = res["x"][idx] - xval.numpy()[idx]
 
             self.x.assign(xval)
 

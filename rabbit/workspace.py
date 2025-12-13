@@ -289,6 +289,27 @@ class Workspace:
             impacts_grouped,
         )
 
+    def add_limits_hist(
+        self, limits, params, cls_list, clb_list=None, base_name="asymptoticLimits"
+    ):
+        axes = [
+            hist.axis.StrCategory(np.array(params).astype(str), name="parms"),
+            hist.axis.StrCategory(np.array(cls_list).astype(str), name="cls"),
+        ]
+
+        name = base_name
+        if clb_list is not None:
+            axes.append(
+                hist.axis.StrCategory(np.array(clb_list).astype(str), name="clb")
+            )
+
+        self.add_hist(
+            name,
+            axes,
+            limits,
+            label=f"Asymptotic limits (CLs)",
+        )
+
     def add_nll_scan_hist(self, param, scan_values, nll_values, base_name="nll_scan"):
         axis_scan = hist.axis.StrCategory(
             np.array(scan_values).astype(str), name="scan"

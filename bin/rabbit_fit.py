@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import copy
+
 import tensorflow as tf
 
 tf.config.experimental.enable_op_determinism()
@@ -7,11 +9,10 @@ tf.config.experimental.enable_op_determinism()
 import argparse
 import time
 
-import h5py
 import numpy as np
-import scipy
+from scipy.stats import chi2, norm
 
-from rabbit import fitter, inputdata, io_tools, workspace
+from rabbit import asymptotic_limits, fitter, inputdata, workspace
 from rabbit.physicsmodels import helpers as ph
 from rabbit.physicsmodels import physicsmodel as pm
 from rabbit.tfhelpers import edmval_cov
@@ -115,9 +116,10 @@ def make_parser():
     )
     parser.add_argument(
         "--expectSignal",
-        default=1.0,
-        type=float,
-        help="rate multiplier for signal expectation (used for fit starting values and for toys)",
+        default=None,
+        nargs=2,
+        action="append",
+        help="Sepcify tuple with signal name and rate multiplier for signal expectation (used for fit starting values and for toys). E.g. '--expectSignal BSM 0.0 --expectSignal SM 1.0'",
     )
     parser.add_argument("--POIMode", default="mu", help="mode for POI's")
     parser.add_argument(
@@ -125,6 +127,25 @@ def make_parser():
         default=False,
         action="store_true",
         help="allow signal strengths to be negative (otherwise constrained to be non-negative)",
+    )
+    parser.add_argument(
+        "--asymptoticLimits",
+        nargs="+",
+        default=[],
+        type=str,
+        help="Compute asymptotic upper limit based on CLs at specified parameters or (masked) channel",
+    )
+    parser.add_argument(
+        "--limitsOnChannel",
+        action="store_true",
+        help="Interpret specified key in '--asymptoticLimits <key>' as (masked) channel",
+    )
+    parser.add_argument(
+        "--cls",
+        nargs="+",
+        default=[0.05],
+        type=float,
+        help="Confidence level for asymptotic upper limit, multiple are possible",
     )
     parser.add_argument(
         "--contourScan",
@@ -135,9 +156,7 @@ def make_parser():
     )
     parser.add_argument(
         "--contourLevels",
-        default=[
-            1.0,
-        ],
+        default=[1.0, 2.0],
         type=float,
         nargs="+",
         help="Confidence level in standard deviations for contour scans (1 = 1 sigma = 68%%)",
@@ -458,47 +477,188 @@ def save_hists(args, models, fitter, ws, prefit=True, profile=False):
                 fitter.cov.assign(tf.constant(cov_prefit))
 
 
+def do_asymptotic_limits(
+    args, fitter, ws, data_values, bkg_only_fit=False, on_channel=False
+):
+    if bkg_only_fit:
+        logger.info("Perform background only fit")
+        # set process to zero and freeze
+        fitter.freeze_params(args.asymptoticLimits)
+
+        fitter.minimize()
+
+        # set asimov from background only fit
+        fitter.set_nobs(fitter.expected_yield())
+
+        # defreeze process again to evaluate it's dependencies
+        fitter.defreeze_params(args.asymptoticLimits)
+
+    if not args.noHessian:
+        # compute the covariance matrix and estimated distance to minimum
+
+        val, grad, hess = fitter.loss_val_grad_hess()
+        edmval, cov = edmval_cov(grad, hess)
+
+        logger.info(f"edmval: {edmval}")
+
+        fitter.cov.assign(cov)
+
+        del cov
+
+    # asymptotic limits (CLs)
+    #  see:
+    #  - combine tutorial https://indico.cern.ch/event/976099/contributions/4138520/
+    #  - paper: https://arxiv.org/abs/1007.1727
+
+    clb_list = np.array([0.025, 0.16, 0.5, 0.84, 0.975])
+
+    # axes for output histogram: params, cls, clb
+    limits_shape = [len(args.asymptoticLimits), len(args.cls), len(clb_list)]
+    limits_obs_shape = [len(args.asymptoticLimits), len(args.cls)]
+
+    limits = np.full(limits_shape, np.nan)
+    limits_obs = np.full(limits_obs_shape, np.nan)
+    limits_nll = np.full(limits_shape, np.nan)
+    limits_nll_obs = np.full(limits_obs_shape, np.nan)
+    for i, key in enumerate(args.asymptoticLimits):
+
+        if on_channel:
+            if key not in fitter.indata.channel_info.keys():
+                raise ValueError(f"Can not find (masked) channel {key} to set limits")
+
+            logger.info(f"Get the limit on the masked channel {key}_masked")
+            model = ph.instance_from_class("Select", fitter.indata, f"{key}_masked")
+            fun = model.compute_flat
+
+            exp, exp_var, _0, _1, _2 = fitter.expected_with_variance(
+                fun,
+                profile=True,
+                compute_cov=False,
+                compute_global_impacts=False,
+                need_observables=True,
+                inclusive=True,
+            )
+            xbest = exp.numpy()[0]
+            xerr = exp_var.numpy()[0] ** 0.5
+
+        else:
+            if key not in fitter.indata.signals.astype(str):
+                raise RuntimeError(
+                    f"Can not compute asymptotic limits for parameter {key}, no such signal process found, signal processe are: {fitter.indata.signals.astype(str)}"
+                )
+            logger.info(f"Get the limit from the signal strength")
+            idx = np.where(fitter.parms.astype(str) == key)[0][0]
+            xbest = fitter.get_blinded_poi()[idx]
+            xerr = fitter.cov[idx, idx] ** 0.5
+
+            xbest = xbest.numpy()
+            xerr = xerr.numpy()
+
+            if not args.allowNegativePOI:
+                xerr = 2 * xerr * xbest**0.5
+
+        logger.debug(f"Best fit {key} = {xbest} +/- {xerr}")
+
+        # this is the denominator of q for likelihood based limits
+        nllvalreduced_asimov = fitter.reduced_nll().numpy()
+
+        for j, cl_s in enumerate(args.cls):
+            logger.info(f" -- AsymptoticLimits ( CLs={round(cl_s*100,1):4.1f}% ) -- ")
+
+            # now we need to find the values for mu where q_{mu,A} = -2ln(L)
+            for k, cl_b in enumerate(clb_list):
+                cl_sb = cl_s * cl_b
+                qmuA = (norm.ppf(cl_b) - norm.ppf(cl_sb)) ** 2
+                logger.debug(f"Find r with q_(r,A)=-2ln(L)/ln(L0) = {qmuA}")
+
+                # Gaussian approximation
+                r = xbest + xerr * qmuA**0.5
+                logger.info(
+                    f"Expected (Gaussian) {round((cl_b)*100,1):4.1f}%: {key} < {r}"
+                )
+                limits[i, j, k] = r
+
+                if on_channel:
+                    # TODO: implement for channels
+                    pass
+                else:
+                    # Likelihood approximation
+                    r = fitter.contour_scan(key, nllvalreduced_asimov, qmuA, signs=[1])[
+                        0
+                    ]
+                    logger.info(
+                        f"Expected (Likelihood) {round((cl_b)*100,1):4.1f}%: {key} < {r}"
+                    )
+                    limits_nll[i, j, k] = r
+
+            # Clone fitter to simultaneously minimize on asimov dataset
+            fitter_asimov = copy.deepcopy(fitter)
+
+            # unconditional fit to real data
+            logger.info(f" -- Compute observed -- ")
+            fitter.set_nobs(data_values)
+            fitter.minimize()
+
+            # Gaussian approximation
+            limits_obs[i, j] = asymptotic_limits.compute_gaussian_limit(
+                fitter, key, idx, xerr, cl_s
+            )
+
+            # Likelihood approximation
+            if on_channel:
+                # TODO: implement for channels
+                pass
+            else:
+                # TODO: make it work
+                # nllvalreduced = fitter.reduced_nll().numpy()
+                # limits_nll_obs[i, j] = asymptotic_limits.compute_likelihood_limit(fitter, fitter_asimov, nllvalreduced, nllvalreduced_asimov, key, cl_s)
+                pass
+
+    ws.add_limits_hist(
+        limits,
+        args.asymptoticLimits,
+        args.cls,
+        clb_list,
+        base_name="gaussian_asymptoticLimits_expected",
+    )
+
+    ws.add_limits_hist(
+        limits_obs,
+        args.asymptoticLimits,
+        args.cls,
+        base_name="gaussian_asymptoticLimits_observed",
+    )
+
+    if not on_channel:
+        # TODO: implement for channels
+        ws.add_limits_hist(
+            limits_nll,
+            args.asymptoticLimits,
+            args.cls,
+            clb_list,
+            base_name="likelihood_asymptoticLimits_expected",
+        )
+
+        ws.add_limits_hist(
+            limits_nll_obs,
+            args.asymptoticLimits,
+            args.cls,
+            base_name="likelihood_asymptoticLimits_observed",
+        )
+
+
 def fit(args, fitter, ws, dofit=True):
 
     edmval = None
 
     if args.externalPostfit is not None:
-        # load results from external fit and set postfit value and covariance elements for common parameters
-        with h5py.File(args.externalPostfit, "r") as fext:
-            if "x" in fext.keys():
-                # fitresult from combinetf
-                x_ext = fext["x"][...]
-                parms_ext = fext["parms"][...].astype(str)
-                cov_ext = fext["cov"][...]
-            else:
-                # fitresult from rabbit
-                h5results_ext = io_tools.get_fitresult(fext, args.externalPostfitResult)
-                h_parms_ext = h5results_ext["parms"].get()
-
-                x_ext = h_parms_ext.values()
-                parms_ext = np.array(h_parms_ext.axes["parms"])
-                cov_ext = h5results_ext["cov"].get().values()
-
-        xvals = fitter.x.numpy()
-        covval = fitter.cov.numpy()
-        parms = fitter.parms.astype(str)
-
-        # Find common elements with their matching indices
-        common_elements, idxs, idxs_ext = np.intersect1d(
-            parms, parms_ext, assume_unique=True, return_indices=True
-        )
-        xvals[idxs] = x_ext[idxs_ext]
-        covval[np.ix_(idxs, idxs)] = cov_ext[np.ix_(idxs_ext, idxs_ext)]
-
-        fitter.x.assign(xvals)
-        fitter.cov.assign(tf.constant(covval))
+        fitter.load_fitresult(args.externalPostfit, args.externalPostfitResult)
     else:
         if dofit:
             fitter.minimize()
 
-        # compute the covariance matrix and estimated distance to minimum
-
         if not args.noHessian:
+            # compute the covariance matrix and estimated distance to minimum
 
             val, grad, hess = fitter.loss_val_grad_hess()
             edmval, cov = edmval_cov(grad, hess)
@@ -532,12 +692,12 @@ def fit(args, fitter, ws, dofit=True):
         tf.size(fitter.nobs) - fitter.npoi - fitter.indata.nsystnoconstraint
     ).numpy()
 
-    chi2 = 2.0 * nllvalreduced
-    p_val = scipy.stats.chi2.sf(chi2, ndfsat)
+    chi2_val = 2.0 * nllvalreduced
+    p_val = chi2.sf(chi2_val, ndfsat)
 
     logger.info("Saturated chi2:")
     logger.info(f"    ndof: {ndfsat}")
-    logger.info(f"    2*deltaNLL: {round(chi2, 2)}")
+    logger.info(f"    2*deltaNLL: {round(chi2_val, 2)}")
     logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
 
     ws.results.update(
@@ -567,6 +727,7 @@ def fit(args, fitter, ws, dofit=True):
         # TODO: based on covariance
         ws.add_nonprofiled_impacts_hist(*fitter.nonprofiled_impacts_parms())
 
+    # Likelihood scans
     if args.scan is not None:
         parms = np.array(fitter.parms).astype(str) if len(args.scan) == 0 else args.scan
 
@@ -588,8 +749,8 @@ def fit(args, fitter, ws, dofit=True):
             )
             ws.add_nll_scan2D_hist(param_tuple, x_scan, yscan, dnll_values)
 
+    # Likelihood contour scans
     if args.contourScan is not None:
-        # do likelihood contour scans
         nllvalreduced = fitter.reduced_nll().numpy()
 
         parms = (
@@ -605,7 +766,9 @@ def fit(args, fitter, ws, dofit=True):
                 logger.info(f"    Now at CL {cl}")
 
                 # find confidence interval
-                contour = fitter.contour_scan(param, nllvalreduced, cl)
+                contour = fitter.contour_scan(
+                    param, nllvalreduced, cl**2, return_all_params=True
+                )
                 contours[i, j, ...] = contour
 
         ws.add_contour_scan_hist(parms, contours, args.contourLevels)
@@ -745,27 +908,45 @@ def main():
                     hist_name="parms_prefit",
                 )
 
-                if args.saveHists:
-                    save_observed_hists(args, models, ifitter, ws)
-                    save_hists(args, models, ifitter, ws, prefit=True)
-                prefit_time.append(time.time())
+                if args.asymptoticLimits:
+                    prefit_time.append(time.time())
 
-                if not args.prefitOnly:
-                    ifitter.set_blinding_offsets(blind=blinded_fits[i])
-                    fit(args, ifitter, ws, dofit=ifit >= 0)
+                    observations = (
+                        data_values if ifit >= 0 else ifitter.expected_yield()
+                    )
+
+                    do_asymptotic_limits(
+                        args,
+                        ifitter,
+                        ws,
+                        data_values=observations,
+                        bkg_only_fit=ifit >= 0,
+                        on_channel=args.limitsOnChannel,
+                    )
                     fit_time.append(time.time())
 
-                    if args.saveHists:
-                        save_hists(
-                            args,
-                            models,
-                            ifitter,
-                            ws,
-                            prefit=False,
-                            profile=args.externalPostfit is None,
-                        )
                 else:
-                    fit_time.append(time.time())
+                    if args.saveHists:
+                        save_observed_hists(args, models, ifitter, ws)
+                        save_hists(args, models, ifitter, ws, prefit=True)
+                    prefit_time.append(time.time())
+
+                    if not args.prefitOnly:
+                        ifitter.set_blinding_offsets(blind=blinded_fits[i])
+                        fit(args, ifitter, ws, dofit=ifit >= 0)
+                        fit_time.append(time.time())
+
+                        if args.saveHists:
+                            save_hists(
+                                args,
+                                models,
+                                ifitter,
+                                ws,
+                                prefit=False,
+                                profile=args.externalPostfit is None,
+                            )
+                    else:
+                        fit_time.append(time.time())
 
                 ws.dump_and_flush("_".join(group))
                 postfit_time.append(time.time())

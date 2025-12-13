@@ -1,3 +1,5 @@
+import math
+
 import tensorflow as tf
 
 from .scipyhelpers import scipy_cond_number, scipy_edmval, scipy_edmval_cov
@@ -136,3 +138,13 @@ def segment_sum_along_axis(x, segment_ids, idx, num_segments):
     rebinned = tf.transpose(rebinned, reverse_perm)
 
     return rebinned
+
+
+def normal_pdf(x):
+    x = tf.convert_to_tensor(x)
+    two_pi = tf.constant(2.0 * math.pi, dtype=x.dtype)
+    return tf.exp(-0.5 * tf.square(x)) / tf.sqrt(two_pi)
+
+
+def normal_cdf(x):
+    return 0.5 * (1.0 + tf.math.erf(x / tf.sqrt(tf.constant(2.0, dtype=x.dtype))))
