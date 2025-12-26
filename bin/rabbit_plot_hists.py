@@ -750,6 +750,15 @@ def make_plot(
 
         ax1.set_ylim(min_y - range_y * 0.1, max_y + range_y * 0.1)
 
+    if args.ylim is not None and args.ylim[0] > args.ylim[1]:
+        # configuration to set minimum to args.ylim[0] (e.g. 0 when we have event yields) and maximum automatically
+        max_y = np.max(h_inclusive.values() + h_inclusive.variances() ** 0.5)
+        if h_data is not None:
+            max_y = max(max_y, np.max(h_data.values() + h_data.variances() ** 0.5))
+        min_y = args.ylim[0]
+        range_y = max_y - min_y
+        ax1.set_ylim(min_y, max_y + range_y * 0.1)
+
     if len(axes_names) > 1 and args.binSeparationLines is not None:
         # plot dashed vertical lines to sepate makro bins
 
