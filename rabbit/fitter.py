@@ -82,15 +82,6 @@ class Fitter:
             self.binByBinStatType = options.binByBinStatType
 
         if (
-            self.binByBinStat
-            and self.binByBinStatMode == "full"
-            and not self.binByBinStatType.startswith("normal")
-        ):
-            raise Exception(
-                'bin-by-bin stat only for option "--binByBinStatMode full" with "--binByBinStatType normal"'
-            )
-
-        if (
             options.covarianceFit
             and self.binByBinStat
             and not self.binByBinStatType.startswith("normal")
@@ -139,15 +130,32 @@ class Fitter:
             )
             self.init_blinding_values(options.unblind)
 
-        self.parms = np.concatenate([self.poi_model.pois, self.indata.systs])
-
+        parms = [self.poi_model.pois, self.indata.systs]
         # tf variable containing all fit parameters
         thetadefault = tf.zeros([self.indata.nsyst], dtype=self.indata.dtype)
         if self.poi_model.npoi > 0:
-            xdefault = tf.concat([self.poi_model.xpoidefault, thetadefault], axis=0)
+            xdefault = [self.poi_model.xpoidefault, thetadefault]
         else:
-            xdefault = thetadefault
+            xdefault = [thetadefault]
+        if self.binByBinStatType == "gamma" and self.binByBinStatMode == "full":
+            # explicit parameters for nbeta define as: nbeta = sum(beta_j n_j)/ sum(n_j)
+            nbetadefault = tf.ones([self.indata.nbins], dtype=self.indata.dtype)
+            xdefault.append(nbetadefault)
+            self.nbeta0 = tf.Variable(
+                tf.ones(self.indata.nbins, dtype=self.indata.dtype),
+                trainable=False,
+                name="nbeta0",
+            )
+            parms_nbeta = np.char.add(
+                "nbeta_", np.arange(self.indata.nbins).astype(str)
+            )
+            parms.append(parms_nbeta)
 
+        self.parms = np.concatenate(parms)
+        if len(xdefault) > 1:
+            xdefault = tf.concat(xdefault, axis=0)
+        else:
+            xdefault = xdefault[0]
         self.x = tf.Variable(xdefault, trainable=True, name="x")
 
         # for freezing parameters
@@ -230,10 +238,10 @@ class Fitter:
                     self.varbeta = self.indata.sumw2
                     self.sumw = self.indata.sumw
 
+            self.betamask = (self.varbeta == 0.0) | (self.sumw == 0.0)
+
             if self.binByBinStatType in ["gamma", "normal-multiplicative"]:
-                self.kstat = self.sumw**2 / self.varbeta
-                self.betamask = (self.varbeta == 0.0) | (self.kstat == 0.0)
-                self.kstat = tf.where(self.betamask, 1.0, self.kstat)
+                self.kstat = tf.where(self.betamask, 1.0, self.sumw**2 / self.varbeta)
             elif self.binByBinStatType == "normal-additive":
                 # precompute decomposition of composite matrix to speed up
                 # calculation of profiled beta values
@@ -403,8 +411,17 @@ class Fitter:
                 np.zeros(self.indata.nsyst, dtype=np.float64)
             )
 
+    def get_nbeta(self):
+        nbeta = self.x[
+            self.poi_model.npoi
+            + self.indata.nsyst : self.poi_model.npoi
+            + self.indata.nsyst
+            + self.indata.nbins
+        ]
+        return nbeta
+
     def get_blinded_theta(self):
-        theta = self.x[self.poi_model.npoi :]
+        theta = self.x[self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst]
         if self.do_blinding:
             return theta + self._blinding_offsets_theta
         else:
@@ -438,8 +455,14 @@ class Fitter:
             unconstrained_err**2,
             tf.math.reciprocal(self.indata.constraintweights),
         )
+        vars = [var_poi, var_theta]
 
-        invhessianprefit = tf.linalg.diag(tf.concat([var_poi, var_theta], axis=0))
+        if self.binByBinStatType == "gamma" and self.binByBinStatMode == "full":
+            # uncertainty from explicit nbeta parameters are accounted for by implicit beta parameters
+            var_nbeta = tf.zeros([self.indata.nbins], dtype=self.indata.dtype)
+            vars.append(var_nbeta)
+
+        invhessianprefit = tf.linalg.diag(tf.concat(vars, axis=0))
         return invhessianprefit
 
     @tf.function
@@ -479,9 +502,19 @@ class Fitter:
 
     def xdefaultassign(self):
         if self.poi_model.npoi == 0:
-            self.x.assign(self.theta0)
+            to_assign = [self.theta0]
         else:
-            self.x.assign(tf.concat([self.poi_model.xpoidefault, self.theta0], axis=0))
+            to_assign = [self.poi_model.xpoidefault, self.theta0]
+
+        if self.binByBinStatType == "gamma" and self.binByBinStatMode == "full":
+            to_assign.append(self.nbeta0)
+
+        if len(to_assign) > 1:
+            to_assign = tf.concat(to_assign, axis=0)
+        else:
+            to_assign = to_assign[0]
+
+        self.x.assign(to_assign)
 
     def beta0defaultassign(self):
         self.set_beta0(self._default_beta0())
@@ -526,6 +559,10 @@ class Fitter:
 
         if self.binByBinStat:
             if self.binByBinStatType == "gamma":
+                if self.binByBinStatMode == "full":
+                    raise NotImplementedError(
+                        "Barlow-Beeston full with gamma is not yet implemented"
+                    )
                 # FIXME this is only valid for beta0=beta=1 (but this should always be the case when throwing toys)
                 betagen = (
                     tf.random.gamma(
@@ -561,6 +598,10 @@ class Fitter:
         )
         if self.binByBinStat:
             if self.binByBinStatType == "gamma":
+                if self.binByBinStatMode == "full":
+                    raise NotImplementedError(
+                        "Barlow-Beeston full with gamma is not yet implemented"
+                    )
                 # FIXME this is only valid for beta0=beta=1 (but this should always be the case when throwing toys)
                 beta0gen = (
                     tf.random.poisson(
@@ -767,7 +808,12 @@ class Fitter:
 
     def _compute_impact_group(self, v, idxs):
         cov_reduced = tf.gather(
-            self.cov[self.poi_model.npoi :, self.poi_model.npoi :], idxs, axis=0
+            self.cov[
+                self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst,
+                self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst,
+            ],
+            idxs,
+            axis=0,
         )
         cov_reduced = tf.gather(cov_reduced, idxs, axis=1)
         v_reduced = tf.gather(v, idxs, axis=1)
@@ -779,7 +825,10 @@ class Fitter:
         v_poi = v[: self.poi_model.npoi]
         # protection for constained NOIs, set them to 0
         mask = (self.indata.noiidxs >= 0) & (
-            self.indata.noiidxs < tf.shape(v[self.poi_model.npoi :])[0]
+            self.indata.noiidxs
+            < tf.shape(
+                v[self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst]
+            )[0]
         )
         safe_idxs = tf.where(mask, self.indata.noiidxs, 0)
         mask = tf.cast(mask, v.dtype)
@@ -789,19 +838,46 @@ class Fitter:
                 [tf.shape(mask), tf.ones(tf.rank(v) - 1, dtype=tf.int32)], axis=0
             ),
         )
-        v_noi = tf.gather(v[self.poi_model.npoi :], safe_idxs) * mask
+        v_noi = (
+            tf.gather(
+                v[self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst],
+                safe_idxs,
+            )
+            * mask
+        )
         v_gathered = tf.concat([v_poi, v_noi], axis=0)
         return v_gathered
 
     @tf.function
     def impacts_parms(self, hess):
         # impact for poi at index i in covariance matrix from nuisance with index j is C_ij/sqrt(C_jj) = <deltax deltatheta>/sqrt(<deltatheta^2>)
-        v = self._gather_poi_noi_vector(self.cov)
-        impacts = v / tf.reshape(tf.sqrt(tf.linalg.diag_part(self.cov)), [1, -1])
-
         nstat = self.poi_model.npoi + self.indata.nsystnoconstraint
-        hess_stat = hess[:nstat, :nstat]
-        inv_hess_stat = tf.linalg.inv(hess_stat)
+
+        if self.binByBinStatMode == "full" and self.binByBinStatType == "gamma":
+            # strip off explicit BB parameters
+            cov = self.cov[
+                : self.poi_model.npoi + self.indata.nsyst,
+                : self.poi_model.npoi + self.indata.nsyst,
+            ]
+            # explicit BB parameters are unconstrained, i.e. stat uncertainty
+            idx_stat = tf.concat(
+                [
+                    tf.range(nstat),
+                    tf.range(
+                        self.poi_model.npoi + self.indata.nsyst,
+                        self.poi_model.npoi + self.indata.nsyst + self.indata.nbins,
+                    ),
+                ],
+                axis=0,
+            )
+            hess_stat = tf.gather(tf.gather(hess, idx_stat, axis=0), idx_stat, axis=1)
+        else:
+            cov = self.cov
+            hess_stat = hess[:nstat, :nstat]
+
+        v = self._gather_poi_noi_vector(cov)
+        impacts = v / tf.reshape(tf.sqrt(tf.linalg.diag_part(cov)), [1, -1])
+        inv_hess_stat = tf.linalg.inv(hess_stat)[:nstat, :nstat]
 
         if self.binByBinStat:
             # impact bin-by-bin stat
@@ -829,7 +905,8 @@ class Fitter:
         if len(self.indata.systgroupidxs):
             impacts_grouped_syst = tf.map_fn(
                 lambda idxs: self._compute_impact_group(
-                    v[:, self.poi_model.npoi :], idxs
+                    v[:, self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst],
+                    idxs,
                 ),
                 tf.ragged.constant(self.indata.systgroupidxs, dtype=tf.int32),
                 fn_output_signature=tf.TensorSpec(
@@ -1015,6 +1092,8 @@ class Fitter:
             impacts_grouped_syst = tf.transpose(impacts_grouped_syst)
             impacts_grouped = tf.concat([impacts_grouped_syst, impacts_grouped], axis=1)
 
+        # strip off explicit BB parameters if available
+        impacts = impacts[:, : self.indata.nsyst]
         return impacts, impacts_grouped
 
     def _pd2ldbeta2(self, profile=False):
@@ -1246,6 +1325,8 @@ class Fitter:
                     [impacts_grouped_syst, impacts_grouped], axis=-1
                 )
 
+            # strip off explicit BB parameters if available
+            impacts = impacts[:, : self.indata.nsyst]
             impacts = tf.reshape(impacts, [*expvar.shape, impacts.shape[-1]])
             impacts_grouped = tf.reshape(
                 impacts_grouped, [*expvar.shape, impacts_grouped.shape[-1]]
@@ -1305,7 +1386,9 @@ class Fitter:
             self.frozen_params_mask[: self.poi_model.npoi], tf.stop_gradient(poi), poi
         )
         theta = tf.where(
-            self.frozen_params_mask[self.poi_model.npoi :],
+            self.frozen_params_mask[
+                self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst
+            ],
             tf.stop_gradient(theta),
             theta,
         )
@@ -1401,28 +1484,36 @@ class Fitter:
 
                 nexp_profile = nexp[: self.indata.nbins]
                 beta0 = self.beta0[: self.indata.nbins]
+                betamask = self.betamask[: self.indata.nbins]
 
                 if self.chisqFit:
                     if self.binByBinStatType == "gamma":
                         kstat = self.kstat[: self.indata.nbins]
-
-                        abeta = nexp_profile**2
-                        bbeta = kstat * self.varnobs - nexp_profile * self.nobs
-                        cbeta = -kstat * self.varnobs * beta0
-                        beta = solve_quad_eq(abeta, bbeta, cbeta)
-
-                        betamask = self.betamask[: self.indata.nbins]
-                        beta = tf.where(betamask, beta0, beta)
+                        if self.binByBinStatMode == "lite":
+                            abeta = nexp_profile**2
+                            bbeta = kstat * self.varnobs - nexp_profile * self.nobs
+                            cbeta = -kstat * self.varnobs * beta0
+                            beta = solve_quad_eq(abeta, bbeta, cbeta)
+                        elif self.binByBinStatMode == "full":
+                            norm_profile = norm[: self.indata.nbins]
+                            nbeta = self.x[self.poi_model.npoi + self.indata.nsyst :]
+                            beta = (
+                                kstat
+                                * beta0
+                                / (
+                                    ((self.nobs - nexp_profile * nbeta) / self.varnobs)[
+                                        ..., None
+                                    ]
+                                    * norm_profile
+                                    + kstat
+                                )
+                            )
                     elif self.binByBinStatType == "normal-multiplicative":
                         kstat = self.kstat[: self.indata.nbins]
-                        betamask = self.betamask[: self.indata.nbins]
                         if self.binByBinStatMode == "lite":
                             beta = (
                                 nexp_profile * self.nobs / self.varnobs + kstat * beta0
                             ) / (kstat + nexp_profile * nexp_profile / self.varnobs)
-
-                            beta = tf.where(betamask, beta0, beta)
-
                         elif self.binByBinStatMode == "full":
                             norm_profile = norm[: self.indata.nbins]
                             n2kstat = tf.square(norm_profile) / kstat
@@ -1443,7 +1534,6 @@ class Fitter:
                                 * norm_profile
                                 / kstat
                             )
-                            beta = tf.where(betamask, beta0, beta)
                     elif self.binByBinStatType == "normal-additive":
                         varbeta = self.varbeta[: self.indata.nbins]
                         sbeta = tf.math.sqrt(varbeta)
@@ -1468,7 +1558,6 @@ class Fitter:
                 elif self.covarianceFit:
                     if self.binByBinStatType == "normal-multiplicative":
                         kstat = self.kstat[: self.indata.nbins]
-                        betamask = self.betamask[: self.indata.nbins]
                         if self.binByBinStatMode == "lite":
 
                             nexp_profile_m = tf.linalg.LinearOperatorDiag(nexp_profile)
@@ -1489,7 +1578,6 @@ class Fitter:
                             beta = tf.linalg.solve(A, b)
 
                             beta = tf.squeeze(beta, axis=-1)
-                            beta = tf.where(betamask, beta0, beta)
                         elif self.binByBinStatMode == "full":
                             norm_profile = norm[: self.indata.nbins]
 
@@ -1523,7 +1611,6 @@ class Fitter:
                             beta = beta0 - norm_profile / kstat * (
                                 self.data_cov_inv @ (nbeta - self.nobs[:, None])
                             )
-                            beta = tf.where(betamask, beta0, beta)
                     elif self.binByBinStatType == "normal-additive":
                         varbeta = self.varbeta[: self.indata.nbins]
                         sbeta = tf.math.sqrt(varbeta)
@@ -1558,19 +1645,28 @@ class Fitter:
                 else:
                     if self.binByBinStatType == "gamma":
                         kstat = self.kstat[: self.indata.nbins]
-                        betamask = self.betamask[: self.indata.nbins]
-
-                        beta = (self.nobs + kstat * beta0) / (nexp_profile + kstat)
-                        beta = tf.where(betamask, beta0, beta)
+                        if self.binByBinStatMode == "lite":
+                            beta = (self.nobs + kstat * beta0) / (nexp_profile + kstat)
+                        elif self.binByBinStatMode == "full":
+                            norm_profile = norm[: self.indata.nbins]
+                            nbeta = self.x[self.poi_model.npoi + self.indata.nsyst :]
+                            beta = (
+                                kstat
+                                * beta0
+                                / (
+                                    norm_profile
+                                    - (self.nobs / (nexp_profile * nbeta))[..., None]
+                                    * norm_profile
+                                    + kstat
+                                )
+                            )
                     elif self.binByBinStatType == "normal-multiplicative":
                         kstat = self.kstat[: self.indata.nbins]
-                        betamask = self.betamask[: self.indata.nbins]
                         if self.binByBinStatMode == "lite":
                             abeta = kstat
                             bbeta = nexp_profile - beta0 * kstat
                             cbeta = -self.nobs
                             beta = solve_quad_eq(abeta, bbeta, cbeta)
-                            beta = tf.where(betamask, beta0, beta)
                         elif self.binByBinStatMode == "full":
                             norm_profile = norm[: self.indata.nbins]
                             n2kstat = tf.square(norm_profile) / kstat
@@ -1590,7 +1686,6 @@ class Fitter:
                                 * norm_profile
                                 / kstat
                             )
-                            beta = tf.where(betamask, beta0, beta)
                     elif self.binByBinStatType == "normal-additive":
                         varbeta = self.varbeta[: self.indata.nbins]
                         sbeta = tf.math.sqrt(varbeta)
@@ -1619,6 +1714,7 @@ class Fitter:
 
                             beta = beta0 + (self.nobs / nbeta - 1)[..., None] * sbeta
 
+                beta = tf.where(betamask, beta0, beta)
                 if self.indata.nbinsmasked:
                     beta = tf.concat([beta, self.beta0[self.indata.nbins :]], axis=0)
             else:
@@ -1978,7 +2074,6 @@ class Fitter:
                 )
 
         lc = self._compute_lc(full_nll)
-
         lbeta = self._compute_lbeta(beta, full_nll)
 
         return ln, lc, lbeta, beta
@@ -1989,7 +2084,7 @@ class Fitter:
         )
         l = ln + lc
 
-        if lbeta is not None:
+        if self.binByBinStat:
             l = l + lbeta
 
         return l
@@ -2062,6 +2157,14 @@ class Fitter:
                 val = self._compute_loss(profile=profile)
             grad = t1.gradient(val, self.ubeta)
         hess = t2.jacobian(grad, self.ubeta)
+
+        grad = tf.reshape(grad, [-1])
+        hess = tf.reshape(hess, [grad.shape[0], grad.shape[0]])
+
+        betamask = ~tf.reshape(self.betamask, [-1])
+        grad = grad[betamask]
+        hess = tf.boolean_mask(hess, betamask, axis=0)
+        hess = tf.boolean_mask(hess, betamask, axis=1)
 
         return val, grad, hess
 
