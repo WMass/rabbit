@@ -276,41 +276,43 @@ def fit(args, fitter, ws, dofit=True):
 
     if args.externalPostfit is not None:
         fitter.load_fitresult(args.externalPostfit, args.externalPostfitResult)
-    else:
-        if dofit:
-            cb = fitter.minimize()
 
-            if cb is not None:
-                ws.add_loss_time_hist(cb.loss_history, cb.time_history)
+        if fitter.binByBinStat:
+            fitter._profile_beta()
 
-        if not args.noHessian:
-            # compute the covariance matrix and estimated distance to minimum
+    if dofit:
+        cb = fitter.minimize()
 
-            val, grad, hess = fitter.loss_val_grad_hess()
-            edmval, cov = edmval_cov(grad, hess)
+        if cb is not None:
+            ws.add_loss_time_hist(cb.loss_history, cb.time_history)
 
-            logger.info(f"edmval: {edmval}")
+    if not args.noHessian:
+        # compute the covariance matrix and estimated distance to minimum
 
-            fitter.cov.assign(cov)
+        val, grad, hess = fitter.loss_val_grad_hess()
+        edmval, cov = edmval_cov(grad, hess)
+        logger.info(f"edmval: {edmval}")
 
-            del cov
+        fitter.cov.assign(cov)
 
-            if fitter.binByBinStat and fitter.diagnostics:
-                # This is the estimated distance to minimum with respect to variations of
-                # the implicit binByBinStat nuisances beta at fixed parameter values.
-                # It should be near-zero by construction as long as the analytic profiling is
-                # correct
-                _, gradbeta, hessbeta = fitter.loss_val_grad_hess_beta()
-                edmvalbeta, covbeta = edmval_cov(gradbeta, hessbeta)
-                logger.info(f"edmvalbeta: {edmvalbeta}")
+        del cov
 
-            if args.doImpacts:
-                ws.add_impacts_hists(*fitter.impacts_parms(hess))
+        if fitter.binByBinStat and fitter.diagnostics:
+            # This is the estimated distance to minimum with respect to variations of
+            # the implicit binByBinStat nuisances beta at fixed parameter values.
+            # It should be near-zero by construction as long as the analytic profiling is
+            # correct
+            _, gradbeta, hessbeta = fitter.loss_val_grad_hess_beta()
+            edmvalbeta, covbeta = edmval_cov(gradbeta, hessbeta)
+            logger.info(f"edmvalbeta: {edmvalbeta}")
 
-            del hess
+        if args.doImpacts:
+            ws.add_impacts_hists(*fitter.impacts_parms(hess))
 
-            if args.globalImpacts:
-                ws.add_global_impacts_hists(*fitter.global_impacts_parms())
+        del hess
+
+        if args.globalImpacts:
+            ws.add_global_impacts_hists(*fitter.global_impacts_parms())
 
     nllvalreduced = fitter.reduced_nll().numpy()
 

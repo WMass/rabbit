@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
-import os
 
-import matplotlib.pyplot as plt
 import mplhep as hep
 import numpy as np
 
@@ -14,32 +12,6 @@ from wums import logging, output_tools, plot_tools  # isort: skip
 hep.style.use(hep.style.ROOT)
 
 logger = None
-
-
-def writeOutput(fig, outfile, extensions=[], postfix=None, args=None, meta_info=None):
-    name, _ = os.path.splitext(outfile)
-
-    if postfix:
-        name += f"_{postfix}"
-
-    for ext in extensions:
-        if ext[0] != ".":
-            ext = "." + ext
-        output = name + ext
-        print(f"Write output file {output}")
-        plt.savefig(output)
-
-        output = name.rsplit("/", 1)
-        output[1] = os.path.splitext(output[1])[0]
-        if len(output) == 1:
-            output = (None, *output)
-    if args is None and meta_info is None:
-        return
-    output_tools.write_logfile(
-        *output,
-        args=args,
-        meta_info=meta_info,
-    )
 
 
 def parseArgs():
@@ -72,6 +44,11 @@ def parseArgs():
         type=str,
         default="./test",
         help="Folder path for output",
+    )
+    parser.add_argument(
+        "--eoscp",
+        action="store_true",
+        help="Override use of xrdcp and use the mount instead",
     )
     parser.add_argument(
         "-p", "--postfix", type=str, help="Postfix for output file name"
@@ -113,6 +90,13 @@ def parseArgs():
         default=None,
         help="x axis limits",
     )
+    parser.add_argument(
+        "--ylim",
+        type=float,
+        nargs=2,
+        default=None,
+        help="y axis limits",
+    )
     parser.add_argument("--titlePos", type=int, default=2, help="title position")
     parser.add_argument(
         "--config",
@@ -133,6 +117,7 @@ def plot_scan(
     subtitle=None,
     titlePos=0,
     xlim=None,
+    ylim=None,
     combine=None,
     ylabel=r"$-2\,\Delta \log L$",
     config={},
@@ -148,13 +133,15 @@ def plot_scan(
 
     if xlim is None:
         xlim = (min(x), max(x))
+    if ylim is None:
+        ylim = (min(y), max(y))
 
     fig, ax = plot_tools.figure(
         x,
         xlabel,
         ylabel,
         xlim=xlim,
-        ylim=(min(y), max(y)),  # logy=args.logy
+        ylim=ylim,  # logy=args.logy
     )
 
     ax.axhline(y=1, color="gray", linestyle="--", alpha=0.5)
@@ -227,6 +214,7 @@ def plot_scan(
 
 def main():
     args = parseArgs()
+    outdir = output_tools.make_plot_dir(args.outpath, eoscp=args.eoscp)
 
     global logger
     logger = logging.setup_logger(__file__, args.verbose, args.noColorLogger)
@@ -280,19 +268,20 @@ def main():
             subtitle=args.subtitle,
             titlePos=args.titlePos,
             xlim=args.xlim,
+            ylim=args.ylim,
             config=config,
             combine=(vals, nlls) if args.combine is not None else None,
             no_hessian=args.noHessian,
         )
-        os.makedirs(args.outpath, exist_ok=True)
-        outfile = os.path.join(args.outpath, f"nll_scan_{param}")
-        writeOutput(
-            fig,
-            outfile=outfile,
-            extensions=["png", "pdf"],
-            meta_info=meta,
+
+        to_join = [f"nll_scan_{param}", args.postfix]
+        outfile = "_".join(filter(lambda x: x, to_join))
+        plot_tools.save_pdf_and_png(outdir, outfile)
+        output_tools.write_index_and_log(
+            outdir,
+            outfile,
+            analysis_meta_info=meta,
             args=args,
-            postfix=args.postfix,
         )
 
 
