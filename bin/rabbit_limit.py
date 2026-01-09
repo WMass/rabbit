@@ -25,6 +25,14 @@ def make_parser():
     parser = parsing.common_parser()
     parser.add_argument("--outname", default="limits.hdf5", help="output file name")
     parser.add_argument(
+        "--modes",
+        nargs="+",
+        default=["gaussian", "likelihood"],
+        type=str,
+        choices=["gaussian", "likelihood"],
+        help="Different modes of approximations to be used",
+    )
+    parser.add_argument(
         "--asymptoticLimits",
         nargs="+",
         default=[],
@@ -42,10 +50,8 @@ def make_parser():
     return parser.parse_args()
 
 
-def do_asymptotic_limits(
-    args, fitter, ws, data_values, mapping=None, bkg_only_fit=False
-):
-    if bkg_only_fit:
+def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=False):
+    if fit_data:
         logger.info("Perform background only fit")
         # set process to zero and freeze
         fitter.freeze_params(args.asymptoticLimits)
@@ -73,9 +79,10 @@ def do_asymptotic_limits(
     # Clone fitter to simultaneously minimize on asimov dataset
     fitter_asimov = copy.deepcopy(fitter)
 
-    # unconditional fit to real data
-    fitter.set_nobs(data_values)
-    fitter.minimize()
+    if fit_data:
+        logger.info("Unconditional fit to real data")
+        fitter.set_nobs(data_values)
+        fitter.minimize()
 
     # asymptotic limits (CLs)
     #  see:
@@ -130,13 +137,15 @@ def do_asymptotic_limits(
 
             idx = np.where(fitter.parms.astype(str) == key)[0][0]
             if key in fitter.poi_model.pois.astype(str):
+                is_poi = True
                 xbest = fitter_asimov.get_blinded_poi()[idx]
                 xobs = fitter.get_blinded_poi()[idx]
             elif key in fitter.parms.astype(str):
+                is_poi = False
                 xbest = fitter_asimov.get_blinded_theta()[
-                    fitter_asimov.poi_model.npoi + idx
+                    idx - fitter_asimov.poi_model.npoi
                 ]
-                xobs = fitter.get_blinded_theta()[fitter_asimov.poi_model.npoi + idx]
+                xobs = fitter.get_blinded_theta()[idx - fitter.poi_model.npoi]
 
             xerr = fitter_asimov.cov[idx, idx] ** 0.5
 
@@ -149,7 +158,7 @@ def do_asymptotic_limits(
             fitter.cov.assign(cov)
             xobs_err = fitter.cov[idx, idx] ** 0.5
 
-            if not args.allowNegativePOI:
+            if is_poi and not args.allowNegativePOI:
                 xerr = 2 * xerr * xbest**0.5
                 xobs_err = 2 * xobs_err * xobs**0.5
 
@@ -167,53 +176,58 @@ def do_asymptotic_limits(
                 qmuA = (norm.ppf(cl_b) - norm.ppf(cl_sb)) ** 2
                 logger.debug(f"Find r with q_(r,A)=-2ln(L)/ln(L0) = {qmuA}")
 
+                if "gaussian" in args.modes:
+                    # Gaussian approximation
+                    r = xbest + xerr * qmuA**0.5
+                    logger.info(
+                        f"Expected (Gaussian) {round((cl_b)*100,1):4.1f}%: {key} < {r}"
+                    )
+                    limits[i, j, k] = r
+
+                if "likelihood" in args.modes:
+                    # Likelihood approximation
+                    r, _ = fitter_asimov.contour_scan(
+                        key, nllvalreduced_asimov, qmuA, signs=[1], fun=fun
+                    )
+                    logger.info(
+                        f"Expected (Likelihood) {round((cl_b)*100,1):4.1f}%: {key} < {r}"
+                    )
+                    limits_nll[i, j, k] = r
+
+            if "gaussian" in args.modes:
                 # Gaussian approximation
-                r = xbest + xerr * qmuA**0.5
-                logger.info(
-                    f"Expected (Gaussian) {round((cl_b)*100,1):4.1f}%: {key} < {r}"
+                limits_obs[i, j] = asymptotic_limits.compute_gaussian_limit(
+                    key, xobs, xobs_err, xerr, cl_s
                 )
-                limits[i, j, k] = r
 
+            if "likelihood" in args.modes:
                 # Likelihood approximation
-                r, _ = fitter_asimov.contour_scan(
-                    key, nllvalreduced_asimov, qmuA, signs=[1], fun=fun
-                )
-                logger.info(
-                    f"Expected (Likelihood) {round((cl_b)*100,1):4.1f}%: {key} < {r}"
-                )
-                limits_nll[i, j, k] = r
+                if mapping is not None:
+                    # TODO: implement for channels
+                    pass
+                else:
+                    # TODO: make it work
+                    # nllvalreduced = fitter.reduced_nll().numpy()
+                    # limits_nll_obs[i, j] = asymptotic_limits.compute_likelihood_limit(fitter, fitter_asimov, nllvalreduced, nllvalreduced_asimov, key, cl_s)
+                    pass
 
-            # Gaussian approximation
-            limits_obs[i, j] = asymptotic_limits.compute_gaussian_limit(
-                key, xobs, xobs_err, xerr, cl_s
-            )
+    if "gaussian" in args.modes:
+        ws.add_limits_hist(
+            limits,
+            args.asymptoticLimits,
+            args.levels,
+            clb_list,
+            base_name="gaussian_asymptoticLimits_expected",
+        )
 
-            # Likelihood approximation
-            if mapping is not None:
-                # TODO: implement for channels
-                pass
-            else:
-                # TODO: make it work
-                # nllvalreduced = fitter.reduced_nll().numpy()
-                # limits_nll_obs[i, j] = asymptotic_limits.compute_likelihood_limit(fitter, fitter_asimov, nllvalreduced, nllvalreduced_asimov, key, cl_s)
-                pass
+        ws.add_limits_hist(
+            limits_obs,
+            args.asymptoticLimits,
+            args.levels,
+            base_name="gaussian_asymptoticLimits_observed",
+        )
 
-    ws.add_limits_hist(
-        limits,
-        args.asymptoticLimits,
-        args.levels,
-        clb_list,
-        base_name="gaussian_asymptoticLimits_expected",
-    )
-
-    ws.add_limits_hist(
-        limits_obs,
-        args.asymptoticLimits,
-        args.levels,
-        base_name="gaussian_asymptoticLimits_observed",
-    )
-
-    if mapping is not None:
+    if "likelihood" in args.modes:
         # TODO: implement for channels
         ws.add_limits_hist(
             limits_nll,
@@ -348,7 +362,7 @@ def main():
                     ws,
                     data_values=observations,
                     mapping=mapping,
-                    bkg_only_fit=ifit >= 0,
+                    fit_data=ifit >= 0,
                 )
                 fit_time.append(time.time())
 

@@ -64,6 +64,7 @@ class Ones(POIModel):
         self.poidefault = tf.zeros([], dtype=self.indata.dtype)
 
         self.allowNegativePOI = False
+        self.is_linear = True
 
     def compute(self, poi):
         rnorm = tf.ones(self.indata.nproc, dtype=self.indata.dtype)

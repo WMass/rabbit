@@ -5,6 +5,7 @@ import os
 
 import mplhep as hep
 import numpy as np
+from wums import boostHistHelpers as hh
 from wums import logging
 
 from rabbit import io_tools
@@ -58,6 +59,13 @@ def parseArgs():
     )
     parser.add_argument(
         "--scale", type=float, default=1.0, help="Scale limits by this value"
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="gaussian",
+        choices=["gaussian", "likelihood"],
+        help="Different modes of approximations to be used",
     )
     parser.add_argument(
         "--config",
@@ -127,30 +135,49 @@ def main():
 
     logger = logging.setup_logger(__file__, args.verbose, args.noColorLogger)
 
+    key_expected = f"{args.mode}_asymptoticLimits_expected"
+    key_observed = f"{args.mode}_asymptoticLimits_observed"
+
     cls_list = set()
     clb_list = set()
     limits = []
     limits_asimov = []
     lumi = None
+    xvals = []
     for infile in args.infiles:
         fitresult_asimov, meta = io_tools.get_fitresult(
             infile, result="asimov", meta=True
         )
 
-        h_limits_asimov = fitresult_asimov["asymptoticLimits"].get()
+        bsm_sample, mixing = meta["meta_info_input"]["meta_info"]["args"][
+            "addBSMMixing"
+        ]
+        bsm_name, mass = bsm_sample.split("_")
+        xvals.append(int(mass))
+
+        scale = float(mixing) * args.scale
+
+        if key_expected in fitresult_asimov.keys():
+            h_limits_asimov = fitresult_asimov[key_expected].get()
+            h_limits_asimov = hh.scaleHist(h_limits_asimov, scale)
+        else:
+            raise RuntimeError(
+                f"Key {key_expected} not found, available keyes are {[key for key in fitresult_asimov.keys()]}"
+            )
 
         cls_list = cls_list.union(set([cls for cls in h_limits_asimov.axes["cls"]]))
         clb_list = clb_list.union(set([clb for clb in h_limits_asimov.axes["clb"]]))
 
         limits_asimov.append(h_limits_asimov)
 
-        fitresult, meta = io_tools.get_fitresult(infile, meta=True)
+        fitresult = io_tools.get_fitresult(infile)
         if fitresult != fitresult_asimov and not args.noObs:
             if (
-                "asymptoticLimits" in fitresult.keys()
-                and "clb" not in fitresult["asymptoticLimits"].get().axes.name
+                key_observed in fitresult.keys()
+                and "clb" not in fitresult[key_observed].get().axes.name
             ):
-                h_limits = fitresult["asymptoticLimits"].get()
+                h_limits = fitresult[key_observed].get()
+                h_limits = hh.scaleHist(h_limits, scale)
                 cls_list = cls_list.union(set([cls for cls in h_limits.axes["cls"]]))
                 limits.append(h_limits)
             else:
@@ -165,33 +192,33 @@ def main():
     if args.xvals is not None:
         x = np.array(args.xvals)
     else:
-        x = np.arange(len(limits_asimov))
+        x = np.array(xvals)
 
     clb_list = list(clb_list)
 
     for cls in cls_list:
 
         yexp = np.array(
-            [l[{"cls": cls, "clb": "0.5"}] * args.scale for l in limits_asimov]
+            [l[{"cls": cls, "clb": "0.5"}] for l in limits_asimov]
         ).flatten()
 
         yexp_m2 = np.array(
-            [l[{"cls": cls, "clb": "0.025"}] * args.scale for l in limits_asimov]
+            [l[{"cls": cls, "clb": "0.025"}] for l in limits_asimov]
         ).flatten()
         yexp_m1 = np.array(
-            [l[{"cls": cls, "clb": "0.16"}] * args.scale for l in limits_asimov]
+            [l[{"cls": cls, "clb": "0.16"}] for l in limits_asimov]
         ).flatten()
         yexp_p1 = np.array(
-            [l[{"cls": cls, "clb": "0.84"}] * args.scale for l in limits_asimov]
+            [l[{"cls": cls, "clb": "0.84"}] for l in limits_asimov]
         ).flatten()
         yexp_p2 = np.array(
-            [l[{"cls": cls, "clb": "0.975"}] * args.scale for l in limits_asimov]
+            [l[{"cls": cls, "clb": "0.975"}] for l in limits_asimov]
         ).flatten()
 
         ylist = [yexp, yexp_m1, yexp_m2, yexp_p1, yexp_p2]
 
         if len(limits) > 0:
-            yobs = np.array([l[{"cls": cls}] * args.scale for l in limits]).flatten()
+            yobs = np.array([l[{"cls": cls}] for l in limits]).flatten()
             ylist.append(yobs)
 
         ylist = np.array(ylist)
