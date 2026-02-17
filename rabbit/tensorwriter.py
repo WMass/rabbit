@@ -57,6 +57,8 @@ class TensorWriter:
         self.dict_logkhalfdiff_indices = {}
         self.dict_beta_variations = {}  # [channel][syst][process]
 
+        self.has_beta_variations = False
+
         self.clipSystVariations = False
         if self.clipSystVariations > 0.0:
             self.clip = np.abs(np.log(self.clipSystVariations))
@@ -443,6 +445,8 @@ class TensorWriter:
 
         self.dict_beta_variations[dest_channel][source_channel][process] = variation
 
+        self.has_beta_variations = True
+
     def get_logk(self, syst, norm, kfac=1.0, systematic_type=None):
         if not np.all(np.isfinite(syst)):
             raise RuntimeError(
@@ -585,8 +589,6 @@ class TensorWriter:
 
         if self.symmetric_tensor:
             logger.info("No asymmetric systematics - write fully symmetric tensor")
-
-        has_beta_variations = False
 
         ibin = 0
         if self.sparse:
@@ -767,7 +769,9 @@ class TensorWriter:
             else:
                 logk = np.zeros([nbinsfull, nproc, 2, nsyst], self.dtype)
 
-            beta_variations = np.zeros([nbinsfull, nbins, nproc], self.dtype)
+            if self.has_beta_variations:
+                beta_variations = np.zeros([nbinsfull, nbins, nproc], self.dtype)
+
             for chan in self.channels.keys():
                 nbinschan = self.nbinschan[chan]
                 dict_norm_chan = self.dict_norm[chan]
@@ -799,32 +803,34 @@ class TensorWriter:
                                     dict_logkhalfdiff_proc[syst]
                                 )
 
+                    if not self.has_beta_variations:
+                        continue
+
                     for (
                         source_channel,
                         source_channel_dict,
                     ) in self.dict_beta_variations[chan].items():
-                        if proc in source_channel_dict:
-                            # find the bins of the source channel
-                            ibin_start = 0
-                            for c, nb in self.nbinschan.items():
-                                if self.channels[c]["masked"]:
-                                    continue  # masked channels can not be source channels
-                                if c == source_channel:
-                                    ibin_end = ibin_start + nb
-                                    break
-                                else:
-                                    ibin_start += nb
+                        if proc not in source_channel_dict:
+                            continue
+                        # find the bins of the source channel
+                        ibin_start = 0
+                        for c, nb in self.nbinschan.items():
+                            if self.channels[c]["masked"]:
+                                continue  # masked channels can not be source channels
+                            if c == source_channel:
+                                ibin_end = ibin_start + nb
+                                break
                             else:
-                                raise RuntimeError(
-                                    f"Did not find source channel {source_channel} in list of channels {[k for k in self.nbinschan.keys()]}"
-                                )
+                                ibin_start += nb
+                        else:
+                            raise RuntimeError(
+                                f"Did not find source channel {source_channel} in list of channels {[k for k in self.nbinschan.keys()]}"
+                            )
 
-                            beta_vars = source_channel_dict[proc]
-                            beta_variations[
-                                ibin : ibin + nbinschan, ibin_start:ibin_end, iproc
-                            ] = beta_vars
-
-                            has_beta_variations = True
+                        beta_vars = source_channel_dict[proc]
+                        beta_variations[
+                            ibin : ibin + nbinschan, ibin_start:ibin_end, iproc
+                        ] = beta_vars
 
                 ibin += nbinschan
 
@@ -998,8 +1004,7 @@ class TensorWriter:
             )
             logk = None
 
-            if has_beta_variations:
-
+            if self.has_beta_variations:
                 nbytes += h5pyutils.writeFlatInChunks(
                     beta_variations, f, "hbetavariations", maxChunkBytes=self.chunkSize
                 )
