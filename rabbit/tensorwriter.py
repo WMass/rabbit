@@ -586,6 +586,8 @@ class TensorWriter:
         if self.symmetric_tensor:
             logger.info("No asymmetric systematics - write fully symmetric tensor")
 
+        has_beta_variations = False
+
         ibin = 0
         if self.sparse:
             logger.info(f"Write out sparse array")
@@ -802,7 +804,6 @@ class TensorWriter:
                         source_channel_dict,
                     ) in self.dict_beta_variations[chan].items():
                         if proc in source_channel_dict:
-
                             # find the bins of the source channel
                             ibin_start = 0
                             for c, nb in self.nbinschan.items():
@@ -822,6 +823,8 @@ class TensorWriter:
                             beta_variations[
                                 ibin : ibin + nbinschan, ibin_start:ibin_end, iproc
                             ] = beta_vars
+
+                            has_beta_variations = True
 
                 ibin += nbinschan
 
@@ -995,10 +998,12 @@ class TensorWriter:
             )
             logk = None
 
-            nbytes += h5pyutils.writeFlatInChunks(
-                beta_variations, f, "hbetavariations", maxChunkBytes=self.chunkSize
-            )
-            beta_variations = None
+            if has_beta_variations:
+
+                nbytes += h5pyutils.writeFlatInChunks(
+                    beta_variations, f, "hbetavariations", maxChunkBytes=self.chunkSize
+                )
+                beta_variations = None
 
         logger.info(f"Total raw bytes in arrays = {nbytes}")
 
