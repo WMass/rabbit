@@ -187,8 +187,8 @@ class Workspace:
 
     def add_chi2(self, chi2, ndf, prefit, mapping):
         postfix = "_prefit" if prefit else ""
-        self.add_value(ndf, "ndf" + postfix, mapping.key)
-        self.add_value(chi2, "chi2" + postfix, mapping.key)
+        self.add_value(int(ndf), "ndf" + postfix, mapping.key)
+        self.add_value(float(chi2), "chi2" + postfix, mapping.key)
 
     def add_observed_hists(
         self, mapping, data_obs, nobs, data_cov_inv=None, nobs_cov_inv=None
