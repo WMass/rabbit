@@ -5,7 +5,7 @@ from collections import defaultdict
 import h5py
 import numpy as np
 
-from rabbit import common, h5pyutils
+from rabbit import common, h5pyutils_write
 
 from wums import ioutils, logging  # isort: skip
 
@@ -907,22 +907,22 @@ class TensorWriter:
         nbytes = 0
 
         constraintweights = self.get_constraintweights(self.dtype)
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             constraintweights, f, "hconstraintweights", maxChunkBytes=self.chunkSize
         )
         constraintweights = None
 
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             data_obs, f, "hdata_obs", maxChunkBytes=self.chunkSize
         )
         if np.any(data_var != data_obs):
-            nbytes += h5pyutils.writeFlatInChunks(
+            nbytes += h5pyutils_write.writeFlatInChunks(
                 data_var, f, "hdata_var", maxChunkBytes=self.chunkSize
             )
             data_var = None
         data_obs = None
 
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             pseudodata, f, "hpseudodata", maxChunkBytes=self.chunkSize
         )
         pseudodata = None
@@ -958,23 +958,23 @@ class TensorWriter:
             )
             full_cov_inv = np.linalg.inv(full_cov)
 
-            nbytes += h5pyutils.writeFlatInChunks(
+            nbytes += h5pyutils_write.writeFlatInChunks(
                 full_cov_inv,
                 f,
                 "hdata_cov_inv",
                 maxChunkBytes=self.chunkSize,
             )
 
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             sumw, f, "hsumw", maxChunkBytes=self.chunkSize
         )
 
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             sumw2, f, "hsumw2", maxChunkBytes=self.chunkSize
         )
 
         if self.sparse:
-            nbytes += h5pyutils.writeSparse(
+            nbytes += h5pyutils_write.writeSparse(
                 norm_sparse_indices,
                 norm_sparse_values,
                 norm_sparse_dense_shape,
@@ -984,7 +984,7 @@ class TensorWriter:
             )
             norm_sparse_indices = None
             norm_sparse_values = None
-            nbytes += h5pyutils.writeSparse(
+            nbytes += h5pyutils_write.writeSparse(
                 logk_sparse_indices,
                 logk_sparse_values,
                 logk_sparse_dense_shape,
@@ -995,17 +995,17 @@ class TensorWriter:
             logk_sparse_indices = None
             logk_sparse_values = None
         else:
-            nbytes += h5pyutils.writeFlatInChunks(
+            nbytes += h5pyutils_write.writeFlatInChunks(
                 norm, f, "hnorm", maxChunkBytes=self.chunkSize
             )
             norm = None
-            nbytes += h5pyutils.writeFlatInChunks(
+            nbytes += h5pyutils_write.writeFlatInChunks(
                 logk, f, "hlogk", maxChunkBytes=self.chunkSize
             )
             logk = None
 
             if self.has_beta_variations:
-                nbytes += h5pyutils.writeFlatInChunks(
+                nbytes += h5pyutils_write.writeFlatInChunks(
                     beta_variations, f, "hbetavariations", maxChunkBytes=self.chunkSize
                 )
                 beta_variations = None
