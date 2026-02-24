@@ -13,6 +13,8 @@ from rabbit import fitter, inputdata, parsing, workspace
 from rabbit.mappings import helpers as mh
 from rabbit.mappings import mapping as mp
 from rabbit.poi_models import helpers as ph
+from rabbit.regularization import helpers as rh
+from rabbit.regularization.lcurve import l_curve_optimize_tau, l_curve_scan_tau
 from rabbit.tfhelpers import edmval_cov
 
 from wums import output_tools, logging  # isort: skip
@@ -150,6 +152,12 @@ def make_parser():
         help="Specify result from external postfit file",
     )
     parser.add_argument(
+        "--noFit",
+        default=False,
+        action="store_true",
+        help="Do not not perform the minimization.",
+    )
+    parser.add_argument(
         "--noPostfitProfileBB",
         default=False,
         action="store_true",
@@ -182,7 +190,24 @@ def make_parser():
         action="store_true",
         help="compute impacts of frozen (non-profiled) systematics",
     )
-
+    parser.add_argument(
+        "--lCurveScan",
+        default=False,
+        action="store_true",
+        help="For use with regularization, scan the L curve versus values for tau",
+    )
+    parser.add_argument(
+        "--lCurveOptimize",
+        default=False,
+        action="store_true",
+        help="For use with regularization, find the value of tau that maximizes the curvature",
+    )
+    parser.add_argument(
+        "--regularizationStrength",
+        default=0.0,
+        type=float,
+        help="For use with regularization, set the regularization strength (tau)",
+    )
     return parser.parse_args()
 
 
@@ -281,7 +306,21 @@ def fit(args, fitter, ws, dofit=True):
     edmval = None
 
     if args.externalPostfit is not None:
-        fitter.load_fitresult(args.externalPostfit, args.externalPostfitResult)
+        fitter.load_fitresult(
+            args.externalPostfit,
+            args.externalPostfitResult,
+            profile=not args.noPostfitProfileBB,
+        )
+
+    if args.lCurveScan:
+        tau_values, l_curve_values = l_curve_scan_tau(fitter)
+        ws.add_1D_integer_hist(tau_values, "step", "tau")
+        ws.add_1D_integer_hist(l_curve_values, "step", "lcurve")
+
+    if args.lCurveOptimize:
+        best_tau, max_curvature = l_curve_optimize_tau(fitter)
+        ws.add_1D_integer_hist([best_tau], "best", "tau")
+        ws.add_1D_integer_hist([max_curvature], "best", "lcurve")
 
     if dofit:
         cb = fitter.minimize()
@@ -293,7 +332,8 @@ def fit(args, fitter, ws, dofit=True):
             fitter._profile_beta()
 
         if cb is not None:
-            ws.add_loss_time_hist(cb.loss_history, cb.time_history)
+            ws.add_1D_integer_hist(cb.loss_history, "epoch", "loss")
+            ws.add_1D_integer_hist(cb.time_history, "epoch", "time")
 
     if not args.noHessian:
         # compute the covariance matrix and estimated distance to minimum
@@ -477,6 +517,14 @@ def main():
             mp.CompositeMapping(mappings),
         ]
 
+    ifitter.tau.assign(args.regularizationStrength)
+    regularizers = []
+    for margs in args.regularization:
+        mapping = mh.load_mapping(margs[1], indata, *margs[2:])
+        regularizer = rh.load_regularizer(margs[0], mapping, dtype=indata.dtype)
+        regularizers.append(regularizer)
+    ifitter.regularizers = regularizers
+
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
 
@@ -560,7 +608,7 @@ def main():
 
                 if not args.prefitOnly:
                     ifitter.set_blinding_offsets(blind=blinded_fits[i])
-                    fit(args, ifitter, ws, dofit=ifit >= 0)
+                    fit(args, ifitter, ws, dofit=ifit >= 0 and not args.noFit)
                     fit_time.append(time.time())
 
                     if args.saveHists:
