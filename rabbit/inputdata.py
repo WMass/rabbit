@@ -3,7 +3,7 @@ import hist
 import numpy as np
 import tensorflow as tf
 
-from rabbit.h5pyutils import makesparsetensor, maketensor
+from rabbit.h5pyutils_read import makesparsetensor, maketensor
 
 
 class FitInputData:
