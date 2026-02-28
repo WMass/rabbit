@@ -12,7 +12,6 @@ from rabbit import io_tools
 
 from wums import output_tools, plot_tools  # isort: skip
 
-
 hep.style.use(hep.style.ROOT)
 
 

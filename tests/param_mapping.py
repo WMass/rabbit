@@ -35,6 +35,7 @@ class Param(Mapping):
     ):
         self.key = key
 
+        # TODO: account for generic poi model
         param_names = list(indata.signals.astype(str)) + list(indata.systs.astype(str))
 
         if isinstance(params, str):

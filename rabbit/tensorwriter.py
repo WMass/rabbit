@@ -5,7 +5,7 @@ from collections import defaultdict
 import h5py
 import numpy as np
 
-from rabbit import common, h5pyutils
+from rabbit import common, h5pyutils_write
 
 from wums import ioutils, logging  # isort: skip
 
@@ -56,6 +56,8 @@ class TensorWriter:
         self.dict_logkavg_indices = {}
         self.dict_logkhalfdiff_indices = {}
         self.dict_beta_variations = {}  # [channel][syst][process]
+
+        self.has_beta_variations = False
 
         self.clipSystVariations = False
         if self.clipSystVariations > 0.0:
@@ -186,13 +188,11 @@ class TensorWriter:
             channel_axes = self.channels[channel]["axes"]
 
             if not all(np.allclose(a, axes[i]) for i, a in enumerate(channel_axes)):
-                raise RuntimeError(
-                    f"""
+                raise RuntimeError(f"""
                     Histogram axes different have different edges from channel axes of channel {channel}
                     \nHistogram axes: {[a.edges for a in axes]}
                     \nChannel axes: {[a.edges for a in channel_axes]}
-                    """
-                )
+                    """)
         else:
             shape_in = h.shape
             shape_this = tuple([len(a) for a in self.channels[channel]["axes"]])
@@ -436,13 +436,16 @@ class TensorWriter:
                     f"Axis {a.name} not found in histogram h with {h.axes.name}"
                 )
 
-        variation = h.project(*dest_axes_names, *source_axes_names).values()
+        flow = self.channels[dest_channel]["flow"]
+        variation = h.project(*dest_axes_names, *source_axes_names).values(flow=flow)
         variation = variation.reshape((*norm.shape, -1))
 
         if source_channel not in self.dict_beta_variations[dest_channel].keys():
             self.dict_beta_variations[dest_channel][source_channel] = {}
 
         self.dict_beta_variations[dest_channel][source_channel][process] = variation
+
+        self.has_beta_variations = True
 
     def get_logk(self, syst, norm, kfac=1.0, systematic_type=None):
         if not np.all(np.isfinite(syst)):
@@ -766,7 +769,9 @@ class TensorWriter:
             else:
                 logk = np.zeros([nbinsfull, nproc, 2, nsyst], self.dtype)
 
-            beta_variations = np.zeros([nbinsfull, nbins, nproc], self.dtype)
+            if self.has_beta_variations:
+                beta_variations = np.zeros([nbinsfull, nbins, nproc], self.dtype)
+
             for chan in self.channels.keys():
                 nbinschan = self.nbinschan[chan]
                 dict_norm_chan = self.dict_norm[chan]
@@ -798,31 +803,34 @@ class TensorWriter:
                                     dict_logkhalfdiff_proc[syst]
                                 )
 
+                    if not self.has_beta_variations:
+                        continue
+
                     for (
                         source_channel,
                         source_channel_dict,
                     ) in self.dict_beta_variations[chan].items():
-                        if proc in source_channel_dict:
-
-                            # find the bins of the source channel
-                            ibin_start = 0
-                            for c, nb in self.nbinschan.items():
-                                if self.channels[c]["masked"]:
-                                    continue  # masked channels can not be source channels
-                                if c == source_channel:
-                                    ibin_end = ibin_start + nb
-                                    break
-                                else:
-                                    ibin_start += nb
+                        if proc not in source_channel_dict:
+                            continue
+                        # find the bins of the source channel
+                        ibin_start = 0
+                        for c, nb in self.nbinschan.items():
+                            if self.channels[c]["masked"]:
+                                continue  # masked channels can not be source channels
+                            if c == source_channel:
+                                ibin_end = ibin_start + nb
+                                break
                             else:
-                                raise RuntimeError(
-                                    f"Did not find source channel {source_channel} in list of channels {[k for k in self.nbinschan.keys()]}"
-                                )
+                                ibin_start += nb
+                        else:
+                            raise RuntimeError(
+                                f"Did not find source channel {source_channel} in list of channels {[k for k in self.nbinschan.keys()]}"
+                            )
 
-                            beta_vars = source_channel_dict[proc]
-                            beta_variations[
-                                ibin : ibin + nbinschan, ibin_start:ibin_end, iproc
-                            ] = beta_vars
+                        beta_vars = source_channel_dict[proc]
+                        beta_variations[
+                            ibin : ibin + nbinschan, ibin_start:ibin_end, iproc
+                        ] = beta_vars
 
                 ibin += nbinschan
 
@@ -899,22 +907,22 @@ class TensorWriter:
         nbytes = 0
 
         constraintweights = self.get_constraintweights(self.dtype)
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             constraintweights, f, "hconstraintweights", maxChunkBytes=self.chunkSize
         )
         constraintweights = None
 
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             data_obs, f, "hdata_obs", maxChunkBytes=self.chunkSize
         )
         if np.any(data_var != data_obs):
-            nbytes += h5pyutils.writeFlatInChunks(
+            nbytes += h5pyutils_write.writeFlatInChunks(
                 data_var, f, "hdata_var", maxChunkBytes=self.chunkSize
             )
             data_var = None
         data_obs = None
 
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             pseudodata, f, "hpseudodata", maxChunkBytes=self.chunkSize
         )
         pseudodata = None
@@ -950,23 +958,23 @@ class TensorWriter:
             )
             full_cov_inv = np.linalg.inv(full_cov)
 
-            nbytes += h5pyutils.writeFlatInChunks(
+            nbytes += h5pyutils_write.writeFlatInChunks(
                 full_cov_inv,
                 f,
                 "hdata_cov_inv",
                 maxChunkBytes=self.chunkSize,
             )
 
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             sumw, f, "hsumw", maxChunkBytes=self.chunkSize
         )
 
-        nbytes += h5pyutils.writeFlatInChunks(
+        nbytes += h5pyutils_write.writeFlatInChunks(
             sumw2, f, "hsumw2", maxChunkBytes=self.chunkSize
         )
 
         if self.sparse:
-            nbytes += h5pyutils.writeSparse(
+            nbytes += h5pyutils_write.writeSparse(
                 norm_sparse_indices,
                 norm_sparse_values,
                 norm_sparse_dense_shape,
@@ -976,7 +984,7 @@ class TensorWriter:
             )
             norm_sparse_indices = None
             norm_sparse_values = None
-            nbytes += h5pyutils.writeSparse(
+            nbytes += h5pyutils_write.writeSparse(
                 logk_sparse_indices,
                 logk_sparse_values,
                 logk_sparse_dense_shape,
@@ -987,19 +995,20 @@ class TensorWriter:
             logk_sparse_indices = None
             logk_sparse_values = None
         else:
-            nbytes += h5pyutils.writeFlatInChunks(
+            nbytes += h5pyutils_write.writeFlatInChunks(
                 norm, f, "hnorm", maxChunkBytes=self.chunkSize
             )
             norm = None
-            nbytes += h5pyutils.writeFlatInChunks(
+            nbytes += h5pyutils_write.writeFlatInChunks(
                 logk, f, "hlogk", maxChunkBytes=self.chunkSize
             )
             logk = None
 
-            nbytes += h5pyutils.writeFlatInChunks(
-                beta_variations, f, "hbetavariations", maxChunkBytes=self.chunkSize
-            )
-            beta_variations = None
+            if self.has_beta_variations:
+                nbytes += h5pyutils_write.writeFlatInChunks(
+                    beta_variations, f, "hbetavariations", maxChunkBytes=self.chunkSize
+                )
+                beta_variations = None
 
         logger.info(f"Total raw bytes in arrays = {nbytes}")
 

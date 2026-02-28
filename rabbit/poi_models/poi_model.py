@@ -19,7 +19,7 @@ class POIModel:
     def parse_args(cls, indata, *args, **kwargs):
         return cls(indata, *args, **kwargs)
 
-    def compute(self, poi):
+    def compute(self, poi, full=False):
         """
         Compute an array for the rate per process
         :param params: 1D tensor of explicit parameters in the fit
@@ -66,7 +66,7 @@ class Ones(POIModel):
         self.allowNegativePOI = False
         self.is_linear = True
 
-    def compute(self, poi):
+    def compute(self, poi, full=False):
         rnorm = tf.ones(self.indata.nproc, dtype=self.indata.dtype)
         rnorm = tf.reshape(rnorm, [1, -1])
         return rnorm
@@ -90,7 +90,7 @@ class Mu(POIModel):
 
         self.set_poi_default(expectSignal, allowNegativePOI)
 
-    def compute(self, poi):
+    def compute(self, poi, full=False):
         rnorm = tf.concat(
             [poi, tf.ones([self.indata.nproc - poi.shape[0]], dtype=self.indata.dtype)],
             axis=0,
@@ -181,7 +181,7 @@ class Mixture(POIModel):
 
         return cls(indata, primaries, complementaries, **kwargs)
 
-    def compute(self, poi):
+    def compute(self, poi, full=False):
 
         ones = tf.ones(self.npoi, dtype=self.indata.dtype)
         updates = tf.concat([ones * poi, ones * (1 - poi)], axis=0)

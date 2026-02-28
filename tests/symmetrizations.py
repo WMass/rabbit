@@ -12,7 +12,6 @@ from rabbit import debugdata, inputdata, tensorwriter
 from wums import output_tools, plot_tools  # isort: skip
 from wums import boostHistHelpers as hh  # isort: skip
 
-
 parser = argparse.ArgumentParser()
 parser.add_argument("-o", "--outpath", default="./", help="output directory")
 parser.add_argument(
@@ -186,13 +185,11 @@ for h1, h2, stype in test_pairs:
     if not np.all(np.isclose(h1.values(), h2.values())):
         original = h1.values()
         stored = h2.values()
-        raise RuntimeError(
-            f"""
+        raise RuntimeError(f"""
                         '{stype}' Histograms should agree but got
                         - original: {original}
                         - stored: {stored}
-                        """
-        )
+                        """)
 
 
 labels_dict = {

@@ -33,7 +33,7 @@ def match_regexp_params(regular_expressions, parameter_names):
 
 
 class FitterCallback:
-    def __init__(self, xv):
+    def __init__(self, xv, early_stopping=-1):
         self.iiter = 0
         self.xval = xv
 
@@ -41,6 +41,8 @@ class FitterCallback:
         self.time_history = []
 
         self.t0 = time.time()
+
+        self.early_stopping = early_stopping
 
     def __call__(self, intermediate_result):
         loss = intermediate_result.fun
@@ -50,6 +52,15 @@ class FitterCallback:
         )  # ; status {intermediate_result.status}")
         if np.isnan(loss):
             raise ValueError(f"Loss value is NaN at iteration {self.iiter}")
+
+        if (
+            self.early_stopping > 0
+            and len(self.loss_history) > self.early_stopping
+            and self.loss_history[-self.early_stopping] <= loss
+        ):
+            raise ValueError(
+                f"No reduction in loss after {self.early_stopping} iterations, early stopping."
+            )
 
         self.loss_history.append(loss)
         self.time_history.append(time.time() - self.t0)
@@ -67,6 +78,7 @@ class Fitter:
     ):
         self.indata = indata
 
+        self.earlyStopping = options.earlyStopping
         self.globalImpactsFromJVP = globalImpactsFromJVP
         self.binByBinStat = not options.noBinByBinStat
         self.binByBinStatMode = options.binByBinStatMode
@@ -358,7 +370,7 @@ class Fitter:
         unblind_parameters = match_regexp_params(
             unblind_parameter_expressions,
             [
-                *self.indata.signals,
+                *self.poi_model.pois,
                 *[self.indata.systs[i] for i in self.indata.noiidxs],
             ],
         )
@@ -398,7 +410,7 @@ class Fitter:
         # add offset to pois
         self._blinding_values_poi = np.ones(self.poi_model.npoi, dtype=np.float64)
         for i in range(self.poi_model.npoi):
-            param = self.indata.signals[i]
+            param = self.poi_model.pois[i]
             if param in unblind_parameters:
                 continue
             logger.debug(f"Blind signal strength modifier for {param}")
@@ -1328,7 +1340,7 @@ class Fitter:
         poi = self.get_poi()
         theta = self.get_theta()
 
-        rnorm = self.poi_model.compute(poi)
+        rnorm = self.poi_model.compute(poi, full)
 
         normcentral = None
         if self.indata.symmetric_tensor:
@@ -2296,7 +2308,7 @@ class Fitter:
 
             xval = self.x.numpy()
 
-            callback = FitterCallback(xval)
+            callback = FitterCallback(xval, self.earlyStopping)
 
             if self.minimizer_method in [
                 "trust-krylov",
