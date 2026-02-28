@@ -1344,7 +1344,7 @@ class Fitter:
         poi = self.get_poi()
         theta = self.get_theta()
 
-        rnorm = self.poi_model.compute(poi)
+        rnorm = self.poi_model.compute(poi, full)
 
         normcentral = None
         if self.indata.symmetric_tensor:
