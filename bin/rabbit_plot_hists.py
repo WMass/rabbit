@@ -332,6 +332,30 @@ def parseArgs():
         """,
     )
     parser.add_argument(
+        "--varGroupNames",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Variation group names to build on-the-fly from nuisance variations "
+            "using fitresult meta mapping (systs/systgroups/systgroupidxs)."
+        ),
+    )
+    parser.add_argument(
+        "--varGroupLabels",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Label(s) for --varGroupNames.",
+    )
+    parser.add_argument(
+        "--varGroupColors",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Color(s) for --varGroupNames.",
+    )
+    parser.add_argument(
         "--varLabels",
         type=str,
         nargs="*",
@@ -1174,6 +1198,9 @@ def make_plots(
     varFilesFitTypes=None,
     varMarkers=None,
     varNames=None,
+    varGroupNames=None,
+    varGroupLabels=None,
+    varGroupColors=None,
     varLabels=None,
     varColors=None,
     binwnorm=None,
@@ -1214,13 +1241,16 @@ def make_plots(
         l if p not in args.suppressProcsLabel else None for l, p in zip(labels, procs)
     ]
 
-    if varNames is not None:
+    if varNames is not None or varGroupNames is not None:
         # take the first variations from the varFiles, empty if no varFiles are provided
         if len(varFilesFitTypes) == 1:
             varFilesFitTypes = varFilesFitTypes * len(varResults)
 
         hists_down = []
         hists_up = []
+        plot_var_names = [] if varNames is None else list(varNames)
+        plot_var_labels = [] if varLabels is None else list(varLabels)
+        plot_var_colors = [] if varColors is None else list(varColors)
         for r, t in zip(varResults, varFilesFitTypes):
             h = r[f"hist_{t}_inclusive"].get()
 
@@ -1237,12 +1267,11 @@ def make_plots(
             hists_up.append(hist_up)
 
         # take the next variations from the nominal input file
-        if len(varNames) > len(varResults):
+        if varNames is not None and len(varNames) > len(varResults):
             # variations from the nominal input file
             hist_var = result[
                 f"hist_{fittype}_inclusive_variations{'_correlated' if args.correlatedVariations else ''}"
             ].get()
-
             hists_down.extend(
                 [
                     hist_var[{"downUpVar": 0, "vars": n}].project(
@@ -1259,6 +1288,67 @@ def make_plots(
                     for n in varNames[len(varResults) :]
                 ]
             )
+
+        # grouped variations built on-the-fly from grouped global impacts
+        # (covariance-based decomposition).
+        if varGroupNames is not None and len(varGroupNames):
+            axis_names = [a.name for a in axes]
+            h_nom = result[f"hist_{fittype}_inclusive"].get().project(*axis_names)
+            name_impacts_grouped = f"hist_{fittype}_inclusive_global_impacts_grouped"
+
+            if name_impacts_grouped not in result.keys():
+                raise KeyError(
+                    f"--varGroupNames requires '{name_impacts_grouped}' in the selected result/channel. "
+                    "Run rabbit_fit with --computeHistImpacts to produce grouped impact histograms."
+                )
+            h_impacts_grouped = result[name_impacts_grouped].get()
+            impact_entries = {_decode_str(x) for x in h_impacts_grouped.axes["impacts"]}
+
+            for ig, gname in enumerate(varGroupNames):
+                if gname not in impact_entries:
+                    logger.warning(
+                        f"Group '{gname}' has no matching entry in grouped impacts axis; skipping."
+                    )
+                    continue
+                sigma = (
+                    h_impacts_grouped[{"impacts": gname}]
+                    .project(*axis_names)
+                    .values()
+                )
+
+                h_up = h_nom.copy()
+                h_down = h_nom.copy()
+                h_up.values()[...] = h_nom.values() + sigma
+                h_down.values()[...] = h_nom.values() - sigma
+                hists_up.append(h_up)
+                hists_down.append(h_down)
+
+                plot_var_names.append(gname)
+                if varGroupLabels is not None and ig < len(varGroupLabels):
+                    plot_var_labels.append(varGroupLabels[ig])
+                else:
+                    plot_var_labels.append(gname)
+                if varGroupColors is not None and ig < len(varGroupColors):
+                    plot_var_colors.append(varGroupColors[ig])
+
+        # Ensure metadata arrays align with the effective number of plotted variations.
+        n_total = len(hists_up)
+        if len(plot_var_names) < n_total:
+            plot_var_names.extend(
+                [f"var{i}" for i in range(len(plot_var_names), n_total)]
+            )
+        if len(plot_var_labels) < n_total:
+            plot_var_labels.extend(plot_var_names[len(plot_var_labels) : n_total])
+        if len(plot_var_colors) < n_total:
+            default_cols = [
+                colormaps["tab10" if n_total < 10 else "tab20"](i)
+                for i in range(n_total)
+            ]
+            plot_var_colors.extend(default_cols[len(plot_var_colors) : n_total])
+
+        varNames = plot_var_names
+        varLabels = plot_var_labels
+        varColors = plot_var_colors
     else:
         hists_down = None
         hists_up = None
@@ -1418,6 +1508,7 @@ def main():
 
     varFiles = args.varFiles
     varNames = args.varNames
+    varGroupNames = args.varGroupNames
     varLabels = args.varLabels
     varColors = args.varColors
     if varNames is not None:
@@ -1434,6 +1525,17 @@ def main():
                 colormaps["tab10" if len(varNames) < 10 else "tab20"](i)
                 for i in range(len(varNames))
             ]
+    varGroupLabels = args.varGroupLabels
+    varGroupColors = args.varGroupColors
+    if varGroupNames is not None:
+        if varGroupLabels is not None and len(varGroupLabels) != len(varGroupNames):
+            raise ValueError(
+                "Must specify the same number of args for --varGroupNames and --varGroupLabels"
+            )
+        if varGroupColors is not None and len(varGroupColors) != len(varGroupNames):
+            raise ValueError(
+                "Must specify the same number of args for --varGroupNames and --varGroupColors"
+            )
 
     fittype = "prefit" if args.prefit else "postfit"
 
@@ -1470,6 +1572,9 @@ def main():
         meta=meta,
         fittype=fittype,
         varNames=varNames,
+        varGroupNames=varGroupNames,
+        varGroupLabels=varGroupLabels,
+        varGroupColors=varGroupColors,
         varLabels=varLabels,
         varColors=varColors,
         varMarkers=args.varMarkers,
