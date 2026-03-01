@@ -94,15 +94,6 @@ class Fitter:
             self.binByBinStatType = options.binByBinStatType
 
         if (
-            self.binByBinStat
-            and self.binByBinStatMode == "full"
-            and not self.binByBinStatType.startswith("normal")
-        ):
-            raise Exception(
-                'bin-by-bin stat only for option "--binByBinStatMode full" with "--binByBinStatType normal"'
-            )
-
-        if (
             options.covarianceFit
             and self.binByBinStat
             and not self.binByBinStatType.startswith("normal")
@@ -258,9 +249,14 @@ class Fitter:
                     self.sumw = self.indata.sumw
 
             if self.binByBinStatType in ["gamma", "normal-multiplicative"]:
-                self.kstat = self.sumw**2 / self.varbeta
-                self.betamask = (self.varbeta == 0.0) | (self.kstat == 0.0)
-                self.kstat = tf.where(self.betamask, 1.0, self.kstat)
+                self.betamask = (self.varbeta == 0.0) | (self.sumw == 0.0)
+                self.kstat = tf.where(self.betamask, 1.0, self.sumw**2 / self.varbeta)
+
+                if self.binByBinStatType == "gamma" and self.binByBinStatMode == "full":
+                    self.nbeta = tf.Variable(
+                        tf.ones_like(self.nobs), trainable=True, name="nbeta"
+                    )
+
             elif self.binByBinStatType == "normal-additive":
                 # precompute decomposition of composite matrix to speed up
                 # calculation of profiled beta values
@@ -1439,13 +1435,79 @@ class Fitter:
                 if self.chisqFit:
                     if self.binByBinStatType == "gamma":
                         kstat = self.kstat[: self.indata.nbins]
-
-                        abeta = nexp_profile**2
-                        bbeta = kstat * self.varnobs - nexp_profile * self.nobs
-                        cbeta = -kstat * self.varnobs * beta0
-                        beta = solve_quad_eq(abeta, bbeta, cbeta)
-
                         betamask = self.betamask[: self.indata.nbins]
+
+                        if self.binByBinStatMode == "lite":
+                            abeta = nexp_profile**2
+                            bbeta = kstat * self.varnobs - nexp_profile * self.nobs
+                            cbeta = -kstat * self.varnobs * beta0
+                            beta = solve_quad_eq(abeta, bbeta, cbeta)
+                        elif self.binByBinStatMode == "full":
+                            norm_profile = norm[: self.indata.nbins]
+
+                            # solving nbeta numerically using newtons method (does not work with forward differentiation i.e. use --globalImpacts with --globalImpactsDisableJVP)
+                            def fnll_nbeta(x):
+                                beta = (
+                                    kstat
+                                    * beta0
+                                    / (
+                                        kstat
+                                        + ((x - self.nobs) / self.varnobs)[..., None]
+                                        * norm_profile
+                                    )
+                                )
+                                beta = tf.where(betamask, beta0, beta)
+                                new_nexp = tf.reduce_sum(beta * norm_profile, axis=-1)
+                                ln = 0.5 * (new_nexp - self.nobs) ** 2 / self.varnobs
+                                lbeta = tf.reduce_sum(
+                                    kstat * (beta - beta0)
+                                    - kstat
+                                    * beta0
+                                    * (tf.math.log(beta) - tf.math.log(beta0)),
+                                    axis=-1,
+                                )
+                                return ln + lbeta
+
+                            def body(i, edm):
+                                with tf.GradientTape() as t2:
+                                    with tf.GradientTape() as t1:
+                                        nll = fnll_nbeta(nexp_profile * self.nbeta)
+                                    grad = t1.gradient(nll, self.nbeta)
+                                hess = t2.gradient(grad, self.nbeta)
+
+                                eps = 1e-8
+                                hess_sign = tf.where(
+                                    hess != 0, tf.sign(hess), tf.ones_like(hess)
+                                )
+                                safe_hess = hess_sign * tf.maximum(tf.abs(hess), eps)
+                                step = grad / safe_hess
+
+                                self.nbeta.assign_sub(step)
+
+                                return i + 1, tf.reduce_max(
+                                    tf.reduce_max(0.5 * grad * step)
+                                )
+
+                            def cond(i, edm):
+                                return tf.logical_and(i < 50, edm > 1e-10)
+
+                            i0 = tf.constant(0)
+                            edm0 = tf.constant(tf.float64.max)
+                            tf.while_loop(cond, body, loop_vars=(i0, edm0))
+
+                            beta = (
+                                kstat
+                                * beta0
+                                / (
+                                    kstat
+                                    + (
+                                        (nexp_profile * self.nbeta - self.nobs)
+                                        / self.varnobs
+                                    )[..., None]
+                                    * norm_profile
+                                )
+                            )
+
                         beta = tf.where(betamask, beta0, beta)
                     elif self.binByBinStatType == "normal-multiplicative":
                         kstat = self.kstat[: self.indata.nbins]
@@ -1594,7 +1656,79 @@ class Fitter:
                         kstat = self.kstat[: self.indata.nbins]
                         betamask = self.betamask[: self.indata.nbins]
 
-                        beta = (self.nobs + kstat * beta0) / (nexp_profile + kstat)
+                        if self.binByBinStatMode == "lite":
+                            beta = (self.nobs + kstat * beta0) / (nexp_profile + kstat)
+                        elif self.binByBinStatMode == "full":
+                            norm_profile = norm[: self.indata.nbins]
+
+                            # solving nbeta numerically using newtons method (does not work with forward differentiation i.e. use --globalImpacts with --globalImpactsDisableJVP)
+                            def fnll_nbeta(x):
+                                beta = (
+                                    kstat
+                                    * beta0
+                                    / (
+                                        norm_profile
+                                        + kstat
+                                        - (self.nobs / x)[..., None] * norm_profile
+                                    )
+                                )
+                                beta = tf.where(betamask, beta0, beta)
+                                new_nexp = tf.reduce_sum(beta * norm_profile, axis=-1)
+                                ln = (
+                                    new_nexp
+                                    - self.nobs
+                                    - self.nobs
+                                    * (tf.math.log(new_nexp) - tf.math.log(self.nobs))
+                                )
+                                lbeta = tf.reduce_sum(
+                                    kstat * (beta - beta0)
+                                    - kstat
+                                    * beta0
+                                    * (tf.math.log(beta) - tf.math.log(beta0)),
+                                    axis=-1,
+                                )
+                                return ln + lbeta
+
+                            def body(i, edm):
+                                with tf.GradientTape() as t2:
+                                    with tf.GradientTape() as t1:
+                                        nll = fnll_nbeta(nexp_profile * self.nbeta)
+                                    grad = t1.gradient(nll, self.nbeta)
+                                hess = t2.gradient(grad, self.nbeta)
+
+                                eps = 1e-8
+                                hess_sign = tf.where(
+                                    hess != 0, tf.sign(hess), tf.ones_like(hess)
+                                )
+                                safe_hess = hess_sign * tf.maximum(tf.abs(hess), eps)
+                                step = grad / safe_hess
+
+                                self.nbeta.assign_sub(step)
+
+                                return i + 1, tf.reduce_max(
+                                    tf.reduce_max(0.5 * grad * step)
+                                )
+
+                            def cond(i, edm):
+                                return tf.logical_and(i < 50, edm > 1e-10)
+
+                            i0 = tf.constant(0)
+                            edm0 = tf.constant(tf.float64.max)
+                            tf.while_loop(cond, body, loop_vars=(i0, edm0))
+
+                            beta = (
+                                kstat
+                                * beta0
+                                / (
+                                    norm_profile
+                                    - (self.nobs / (nexp_profile * self.nbeta))[
+                                        ..., None
+                                    ]
+                                    * norm_profile
+                                    + kstat
+                                )
+                            )
+
                         beta = tf.where(betamask, beta0, beta)
                     elif self.binByBinStatType == "normal-multiplicative":
                         kstat = self.kstat[: self.indata.nbins]
