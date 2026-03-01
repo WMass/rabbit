@@ -1366,7 +1366,9 @@ def make_plots(
         # Ensure metadata arrays align with the effective number of plotted variations.
         n_total = len(hists_up)
         if len(plot_var_names) < n_total:
-            plot_var_names.extend([f"var{i}" for i in range(len(plot_var_names), n_total)])
+            plot_var_names.extend(
+                [f"var{i}" for i in range(len(plot_var_names), n_total)]
+            )
         if len(plot_var_labels) < n_total:
             plot_var_labels.extend(plot_var_names[len(plot_var_labels) : n_total])
         if len(plot_var_colors) < n_total:
