@@ -47,9 +47,7 @@ class FitterCallback:
     def __call__(self, intermediate_result):
         loss = intermediate_result.fun
 
-        logger.debug(
-            f"Iteration {self.iiter}: loss value {loss}"
-        )  # ; status {intermediate_result.status}")
+        logger.debug(f"Iteration {self.iiter}: loss value {loss}")
         if np.isnan(loss):
             raise ValueError(f"Loss value is NaN at iteration {self.iiter}")
 
@@ -2125,13 +2123,11 @@ class Fitter:
         return None
 
     def _compute_nll_components(self, profile=True, full_nll=False):
-        nexpfullcentral, _, beta = self._compute_yields_with_beta(
+        nexp, _, beta = self._compute_yields_with_beta(
             profile=profile,
             compute_norm=False,
             full=False,
         )
-
-        nexp = nexpfullcentral
 
         if self.chisqFit:
             ln = 0.5 * tf.reduce_sum((nexp - self.nobs) ** 2 / self.varnobs, axis=-1)
@@ -2257,6 +2253,69 @@ class Fitter:
 
         return val, grad, hess
 
+    def fit(self):
+
+        def scipy_loss(xval):
+            self.x.assign(xval)
+            val, grad = self.loss_val_grad()
+            return val.__array__(), grad.__array__()
+
+        def scipy_hessp(xval, pval):
+            self.x.assign(xval)
+            p = tf.convert_to_tensor(pval)
+            val, grad, hessp = self.loss_val_grad_hessp(p)
+            return hessp.__array__()
+
+        def scipy_hess(xval):
+            self.x.assign(xval)
+            val, grad, hess = self.loss_val_grad_hess()
+            if self.diagnostics:
+                cond_number = tfh.cond_number(hess)
+                logger.info(f"  - Condition number: {cond_number}")
+                edmval = tfh.edmval(grad, hess)
+                logger.info(f"  - edmval: {edmval}")
+            return hess.__array__()
+
+        xval = self.x.numpy()
+
+        callback = FitterCallback(xval, self.earlyStopping)
+
+        if self.minimizer_method in [
+            "trust-krylov",
+            "trust-ncg",
+        ]:
+            info_minimize = dict(hessp=scipy_hessp)
+        elif self.minimizer_method in [
+            "trust-exact",
+            "dogleg",
+        ]:
+            info_minimize = dict(hess=scipy_hess)
+        else:
+            info_minimize = dict()
+
+        try:
+            res = scipy.optimize.minimize(
+                scipy_loss,
+                xval,
+                method=self.minimizer_method,
+                jac=True,
+                tol=0.0,
+                callback=callback,
+                **info_minimize,
+            )
+        except Exception as ex:
+            # minimizer could have called the loss or hessp functions with "random" values, so restore the
+            # state from the end of the last iteration before the exception
+            xval = callback.xval
+            logger.debug(ex)
+        else:
+            xval = res["x"]
+            logger.debug(res)
+
+        self.x.assign(xval)
+
+        return callback
+
     def minimize(self):
         if self.is_linear:
             logger.info(
@@ -2284,71 +2343,16 @@ class Fitter:
 
             callback = None
         else:
-
-            def scipy_loss(xval):
-                self.x.assign(xval)
-                val, grad = self.loss_val_grad()
-                return val.__array__(), grad.__array__()
-
-            def scipy_hessp(xval, pval):
-                self.x.assign(xval)
-                p = tf.convert_to_tensor(pval)
-                val, grad, hessp = self.loss_val_grad_hessp(p)
-                return hessp.__array__()
-
-            def scipy_hess(xval):
-                self.x.assign(xval)
-                val, grad, hess = self.loss_val_grad_hess()
-                if self.diagnostics:
-                    cond_number = tfh.cond_number(hess)
-                    logger.info(f"  - Condition number: {cond_number}")
-                    edmval = tfh.edmval(grad, hess)
-                    logger.info(f"  - edmval: {edmval}")
-                return hess.__array__()
-
-            xval = self.x.numpy()
-
-            callback = FitterCallback(xval, self.earlyStopping)
-
-            if self.minimizer_method in [
-                "trust-krylov",
-                "trust-ncg",
-            ]:
-                info_minimize = dict(hessp=scipy_hessp)
-            elif self.minimizer_method in [
-                "trust-exact",
-                "dogleg",
-            ]:
-                info_minimize = dict(hess=scipy_hess)
-            else:
-                info_minimize = dict()
-
-            try:
-                res = scipy.optimize.minimize(
-                    scipy_loss,
-                    xval,
-                    method=self.minimizer_method,
-                    jac=True,
-                    tol=0.0,
-                    callback=callback,
-                    **info_minimize,
-                )
-            except Exception as ex:
-                # minimizer could have called the loss or hessp functions with "random" values, so restore the
-                # state from the end of the last iteration before the exception
-                xval = callback.xval
-                logger.debug(ex)
-            else:
-                xval = res["x"]
-                logger.debug(res)
-
-            self.x.assign(xval)
+            callback = self.fit()
 
         return callback
 
     def nll_scan(self, param, scan_range, scan_points, use_prefit=False):
         # make a likelihood scan for a single parameter
         # assuming the likelihood is minimized
+
+        # freeze minimize which mean to not update it in the fit
+        self.freeze_params(param)
 
         idx = np.where(self.parms.astype(str) == param)[0][0]
 
@@ -2375,50 +2379,27 @@ class Fitter:
                 if i == 0:
                     continue
 
+                logger.debug(f"Now at i={i} x={ixval}")
                 self.x.assign(tf.tensor_scatter_nd_update(self.x, [[idx]], [ixval]))
 
-                def scipy_loss(xval):
-                    self.x.assign(xval)
-                    val, grad = self.loss_val_grad()
-                    grad = grad.numpy()
-                    grad[idx] = 0  # Zero out gradient for the frozen parameter
-                    return val.numpy(), grad
+                self.fit()
 
-                def scipy_hessp(xval, pval):
-                    self.x.assign(xval)
-                    pval[idx] = (
-                        0  # Ensure the perturbation does not affect frozen parameter
-                    )
-                    p = tf.convert_to_tensor(pval)
-                    val, grad, hessp = self.loss_val_grad_hessp(p)
-                    hessp = hessp.numpy()
-                    # TODO: worth testing modifying the loss/grad/hess functions to imply 1
-                    # for the corresponding hessian element instead of 0,
-                    # since this might allow the minimizer to converge more efficiently
-                    hessp[idx] = (
-                        0  # Zero out Hessian-vector product at the frozen index
-                    )
-                    return hessp
+                dnlls[nscans // 2 + sign * i] = self.reduced_nll().numpy() - nll_best
 
-                res = scipy.optimize.minimize(
-                    scipy_loss,
-                    self.x,
-                    method="trust-krylov",
-                    jac=True,
-                    hessp=scipy_hessp,
-                )
-                if res["success"]:
-                    dnlls[nscans // 2 + sign * i] = (
-                        self.reduced_nll().numpy() - nll_best
-                    )
-                    scan_vals[nscans // 2 + sign * i] = ixval
+                scan_vals[nscans // 2 + sign * i] = ixval
 
             # reset x to original state
             self.x.assign(xval)
 
+        # let the parameter be free again
+        self.defreeze_params(param)
+
         return scan_vals, dnlls
 
     def nll_scan2D(self, param_tuple, scan_range, scan_points, use_prefit=False):
+
+        # freeze minimize which mean to not update it in the fit
+        self.freeze_params(param_tuple)
 
         idx0 = np.where(self.parms.astype(str) == param_tuple[0])[0][0]
         idx1 = np.where(self.parms.astype(str) == param_tuple[1])[0][0]
@@ -2466,7 +2447,9 @@ class Fitter:
             ix = best_fit - i
             iy = best_fit + j
 
-            # print(f"i={i}, j={j}, r={r} drow={drow}, dcol={dcol} | ix={ix}, iy={iy}")
+            logger.debug(
+                f"Now at (ix,iy) = ({ix},{iy}) (x,y)= ({x_scans[ix]},{y_scans[iy]})"
+            )
 
             self.x.assign(
                 tf.tensor_scatter_nd_update(
@@ -2474,41 +2457,15 @@ class Fitter:
                 )
             )
 
-            def scipy_loss(xval):
-                self.x.assign(xval)
-                val, grad = self.loss_val_grad()
-                grad = grad.numpy()
-                grad[idx0] = 0
-                grad[idx1] = 0
-                return val.numpy(), grad
+            self.fit()
 
-            def scipy_hessp(xval, pval):
-                self.x.assign(xval)
-                pval[idx0] = 0
-                pval[idx1] = 0
-                p = tf.convert_to_tensor(pval)
-                val, grad, hessp = self.loss_val_grad_hessp(p)
-                hessp = hessp.numpy()
-                hessp[idx0] = 0
-                hessp[idx1] = 0
-
-                if np.allclose(hessp, 0, atol=1e-8):
-                    return np.zeros_like(hessp)
-
-                return hessp
-
-            res = scipy.optimize.minimize(
-                scipy_loss,
-                self.x,
-                method="trust-krylov",
-                jac=True,
-                hessp=scipy_hessp,
-            )
-
-            if res["success"]:
-                dnlls[ix, iy] = self.reduced_nll().numpy() - nll_best
+            dnlls[ix, iy] = self.reduced_nll().numpy() - nll_best
 
         self.x.assign(xval)
+
+        # let the parameter be free again
+        self.defreeze_params(param_tuple)
+
         return x_scans, y_scans, dnlls
 
     def contour_scan(self, param, nll_min, q=1, signs=[-1, 1], fun=None):
