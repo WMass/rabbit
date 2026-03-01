@@ -1311,9 +1311,7 @@ def make_plots(
                     )
                     continue
                 sigma = (
-                    h_impacts_grouped[{"impacts": gname}]
-                    .project(*axis_names)
-                    .values()
+                    h_impacts_grouped[{"impacts": gname}].project(*axis_names).values()
                 )
 
                 h_up = h_nom.copy()
