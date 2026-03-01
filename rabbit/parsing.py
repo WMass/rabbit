@@ -44,6 +44,12 @@ def common_parser():
         help="Calculate and print additional info for diagnostics (condition number, edm value)",
     )
     parser.add_argument(
+        "--earlyStopping",
+        default=-1,
+        type=int,
+        help="Number of iterations with no improvement after which training will be stopped. Specify -1 to disable.",
+    )
+    parser.add_argument(
         "--minimizerMethod",
         default="trust-krylov",
         type=str,

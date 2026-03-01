@@ -12,14 +12,6 @@ axis_downUpVar = hist.axis.Regular(
 )
 
 
-def getImpactsAxes(indata, global_impacts=False):
-    if global_impacts:
-        impact_names = list(indata.systs.astype(str))
-    else:
-        impact_names = list(indata.signals.astype(str)) + list(indata.systs.astype(str))
-    return hist.axis.StrCategory(impact_names, name="impacts")
-
-
 def getGroupedImpactsAxes(indata, bin_by_bin_stat=False, per_process=False):
     impact_names = list(indata.systgroups.astype(str))
     impact_names.append("stat")
@@ -56,9 +48,15 @@ class Workspace:
     def __init__(self, outdir, outname, fitter, postfix=None):
         self.results = {}
 
+        self.parms = fitter.parms
+        self.npoi = fitter.poi_model.npoi
+        self.noiidxs = fitter.indata.noiidxs
+
         # some information for the impact histograms
-        self.impact_axis = getImpactsAxes(fitter.indata)
-        self.global_impact_axis = getImpactsAxes(fitter.indata, global_impacts=True)
+        systs = list(fitter.indata.systs.astype(str))
+        parms = list(fitter.parms.astype(str))
+        self.impact_axis = hist.axis.StrCategory(parms, name="impacts")
+        self.global_impact_axis = hist.axis.StrCategory(systs, name="impacts")
         self.grouped_impact_axis = getGroupedImpactsAxes(
             fitter.indata, bin_by_bin_stat=fitter.binByBinStat, per_process=False
         )
@@ -67,10 +65,6 @@ class Workspace:
             bin_by_bin_stat=fitter.binByBinStat,
             per_process=fitter.binByBinStatMode == "full",
         )
-
-        self.parms = fitter.parms
-        self.npoi = fitter.poi_model.npoi
-        self.noiidxs = fitter.indata.noiidxs
 
         self.extension = "hdf5"
         self.file_path = self.get_file_path(outdir, outname, postfix)
@@ -193,8 +187,8 @@ class Workspace:
 
     def add_chi2(self, chi2, ndf, prefit, mapping):
         postfix = "_prefit" if prefit else ""
-        self.add_value(ndf, "ndf" + postfix, mapping.key)
-        self.add_value(chi2, "chi2" + postfix, mapping.key)
+        self.add_value(int(ndf), "ndf" + postfix, mapping.key)
+        self.add_value(float(chi2), "chi2" + postfix, mapping.key)
 
     def add_observed_hists(
         self, mapping, data_obs, nobs, data_cov_inv=None, nobs_cov_inv=None

@@ -190,7 +190,7 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
                     logger.info(
                         f"Expected (Likelihood) {round((cl_b)*100,1):4.1f}%: {key} < {r}"
                     )
-                    limits_nll[i, j, k] = r
+                    limits_nll[i, j, k] = r.item()
 
             if "gaussian" in args.modes:
                 # Gaussian approximation

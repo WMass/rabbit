@@ -15,7 +15,6 @@ import rabbit.io_tools
 from wums import boostHistHelpers as hh  # isort: skip
 from wums import logging, output_tools, plot_tools  # isort: skip
 
-
 hep.style.use(hep.style.ROOT)
 
 

@@ -9,15 +9,11 @@ import re
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.io as pio
 from plotly.subplots import make_subplots
 
 from rabbit import io_tools
 
 from wums import logging, output_tools, plot_tools  # isort: skip
-
-# prevent MathJax from bein loaded
-pio.kaleido.scope.mathjax = None
 
 logger = None
 
@@ -1278,13 +1274,14 @@ def main():
     translate_label = getattr(config, "impact_labels", {})
 
     fitresult, meta = io_tools.get_fitresult(args.inputFile, args.result, meta=True)
-    if any(
-        x is not None for x in [args.referenceFile, args.refResult, args.refMapping]
-    ):
-        if args.referenceFile is not None:
-            fitresult_ref = io_tools.get_fitresult(args.referenceFile, args.refResult)
-        else:
-            fitresult_ref = fitresult
+    if any(x is not None for x in [args.referenceFile, args.refResult]):
+        ref_file = (
+            args.referenceFile if args.referenceFile is not None else args.inputFile
+        )
+        ref_result = args.refResult if args.refResult is not None else args.result
+        fitresult_ref = io_tools.get_fitresult(ref_file, ref_result)
+    elif args.refMapping is not None:
+        fitresult_ref = fitresult
     else:
         fitresult_ref = None
 
