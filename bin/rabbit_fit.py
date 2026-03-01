@@ -182,13 +182,6 @@ def make_parser():
         action="store_true",
         help="compute impacts of frozen (non-profiled) systematics",
     )
-    parser.add_argument(
-        "--setConstraintMinimum",
-        default=[],
-        nargs=2,
-        action="append",
-        help="Set the constraint minima of specified parameter to specified value",
-    )
 
     return parser.parse_args()
 
