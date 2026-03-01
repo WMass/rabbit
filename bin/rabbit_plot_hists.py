@@ -24,38 +24,6 @@ hep.style.use(hep.style.ROOT)
 logger = None
 
 
-def _decode_str(x):
-    return x.decode() if isinstance(x, (bytes, np.bytes_)) else str(x)
-
-
-def _build_group_to_nuisance_map(meta):
-    # Prefer mapping persisted directly in fitresult meta, fallback to nested input meta.
-    systs = meta.get("systs")
-    groups = meta.get("systgroups")
-    groupidxs = meta.get("systgroupidxs")
-
-    if systs is None or groups is None or groupidxs is None:
-        nested = meta.get("meta_info_input", {})
-        systs = nested.get("systs")
-        groups = nested.get("systgroups")
-        groupidxs = nested.get("systgroupidxs")
-
-    if systs is None or groups is None or groupidxs is None:
-        return {}
-
-    systs = [_decode_str(x) for x in np.array(systs)]
-    groups = [_decode_str(x) for x in np.array(groups)]
-
-    out = {}
-    for g, idxs in zip(groups, np.array(groupidxs, dtype=object)):
-        nuis = []
-        for idx in np.array(idxs, dtype=int):
-            if 0 <= idx < len(systs):
-                nuis.append(systs[idx])
-        out[g] = nuis
-    return out
-
-
 def parseArgs():
 
     # choices for legend padding
@@ -1321,33 +1289,33 @@ def make_plots(
                 ]
             )
 
-        # grouped variations built on-the-fly from nuisance-level variations
+        # grouped variations built on-the-fly from grouped global impacts
+        # (covariance-based decomposition).
         if varGroupNames is not None and len(varGroupNames):
-            hist_var = result[
-                f"hist_{fittype}_inclusive_variations{'_correlated' if args.correlatedVariations else ''}"
-            ].get()
             axis_names = [a.name for a in axes]
-            var_axis_entries = {_decode_str(x) for x in hist_var.axes["vars"]}
-            group_to_nuis = _build_group_to_nuisance_map(kwopts.get("meta", {}))
             h_nom = result[f"hist_{fittype}_inclusive"].get().project(*axis_names)
+            name_impacts_grouped = f"hist_{fittype}_inclusive_global_impacts_grouped"
+
+            if name_impacts_grouped not in result.keys():
+                raise KeyError(
+                    f"--varGroupNames requires '{name_impacts_grouped}' in the selected result/channel. "
+                    "Run rabbit_fit with --computeHistImpacts to produce grouped impact histograms."
+                )
+            h_impacts_grouped = result[name_impacts_grouped].get()
+            impact_entries = {_decode_str(x) for x in h_impacts_grouped.axes["impacts"]}
 
             for ig, gname in enumerate(varGroupNames):
-                members = group_to_nuis.get(gname, [])
-                members = [n for n in members if n in var_axis_entries]
-                if len(members) == 0:
+                if gname not in impact_entries:
                     logger.warning(
-                        f"Group '{gname}' has no matching nuisances in variations axis; skipping."
+                        f"Group '{gname}' has no matching entry in grouped impacts axis; skipping."
                     )
                     continue
+                sigma = (
+                    h_impacts_grouped[{"impacts": gname}]
+                    .project(*axis_names)
+                    .values()
+                )
 
-                sigma2 = np.zeros_like(h_nom.values(), dtype=float)
-                for n in members:
-                    hdn = hist_var[{"downUpVar": 0, "vars": n}].project(*axis_names)
-                    hup = hist_var[{"downUpVar": 1, "vars": n}].project(*axis_names)
-                    contrib = 0.5 * (hup.values() - hdn.values())
-                    sigma2 += contrib * contrib
-
-                sigma = np.sqrt(sigma2)
                 h_up = h_nom.copy()
                 h_down = h_nom.copy()
                 h_up.values()[...] = h_nom.values() + sigma

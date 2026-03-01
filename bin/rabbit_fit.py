@@ -487,8 +487,6 @@ def main():
         "procs": ifitter.indata.procs,
         "pois": ifitter.poi_model.pois,
         "nois": ifitter.parms[ifitter.poi_model.npoi :][indata.noiidxs],
-        # Persist nuisance/group bookkeeping directly in fitresults
-        # so downstream plotting can reconstruct groupings without the input card.
         "systs": ifitter.indata.systs,
         "systgroups": ifitter.indata.systgroups,
         "systgroupidxs": ifitter.indata.systgroupidxs,
