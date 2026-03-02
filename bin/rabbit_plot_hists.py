@@ -1302,7 +1302,7 @@ def make_plots(
                     "Run rabbit_fit with --computeHistImpacts to produce grouped impact histograms."
                 )
             h_impacts_grouped = result[name_impacts_grouped].get()
-            impact_entries = {_decode_str(x) for x in h_impacts_grouped.axes["impacts"]}
+            impact_entries = {x for x in h_impacts_grouped.axes["impacts"]}
 
             for ig, gname in enumerate(varGroupNames):
                 if gname not in impact_entries:
