@@ -58,7 +58,7 @@ Then activate it and install the necessary packages
 source env/bin/activate
 pip install wums[pickling,plotting] tensorflow tensorflow-probability tf_keras numpy h5py hist scipy matplotlib mplhep seaborn pandas plotly kaleido
 ```
-The packages `matplotlib`, `mplhep`, `seaborn`, `pandas`, `plotly`, and `kaleido` are only needed for the plotting scripts. 
+The packages `matplotlib`, `mplhep`, `seaborn`, `pandas`, and `plotly` are only needed for the plotting scripts. 
 For the `text2hdf5.py` conversion also the `uproot` package is needed.
 In case you want to contribute to the development, please also install the linters `isort`, `flake8`, `autoflake`, `black`, and `pylint` used in the pre-commit hooks and the github CI
 Deactivate the environment with `deactivate`.

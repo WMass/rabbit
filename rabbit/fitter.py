@@ -305,6 +305,11 @@ class Fitter:
             name="cov",
         )
 
+        # regularization
+        self.regularizers = []
+        # one common regularization strength parameter
+        self.tau = tf.Variable(1.0, trainable=True, name="tau", dtype=tf.float64)
+
         # determine if problem is linear (ie likelihood is purely quadratic)
         self.is_linear = (
             (self.chisqFit or self.covarianceFit)
@@ -314,7 +319,7 @@ class Fitter:
             and ((not self.binByBinStat) or self.binByBinStatType == "normal-additive")
         )
 
-    def load_fitresult(self, fitresult_file, fitresult_key):
+    def load_fitresult(self, fitresult_file, fitresult_key, profile=True):
         # load results from external fit and set postfit value and covariance elements for common parameters
         cov_ext = None
         with h5py.File(fitresult_file, "r") as fext:
@@ -350,6 +355,9 @@ class Fitter:
             covval[np.ix_(idxs, idxs)] = cov_ext[np.ix_(idxs_ext, idxs_ext)]
             self.cov.assign(tf.constant(covval))
 
+        if profile:
+            self._profile_beta()
+
     def update_frozen_params(self):
         logger.debug(f"Updated list of frozen params: {self.frozen_params}")
         new_mask_np = np.isin(self.parms, self.frozen_params)
@@ -358,12 +366,14 @@ class Fitter:
         self.frozen_indices = np.where(new_mask_np)[0]
 
     def freeze_params(self, frozen_parmeter_expressions):
+        logger.debug(f"Freeze params with {frozen_parmeter_expressions}")
         self.frozen_params.extend(
             match_regexp_params(frozen_parmeter_expressions, self.parms)
         )
         self.update_frozen_params()
 
     def defreeze_params(self, unfrozen_parmeter_expressions):
+        logger.debug(f"Freeze params with {unfrozen_parmeter_expressions}")
         unfrozen_parmeter = match_regexp_params(
             unfrozen_parmeter_expressions, self.parms
         )
@@ -373,6 +383,7 @@ class Fitter:
         self.update_frozen_params()
 
     def init_blinding_values(self, unblind_parameter_expressions=[]):
+        logger.debug(f"Unblind parameters with {unblind_parameter_expressions}")
         unblind_parameters = match_regexp_params(
             unblind_parameter_expressions,
             [
@@ -465,6 +476,9 @@ class Fitter:
         else:
             return poi
 
+    def get_x(self):
+        return tf.concat([self.get_poi(), self.get_theta()], axis=0)
+
     def _default_beta0(self):
         if self.binByBinStatType in ["gamma", "normal-multiplicative"]:
             return tf.ones(self.beta_shape, dtype=self.indata.dtype)
@@ -546,6 +560,11 @@ class Fitter:
         self.xdefaultassign()
         if self.do_blinding:
             self.set_blinding_offsets(False)
+
+        xinit = self.get_x()
+        nexp0 = self.expected_yield(full=True)
+        for reg in self.regularizers:
+            reg.set_expectations(xinit, nexp0)
 
     def bayesassign(self):
         # FIXME use theta0 as the mean and constraintweight to scale the width
@@ -2129,13 +2148,7 @@ class Fitter:
 
         return None
 
-    def _compute_nll_components(self, profile=True, full_nll=False):
-        nexp, _, beta = self._compute_yields_with_beta(
-            profile=profile,
-            compute_norm=False,
-            full=False,
-        )
-
+    def _compute_ln(self, nexp, full_nll=False):
         if self.chisqFit:
             ln = 0.5 * tf.reduce_sum((nexp - self.nobs) ** 2 / self.varnobs, axis=-1)
         elif self.covarianceFit:
@@ -2163,21 +2176,46 @@ class Fitter:
                 ln = tf.reduce_sum(
                     -self.nobs * (lognexp - self.lognobs) + nexp - self.nobs, axis=-1
                 )
+        return ln
+
+    def _compute_nll_components(self, profile=True, full_nll=False):
+        nexpfullcentral, _, beta = self._compute_yields_with_beta(
+            profile=profile,
+            compute_norm=False,
+            full=len(self.regularizers),
+        )
+
+        nexp = nexpfullcentral[: self.indata.nbins]
+
+        ln = self._compute_ln(nexp, full_nll)
 
         lc = self._compute_lc(full_nll)
 
         lbeta = self._compute_lbeta(beta, full_nll)
 
-        return ln, lc, lbeta, beta
+        if len(self.regularizers):
+            x = self.get_x()
+            penalties = [
+                reg.compute_nll_penalty(x, nexpfullcentral) * tf.exp(2 * self.tau)
+                for reg in self.regularizers
+            ]
+            lpenalty = tf.add_n(penalties)
+        else:
+            lpenalty = None
+
+        return ln, lc, lbeta, lpenalty, beta
 
     def _compute_nll(self, profile=True, full_nll=False):
-        ln, lc, lbeta, beta = self._compute_nll_components(
+        ln, lc, lbeta, lpenalty, beta = self._compute_nll_components(
             profile=profile, full_nll=full_nll
         )
         l = ln + lc
 
         if lbeta is not None:
             l = l + lbeta
+
+        if lpenalty is not None:
+            l = l + lpenalty
 
         return l
 
