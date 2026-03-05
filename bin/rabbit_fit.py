@@ -487,6 +487,10 @@ def main():
         "procs": ifitter.indata.procs,
         "pois": ifitter.poi_model.pois,
         "nois": ifitter.parms[ifitter.poi_model.npoi :][indata.noiidxs],
+        "systs": ifitter.indata.systs,
+        "systgroups": ifitter.indata.systgroups,
+        "systgroupidxs": ifitter.indata.systgroupidxs,
+        "systsnoconstraint": ifitter.indata.systsnoconstraint,
     }
 
     with workspace.Workspace(
