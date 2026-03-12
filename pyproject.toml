@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-plotting = ["matplotlib", "mplhep", "seaborn", "pandas", "plotly", "kaleido", "wums[plotting]"]
+plotting = ["matplotlib", "mplhep", "seaborn", "pandas", "plotly", "wums[plotting]"]
 conversion = ["uproot"]
 all = ["plotting", "conversion"]
 

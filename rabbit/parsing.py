@@ -217,5 +217,18 @@ def common_parser():
         action="store_true",
         help="Make a composite mapping and compute the covariance matrix across all mappings.",
     )
+    parser.add_argument(
+        "-r",
+        "--regularization",
+        nargs="+",
+        action="append",
+        default=[],
+        help="""
+        apply regularization on the output "nout" of a mapping by including a penalty term P(nout) in the -log(L) of the minimization.
+        As argument, specify the regulaization defined in rabbit/regularization/, followed by a mapping using the same syntax as discussed above. 
+        e.g. '-r SVD Select ch0_masked' to apply SVD regularization on the channel 'ch0_masked' or '-r SVD Project ch0 pt' for the 1D projection to pt.
+        Custom regularization can be specified with the full path e.g. '-r custom_regularization.MyCustomRegularization Project ch0 pt'.
+        """,
+    )
 
     return parser

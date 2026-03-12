@@ -267,6 +267,32 @@ jobs:
           rabbit_fit.py $RABBIT_OUTDIR/test_tensor_symmetric.hdf5 -o $RABBIT_OUTDIR/ --postfix bb_full
           -t 0 --globalImpacts --binByBinStatType normal-multiplicative --binByBinStatMode full
 
+  regularization:
+    runs-on: [self-hosted, linux, x64]
+    needs: [setenv, make-tensor]
+    steps:
+      - env:
+          RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
+          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
+          PATH: ${{ needs.setenv.outputs.PATH }}
+          WEB_DIR: ${{ needs.setenv.outputs.WEB_DIR }}
+          PLOT_DIR: ${{ needs.setenv.outputs.PLOT_DIR }}
+        run: |
+          echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
+          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
+          echo "PATH=${PATH}" >> $GITHUB_ENV
+          echo "WEB_DIR=${WEB_DIR}" >> $GITHUB_ENV
+          echo "PLOT_DIR=${PLOT_DIR}" >> $GITHUB_ENV
+
+      - name: lcurve scan
+        run: >-
+          rabbit_fit.py $RABBIT_OUTDIR/test_tensor.hdf5 -o $RABBIT_OUTDIR/ --postfix lcurve_scan
+          -t 0 --unblind -r SVD Select 'ch0_masked' -r SVD Select 'ch0_masked'--earlyStopping 15
+
+      - name: plot lcurve
+        run: >-
+          python tests/plot_epoch_loss_time.py results/fitresults_lcurve_scan.hdf5 -o $WEB_DIR/$PLOT_DIR --types lcurve --title Experiment --subtitle 'Work in progress'
+
   bsm:
     runs-on: [self-hosted, linux, x64]
     needs: [setenv, make-tensor]
@@ -431,7 +457,7 @@ jobs:
 
   copy-clean:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, symmerizations, bsm, plotting, likelihoodscans]
+    needs: [setenv, symmerizations, bsm, regularization, plotting, likelihoodscans]
     if: always() 
     steps:
       - env:
