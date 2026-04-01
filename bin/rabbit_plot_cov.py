@@ -284,6 +284,7 @@ def main():
                         suffix=suffix,
                         axes_names=axes_names,
                     )
+                    h_cov_channel = h_cov
                 elif len(instance.get("channels", {}).keys()) > 1:
                     # plot covariance matrix in each channel
                     nbins = np.prod(channel_hist.shape)
@@ -318,9 +319,19 @@ def main():
                         put_trailing=True,
                     )
 
+                    cov_channel_vals = (
+                        h_cov_channel.values()
+                        if hasattr(h_cov_channel, "values")
+                        else h_cov_channel
+                    )
+                    if len(cov_channel_vals.shape) > 2:
+                        flat = np.prod(
+                            cov_channel_vals.shape[: len(cov_channel_vals.shape) // 2]
+                        )
+                        cov_channel_vals = cov_channel_vals.reshape((flat, flat))
                     vals = np.reshape(
-                        h_cov_channel.values(),
-                        (h_cov_channel.shape[0], *h2d.shape[: len(h2d.shape) // 2]),
+                        cov_channel_vals,
+                        (cov_channel_vals.shape[0], *h2d.shape[: len(h2d.shape) // 2]),
                     )
                     h2d.values()[...] = np.reshape(vals, h2d.shape)
 
@@ -356,7 +367,7 @@ def main():
                             h_cov_i,
                             args,
                             channel=channel,
-                            axes=other_axes,
+                            axes_names=other_axes,
                             config=config,
                             meta=meta,
                             suffix=suffix,

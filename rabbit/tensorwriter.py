@@ -165,12 +165,16 @@ class TensorWriter:
         self.dict_sumw2[name] = {}
         self.dict_beta_variations[name] = {}
 
-        # add masked channels last and not masked channels first
+        # add masked channels last
         this_channel = {"axes": [a for a in axes], "masked": masked, "flow": flow}
         if masked:
             self.channels[name] = this_channel
         else:
-            self.channels = {name: this_channel, **self.channels}
+            self.channels = {
+                **{k: v for k, v in self.channels.items() if not v["masked"]},
+                name: this_channel,
+                **{k: v for k, v in self.channels.items() if v["masked"]},
+            }
 
         self.dict_logkavg[name] = {}
         self.dict_logkhalfdiff[name] = {}

@@ -752,6 +752,7 @@ def make_plot(
                     closed=True,
                     facecolor=facecolor_pred,
                     edgecolor="black",
+                    alpha=facecolor_alpha_pred,
                 )
             )
             extra_labels_upper.append(pred_label)
