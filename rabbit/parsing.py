@@ -332,9 +332,12 @@ def common_parser():
     )
     parser.add_argument(
         "--poiModel",
-        default=["Mu"],
+        default=[["Mu"]],
         nargs="+",
-        help="Specify POI model to be used to introduce non standard parameterization",
+        action="append",
+        help="Specify POI model (repeatable). Each flag takes a class name "
+        "followed by its positional args. Multiple flags are automatically "
+        "composed via CompositePOIModel.",
     )
     parser.add_argument(
         "-m",
