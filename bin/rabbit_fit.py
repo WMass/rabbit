@@ -646,12 +646,12 @@ def main():
 
     indata = inputdata.FitInputData(args.filename, args.pseudoData)
 
-    margs = args.poiModel
-    poi_model = ph.load_model(margs[0], indata, *margs[1:], **vars(args))
+    _models = [ph.load_model(spec[0], indata, *spec[1:], **vars(args)) for spec in args.poiModel]
+    fitted_poi_model = _models[0] if len(_models) == 1 else poi_model.CompositePOIModel(_models)
 
     ifitter = fitter.Fitter(
         indata,
-        poi_model,
+        fitted_poi_model,
         args,
         do_blinding=any(blinded_fits),
         globalImpactsFromJVP=not args.globalImpactsDisableJVP,

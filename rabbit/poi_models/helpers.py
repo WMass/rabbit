@@ -5,6 +5,9 @@ baseline_models = {
     "Ones": "poi_model",
     "Mu": "poi_model",
     "Mixture": "poi_model",
+    "AxisNormModel": "poi_model",
+    "AxisExpModel": "poi_model",
+    "AxisBernsteinModel": "poi_model",
 }
 
 
