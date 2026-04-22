@@ -11,7 +11,7 @@ import hist
 import numpy as np
 
 from rabbit import fitter, inputdata, tensorwriter
-from rabbit.poi_models.helpers import load_model
+from rabbit.param_models.helpers import load_model
 
 
 def make_histograms():
@@ -162,10 +162,10 @@ def run_fit(filename):
     """Load tensor, set up fitter, run fit to data, return results."""
 
     indata_obj = inputdata.FitInputData(filename)
-    poi_model = load_model("Mu", indata_obj)
+    param_model = load_model("Mu", indata_obj)
 
     options = make_options()
-    f = fitter.Fitter(indata_obj, poi_model, options)
+    f = fitter.Fitter(indata_obj, param_model, options)
 
     # fit to observed data
     f.set_nobs(indata_obj.data_obs)
@@ -177,16 +177,16 @@ def run_fit(filename):
 
     edmval, cov = edmval_cov(grad, hess)
 
-    poi_val = f.x[: poi_model.npoi].numpy()
-    theta_val = f.x[poi_model.npoi :].numpy()
+    param_val = f.x[: param_model.nparams].numpy()
+    theta_val = f.x[param_model.nparams :].numpy()
     cov_np = cov.numpy() if hasattr(cov, "numpy") else np.asarray(cov)
-    poi_err = np.sqrt(np.diag(cov_np)[: poi_model.npoi])
+    param_err = np.sqrt(np.diag(cov_np)[: param_model.nparams])
     nll = f.reduced_nll().numpy()
 
     return dict(
-        poi=poi_val,
+        param=param_val,
         theta=theta_val,
-        poi_err=poi_err,
+        param_err=param_err,
         nll=nll,
         edmval=edmval,
         parms=f.parms,
@@ -200,29 +200,31 @@ def check_results(label_a, res_a, label_b, res_b, atol=1e-5, rtol=1e-4):
 
     for label, res in [(label_a, res_a), (label_b, res_b)]:
         print(f"\n{label}:")
-        for i, name in enumerate(res["parms"][: len(res["poi"])]):
-            print(f"  {name}: {res['poi'][i]:.6f} +/- {res['poi_err'][i]:.6f}")
-        for i, name in enumerate(res["parms"][len(res["poi"]) :]):
+        for i, name in enumerate(res["parms"][: len(res["param"])]):
+            print(f"  {name}: {res['param'][i]:.6f} +/- {res['param_err'][i]:.6f}")
+        for i, name in enumerate(res["parms"][len(res["param"]) :]):
             print(f"  {name}: {res['theta'][i]:.6f}")
         print(f"  reduced NLL: {res['nll']:.6f}")
         print(f"  EDM: {res['edmval']:.2e}")
 
-    poi_match = np.allclose(res_a["poi"], res_b["poi"], atol=atol, rtol=rtol)
+    param_match = np.allclose(res_a["param"], res_b["param"], atol=atol, rtol=rtol)
     theta_match = np.allclose(res_a["theta"], res_b["theta"], atol=atol, rtol=rtol)
-    err_match = np.allclose(res_a["poi_err"], res_b["poi_err"], atol=atol, rtol=rtol)
+    err_match = np.allclose(
+        res_a["param_err"], res_b["param_err"], atol=atol, rtol=rtol
+    )
     nll_match = np.isclose(res_a["nll"], res_b["nll"], atol=atol, rtol=rtol)
 
-    all_ok = poi_match and theta_match and err_match and nll_match
+    all_ok = param_match and theta_match and err_match and nll_match
 
-    print(f"\n  POI values match:        {poi_match}")
+    print(f"\n  param values match:        {param_match}")
     print(f"  Theta values match:      {theta_match}")
-    print(f"  POI uncertainties match:  {err_match}")
+    print(f"  param uncertainties match:  {err_match}")
     print(f"  NLL values match:         {nll_match}")
 
-    if not poi_match:
-        print(f"    {label_a} POI:  {res_a['poi']}")
-        print(f"    {label_b} POI:  {res_b['poi']}")
-        print(f"    diff:       {res_a['poi'] - res_b['poi']}")
+    if not param_match:
+        print(f"    {label_a} param:  {res_a['param']}")
+        print(f"    {label_b} param:  {res_b['param']}")
+        print(f"    diff:       {res_a['param'] - res_b['param']}")
 
     if not theta_match:
         print(f"    {label_a} theta:  {res_a['theta']}")

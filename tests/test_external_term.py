@@ -25,7 +25,7 @@ import scipy.sparse
 from wums.sparse_hist import SparseHist
 
 from rabbit import fitter, inputdata, tensorwriter
-from rabbit.poi_models.helpers import load_model
+from rabbit.param_models.helpers import load_model
 
 
 def make_options(**kwargs):
@@ -80,9 +80,9 @@ def build_writer(grad=None, hess=None):
 
 def run_fit(filename):
     indata_obj = inputdata.FitInputData(filename)
-    poi_model = load_model("Mu", indata_obj)
+    param_model = load_model("Mu", indata_obj)
     options = make_options()
-    f = fitter.Fitter(indata_obj, poi_model, options)
+    f = fitter.Fitter(indata_obj, param_model, options)
 
     # use Asimov data so the only force on the nuisance is the constraint + external term
     f.set_nobs(f.expected_yield())
@@ -101,9 +101,9 @@ def loss_grad_hess_at(filename, x_override=None):
     import tensorflow as tf
 
     indata_obj = inputdata.FitInputData(filename)
-    poi_model = load_model("Mu", indata_obj)
+    param_model = load_model("Mu", indata_obj)
     options = make_options()
-    f = fitter.Fitter(indata_obj, poi_model, options)
+    f = fitter.Fitter(indata_obj, param_model, options)
     f.set_nobs(f.expected_yield())
     if x_override is not None:
         f.x.assign(tf.constant(x_override, dtype=f.x.dtype))

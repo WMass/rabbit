@@ -82,7 +82,7 @@ class Fitter:
     valid_systematic_types = ["log_normal", "normal"]
 
     def __init__(
-        self, indata, poi_model, options, globalImpactsFromJVP=True, do_blinding=False
+        self, indata, param_model, options, globalImpactsFromJVP=True, do_blinding=False
     ):
         self.indata = indata
 
@@ -176,7 +176,7 @@ class Fitter:
 
         # --- fit params
         self.init_fit_parms(
-            poi_model,
+            param_model,
             options.setConstraintMinimum,
             unblind=options.unblind,
             freeze_parameters=options.freezeParameters,
@@ -297,16 +297,16 @@ class Fitter:
 
     def init_fit_parms(
         self,
-        poi_model,
+        param_model,
         set_constraint_minimum=[],
         unblind=False,
         freeze_parameters=[],
     ):
-        self.poi_model = poi_model
+        self.param_model = param_model
 
         if self.do_blinding:
             self._blinding_offsets_poi = tf.Variable(
-                tf.ones([self.poi_model.npoi], dtype=self.indata.dtype),
+                tf.ones([self.param_model.npoi], dtype=self.indata.dtype),
                 trainable=False,
                 name="offset_poi",
             )
@@ -317,7 +317,7 @@ class Fitter:
             )
             self.init_blinding_values(unblind)
 
-        self.parms = np.concatenate([self.poi_model.pois, self.indata.systs])
+        self.parms = np.concatenate([self.param_model.params, self.indata.systs])
 
         # tf tensor containing default constraint minima
         theta0default = np.zeros(self.indata.nsyst)
@@ -334,9 +334,9 @@ class Fitter:
         )
 
         # tf variable containing all fit parameters
-        if self.poi_model.npoi > 0:
+        if self.param_model.nparams > 0:
             xdefault = tf.concat(
-                [self.poi_model.xpoidefault, self.theta0default], axis=0
+                [self.param_model.xparamdefault, self.theta0default], axis=0
             )
         else:
             xdefault = self.theta0default
@@ -404,7 +404,7 @@ class Fitter:
         # determine if problem is linear (ie likelihood is purely quadratic)
         self.is_linear = (
             (self.chisqFit or self.covarianceFit)
-            and self.poi_model.is_linear
+            and self.param_model.is_linear
             and self.indata.symmetric_tensor
             and self.indata.systematic_type == "normal"
             and ((not self.binByBinStat) or self.binByBinStatType == "normal-additive")
@@ -531,7 +531,7 @@ class Fitter:
         unblind_parameters = match_regexp_params(
             unblind_parameter_expressions,
             [
-                *self.poi_model.pois,
+                *self.param_model.params[: self.param_model.npoi],
                 *[self.indata.systs[i] for i in self.indata.noiidxs],
             ],
         )
@@ -569,9 +569,9 @@ class Fitter:
             self._blinding_values_theta[i] = value
 
         # add offset to pois
-        self._blinding_values_poi = np.ones(self.poi_model.npoi, dtype=np.float64)
-        for i in range(self.poi_model.npoi):
-            param = self.poi_model.pois[i]
+        self._blinding_values_poi = np.ones(self.param_model.npoi, dtype=np.float64)
+        for i in range(self.param_model.npoi):
+            param = self.param_model.params[i]
             if param in unblind_parameters:
                 continue
             logger.debug(f"Blind signal strength modifier for {param}")
@@ -586,18 +586,17 @@ class Fitter:
             self._blinding_offsets_theta.assign(self._blinding_values_theta)
         else:
             self._blinding_offsets_poi.assign(
-                np.ones(self.poi_model.npoi, dtype=np.float64)
+                np.ones(self.param_model.npoi, dtype=np.float64)
             )
             self._blinding_offsets_theta.assign(
                 np.zeros(self.indata.nsyst, dtype=np.float64)
             )
 
     def get_theta(self):
-        theta = self.x[self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst]
+        start = self.param_model.nparams
+        theta = self.x[start : start + self.indata.nsyst]
         theta = tf.where(
-            self.frozen_params_mask[
-                self.poi_model.npoi : self.poi_model.npoi + self.indata.nsyst
-            ],
+            self.frozen_params_mask[start : start + self.indata.nsyst],
             tf.stop_gradient(theta),
             theta,
         )
@@ -606,14 +605,19 @@ class Fitter:
         else:
             return theta
 
+    def get_model_nui(self):
+        npoi = self.param_model.npoi
+        npou = self.param_model.npou
+        return self.x[npoi : npoi + npou]
+
     def get_poi(self):
-        xpoi = self.x[: self.poi_model.npoi]
-        if self.poi_model.allowNegativePOI:
+        xpoi = self.x[: self.param_model.npoi]
+        if self.param_model.allowNegativeParam:
             poi = xpoi
         else:
             poi = tf.square(xpoi)
         poi = tf.where(
-            self.frozen_params_mask[: self.poi_model.npoi], tf.stop_gradient(poi), poi
+            self.frozen_params_mask[: self.param_model.npoi], tf.stop_gradient(poi), poi
         )
         if self.do_blinding:
             return poi * self._blinding_offsets_poi
@@ -621,7 +625,9 @@ class Fitter:
             return poi
 
     def get_x(self):
-        return tf.concat([self.get_poi(), self.get_theta()], axis=0)
+        return tf.concat(
+            [self.get_poi(), self.get_model_nui(), self.get_theta()], axis=0
+        )
 
     def _default_beta0(self):
         if self.binByBinStatType in ["gamma", "normal-multiplicative"]:
@@ -638,7 +644,7 @@ class Fitter:
         term (1 / constraintweight).
         """
         var_poi = (
-            tf.ones([self.poi_model.npoi], dtype=self.indata.dtype)
+            tf.ones([self.param_model.nparams], dtype=self.indata.dtype)
             * unconstrained_err**2
         )
         var_theta = tf.where(
@@ -698,10 +704,12 @@ class Fitter:
         self.theta0.assign(self.theta0default)
 
     def xdefaultassign(self):
-        if self.poi_model.npoi == 0:
+        if self.param_model.nparams == 0:
             self.x.assign(self.theta0)
         else:
-            self.x.assign(tf.concat([self.poi_model.xpoidefault, self.theta0], axis=0))
+            self.x.assign(
+                tf.concat([self.param_model.xparamdefault, self.theta0], axis=0)
+            )
 
     def beta0defaultassign(self):
         self.set_beta0(self._default_beta0())
@@ -731,7 +739,7 @@ class Fitter:
 
     def bayesassign(self):
         # FIXME use theta0 as the mean and constraintweight to scale the width
-        if self.poi_model.npoi == 0:
+        if self.param_model.nparams == 0:
             self.x.assign(
                 self.theta0
                 + tf.random.normal(shape=self.theta0.shape, dtype=self.theta0.dtype)
@@ -740,7 +748,7 @@ class Fitter:
             self.x.assign(
                 tf.concat(
                     [
-                        self.poi_model.xpoidefault,
+                        self.param_model.xparamdefault,
                         self.theta0
                         + tf.random.normal(
                             shape=self.theta0.shape, dtype=self.theta0.dtype
@@ -1012,7 +1020,11 @@ class Fitter:
     @tf.function
     def impacts_parms(self, hess):
 
-        nstat = self.poi_model.npoi + self.indata.nsystnoconstraint
+        nstat = (
+            self.param_model.npoi
+            + self.param_model.npou
+            + self.indata.nsystnoconstraint
+        )
         hess_stat = hess[:nstat, :nstat]
         cov_stat = tf.linalg.inv(hess_stat)
 
@@ -1029,7 +1041,7 @@ class Fitter:
             self.cov,
             cov_stat,
             cov_stat_no_bbb,
-            self.poi_model.npoi,
+            self.param_model.npoi,
             self.indata.noiidxs,
             self.indata.systgroupidxs,
         )
@@ -1045,7 +1057,8 @@ class Fitter:
             self._compute_yields_with_beta,
             self._compute_lbeta,
             self._compute_lc,
-            self.poi_model.npoi,
+            self.param_model.npoi,
+            self.param_model.nparams,
             self.indata.noiidxs,
             self.indata.systgroupidxs,
             self.binByBinStat,
@@ -1069,7 +1082,8 @@ class Fitter:
                 if self.binByBinStatType in ["normal-additive"] or not self.binByBinStat
                 else 1.0 / self.kstat
             ),
-            self.poi_model.npoi,
+            self.param_model.npoi,
+            self.param_model.nparams,
             self.indata.noiidxs,
             self.binByBinStat,
             self.binByBinStatMode,
@@ -1089,7 +1103,7 @@ class Fitter:
             self.indata.constraintweights,
             self.indata.systgroups,
             self.indata.systgroupidxs,
-            self.poi_model.npoi,
+            self.param_model.nparams,
             self.minimize,
             self.diagnostics,
             self.loss_val_grad_hess,
@@ -1266,7 +1280,8 @@ class Fitter:
                 self._compute_yields_with_beta,
                 self._compute_lbeta,
                 self._compute_lc,
-                self.poi_model.npoi,
+                self.param_model.npoi,
+                self.param_model.nparams,
                 self.indata.systgroupidxs,
                 self.binByBinStat,
                 self.binByBinStatMode,
@@ -1377,9 +1392,11 @@ class Fitter:
         # binByBinStat in "full" mode. The default is True for backward
         # compatibility; the NLL/grad/HVP path passes compute_norm=False.
         poi = self.get_poi()
+        model_nui = self.get_model_nui()
         theta = self.get_theta()
 
-        rnorm = self.poi_model.compute(poi, full)
+        all_params = tf.concat([poi, model_nui], axis=0)
+        rnorm = self.param_model.compute(all_params, full)
 
         normcentral = None
         if self.indata.symmetric_tensor:

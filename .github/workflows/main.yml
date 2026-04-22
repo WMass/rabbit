@@ -303,7 +303,7 @@ jobs:
           - name: linearized
             tensor: test_tensor_symmetric.hdf5
             fit_args: >-
-              --binByBinStatType normal-additive --allowNegativePOI
+              --binByBinStatType normal-additive --allowNegativeParam
           - name: bb_full_normal_additive
             tensor: test_tensor.hdf5
             fit_args: >-
@@ -426,12 +426,12 @@ jobs:
       - name: bsm limits
         run: >-
           rabbit_limit.py $RABBIT_OUTDIR/test_tensor_bsm.hdf5 -o $RABBIT_OUTDIR/ --postfix bsm
-          -t 0 --unblind --expectSignal bsm1 0 --expectSignal bsm2 1 --allowNegativePOI --asymptoticLimits bsm1 --levels 0.05
+          -t 0 --unblind --expectSignal bsm1 0 --expectSignal bsm2 1 --allowNegativeParam --asymptoticLimits bsm1 --levels 0.05
 
       - name: bsm limits on channel 
         run: >-
           rabbit_limit.py $RABBIT_OUTDIR/test_tensor_bsm.hdf5 -o $RABBIT_OUTDIR/ --postfix bsm
-          -t 0 --unblind --poiModel Mixture bsm1 sig --expectSignal bsm1_sig_mixing 0 --asymptoticLimits bsm1_sig_mixing --levels 0.05 --allowNegativePOI
+          -t 0 --unblind --paramModel Mixture bsm1 sig --expectSignal bsm1_sig_mixing 0 --asymptoticLimits bsm1_sig_mixing --levels 0.05 --allowNegativeParam
 
   plotting:
     runs-on: [self-hosted, linux, x64]
@@ -569,9 +569,81 @@ jobs:
           rabbit_plot_likelihood_scan2D.py $RABBIT_OUTDIR/fitresults_scans.hdf5 -o $WEB_DIR/$PLOT_DIR 
           --title Rabbit --subtitle Preliminary --params sig slope_signal --titlePos 0 --legPos 'lower right'
 
+  make-abcd-tensors:
+    runs-on: [self-hosted, linux, x64]
+    needs: setenv
+
+    steps:
+      - env:
+          RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
+          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
+          PATH: ${{ needs.setenv.outputs.PATH }}
+        run: |
+          echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
+          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
+          echo "PATH=${PATH}" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v5
+
+      - name: make ABCD tensor
+        run: >-
+          python tests/make_abcd_tensor.py -o $RABBIT_OUTDIR/
+
+      - name: make extended ABCD tensor
+        run: >-
+          python tests/make_extended_abcd_tensor.py -o $RABBIT_OUTDIR/
+
+  abcd-fits:
+    runs-on: [self-hosted, linux, x64]
+    needs: [setenv, make-abcd-tensors]
+
+    steps:
+      - env:
+          RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
+          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
+          PATH: ${{ needs.setenv.outputs.PATH }}
+        run: |
+          echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
+          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
+          echo "PATH=${PATH}" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v5
+
+      - name: ABCD fit
+        run: >-
+          rabbit_fit.py $RABBIT_OUTDIR/test_abcd_tensor/rabbit_input.hdf5
+          -o $RABBIT_OUTDIR/ --postfix abcd
+          -t 0 --paramModel Mu
+          --paramModel ABCD nonprompt ch_A ch_B ch_C ch_D
+          --saveHists
+
+      - name: SmoothABCD fit
+        run: >-
+          rabbit_fit.py $RABBIT_OUTDIR/test_abcd_tensor/rabbit_input.hdf5
+          -o $RABBIT_OUTDIR/ --postfix smooth_abcd
+          -t 0 --paramModel Mu
+          --paramModel SmoothABCD pt nonprompt ch_A ch_B ch_C ch_D
+          --saveHists
+
+      - name: ExtendedABCD fit
+        run: >-
+          rabbit_fit.py $RABBIT_OUTDIR/test_extended_abcd_tensor/rabbit_input.hdf5
+          -o $RABBIT_OUTDIR/ --postfix extended_abcd
+          -t 0 --paramModel Mu
+          --paramModel ExtendedABCD nonprompt ch_Ax ch_Bx ch_A ch_B ch_C ch_D
+          --saveHists
+
+      - name: SmoothExtendedABCD fit
+        run: >-
+          rabbit_fit.py $RABBIT_OUTDIR/test_extended_abcd_tensor/rabbit_input.hdf5
+          -o $RABBIT_OUTDIR/ --postfix smooth_extended_abcd
+          -t 0 --paramModel Mu
+          --paramModel SmoothExtendedABCD pt nonprompt ch_Ax ch_Bx ch_A ch_B ch_C ch_D
+          --saveHists
+
   copy-clean:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, symmerizations, sparse-fits, alternative-fits, regularization, bsm, plotting, likelihoodscans]
+    needs: [setenv, symmerizations, sparse-fits, alternative-fits, regularization, bsm, plotting, likelihoodscans, abcd-fits]
     if: always() 
     steps:
       - env:

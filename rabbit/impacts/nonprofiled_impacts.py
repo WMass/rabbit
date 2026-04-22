@@ -28,7 +28,7 @@ def nonprofiled_impacts_parms(
     constraintweights,
     systgroups,
     systgroupidxs,
-    npoi,
+    nparams,
     minimize_fn,
     diagnostics=False,
     loss_val_grad_hess_fn=None,
@@ -43,7 +43,7 @@ def nonprofiled_impacts_parms(
         constraintweights: constraint weights for each nuisance parameter.
         systgroups: systematic group names.
         systgroupidxs: per-group lists of nuisance parameter indices.
-        npoi: number of POIs.
+        nparams: total number of model parameters (nparams + npou); offset from x index to theta0 index.
         minimize_fn: callable that runs the fit (no arguments).
         diagnostics: if True, log EDM after each minimization (requires loss_val_grad_hess_fn).
         loss_val_grad_hess_fn: callable returning (val, grad, hess); used only when diagnostics=True.
@@ -65,9 +65,9 @@ def nonprofiled_impacts_parms(
         logger.info(f"Now at parameter {frozen_params[i]}")
 
         for j, sign in enumerate((1, -1)):
-            variation = sign * err_theta[idx - npoi] + theta0_tmp[idx - npoi]
+            variation = sign * err_theta[idx - nparams] + theta0_tmp[idx - nparams]
             # vary the non-profiled parameter
-            theta0[idx - npoi].assign(variation)
+            theta0[idx - nparams].assign(variation)
             x[idx].assign(
                 variation
             )  # this should not be needed but should accelerate the minimization
@@ -83,7 +83,7 @@ def nonprofiled_impacts_parms(
             x.assign(x_tmp)
 
         # back to original value
-        theta0[idx - npoi].assign(theta0_tmp[idx - npoi])
+        theta0[idx - nparams].assign(theta0_tmp[idx - nparams])
 
     impact_group_names = []
     impact_groups = []

@@ -50,7 +50,8 @@ class Workspace:
         self.results = {}
 
         self.parms = fitter.parms
-        self.npoi = fitter.poi_model.npoi
+        self.npoi = fitter.param_model.npoi
+        self.nparams = fitter.param_model.nparams
         self.noiidxs = fitter.indata.noiidxs
 
         # some information for the impact histograms
@@ -402,7 +403,7 @@ class Workspace:
     ):
         # store impacts for all POIs and NOIs
         parms = np.concatenate(
-            [self.parms[: self.npoi], self.parms[self.npoi :][self.noiidxs]]
+            [self.parms[: self.npoi], self.parms[self.nparams :][self.noiidxs]]
         )
 
         # write out histograms
