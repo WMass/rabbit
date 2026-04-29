@@ -724,11 +724,24 @@ class AxisBernsteinModel(POIModel):
             a.size if a.name == shape_axis else 1 for a in channel_axes
         ]
 
-        # Non-negative coefficients enforced via x² reparameterization.
-        # Default x=1 → c=1 → flat unit background.
-        self.allowNegativePOI = False
+        # Non-negative Bernstein coefficients via softplus: c = log(1 + exp(x)).
+        # softplus is always > 0 and has nonzero gradient everywhere, unlike x²
+        # which has zero gradient at x=0 and produces a degenerate (zero-pivot)
+        # Hessian when background → 0 at best fit (boundary of parameter space).
+        # allowNegativePOI=True tells CompositePOIModel to pass raw x; softplus
+        # is applied inside compute() below.
+        # Default x = softplus_inv(1) ≈ 0.5413 so c starts at 1 (flat background).
+        self.allowNegativePOI = True
         self.is_linear = False
-        self.set_poi_default(expectSignal, allowNegativePOI=False)
+        if expectSignal is not None:
+            raise ValueError(
+                "AxisBernsteinModel does not support expectSignal; "
+                "set initial Bernstein coefficients via --expectSignal on another model."
+            )
+        _softplus_inv_1 = float(np.log(np.exp(1.0) - 1.0))  # ≈ 0.5413
+        self.xpoidefault = tf.constant(
+            _softplus_inv_1 * np.ones(self.npoi), dtype=self.indata.dtype
+        )
 
     def compute(self, poi, full=False):
         x_reshaped = tf.reshape(self.x_m, self.shape_reshape)
@@ -743,8 +756,8 @@ class AxisBernsteinModel(POIModel):
                 for i, proc_idx in enumerate(self.proc_idxs):
                     c0_poi = poi[i * 2 * self.n_cell : i * 2 * self.n_cell + self.n_cell]
                     c1_poi = poi[i * 2 * self.n_cell + self.n_cell : (i + 1) * 2 * self.n_cell]
-                    c0 = tf.reshape(c0_poi, self.cell_reshape)
-                    c1 = tf.reshape(c1_poi, self.cell_reshape)
+                    c0 = tf.reshape(tf.nn.softplus(c0_poi), self.cell_reshape)
+                    c1 = tf.reshape(tf.nn.softplus(c1_poi), self.cell_reshape)
                     scaling = tf.reshape(
                         tf.broadcast_to(
                             c0 * (1.0 - x_reshaped) + c1 * x_reshaped,

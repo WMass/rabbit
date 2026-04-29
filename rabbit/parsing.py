@@ -332,7 +332,7 @@ def common_parser():
     )
     parser.add_argument(
         "--poiModel",
-        default=[["Mu"]],
+        default=[],
         nargs="+",
         action="append",
         help="Specify POI model (repeatable). Each flag takes a class name "
