@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 
+# Enable XLA's multi-threaded Eigen path on CPU before importing tensorflow.
+# This must be set before any TF import (including transitive) because XLA
+# parses XLA_FLAGS once during runtime initialization. Measured ~1.3x speedup
+# on dense large-model HVP/loss+grad on a many-core system, no downside.
+# Users who set their own XLA_FLAGS keep theirs and we append.
+import os as _os
+
+_xla_default = "--xla_cpu_multi_thread_eigen=true"
+_existing = _os.environ.get("XLA_FLAGS", "")
+if "xla_cpu_multi_thread_eigen" not in _existing:
+    _os.environ["XLA_FLAGS"] = (
+        f"{_existing} {_xla_default}".strip() if _existing else _xla_default
+    )
+
 import copy
 
 import tensorflow as tf
@@ -15,8 +29,8 @@ from rabbit import fitter, inputdata, parsing, workspace
 from rabbit.mappings import helpers as mh
 from rabbit.mappings import mapping as mp
 from rabbit.mappings import project
-from rabbit.poi_models import helpers as ph
-from rabbit.poi_models import poi_model
+from rabbit.param_models import helpers as ph
+from rabbit.param_models import param_model
 from rabbit.regularization import helpers as rh
 from rabbit.regularization.lcurve import l_curve_optimize_tau, l_curve_scan_tau
 from rabbit.tfhelpers import edmval_cov
@@ -302,21 +316,37 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
             ):
                 # saturated likelihood test
 
-                saturated_model = poi_model.SaturatedProjectModel(
+                saturated_model = param_model.SaturatedProjectModel(
                     fitter.indata, mapping.channel_info
                 )
-                composite_model = poi_model.CompositePOIModel(
-                    [fitter.poi_model, saturated_model]
+                composite_model = param_model.CompositeParamModel(
+                    [fitter.param_model, saturated_model]
                 )
 
                 fitter_saturated = copy.deepcopy(fitter)
+
+                toy_theta0 = tf.identity(fitter_saturated.theta0)
+                saved_regularizers = fitter_saturated.regularizers
+                saved_tau = float(fitter_saturated.tau.numpy())
                 fitter_saturated.init_fit_parms(
                     composite_model,
                     args.setConstraintMinimum,
                     unblind=args.unblind,
                     freeze_parameters=args.freezeParameters,
                 )
+                fitter_saturated.theta0.assign(toy_theta0)
+                fitter_saturated.regularizers = saved_regularizers
+                fitter_saturated.tau.assign(saved_tau)
+
+                fitter_saturated.xdefaultassign()
                 cb = fitter_saturated.minimize()
+                if not args.noHessian:
+                    _, grad, hess = fitter_saturated.loss_val_grad_hess()
+                    edmval, cov = fitter_saturated.edmval_cov(grad, hess)
+                    logger.info(f"edmval: {edmval}")
+                else:
+                    edmval = None
+
                 nllvalreduced = fitter_saturated.reduced_nll().numpy()
 
                 ndf = saturated_model.npoi
@@ -328,7 +358,9 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                 logger.info(f"    2*deltaNLL: {round(chi2val, 2)}")
                 logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
 
-                ws.add_chi2(chi2val, ndf, prefit, mapping, saturated=True)
+                ws.add_chi2(
+                    chi2val, ndf, prefit, mapping, saturated=True, edmval=edmval
+                )
 
         if args.saveHistsPerProcess and not mapping.skip_per_process:
             logger.info(f"Save processes histogram for {mapping.key}")
@@ -349,9 +381,16 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
             )
 
         if args.computeVariations:
+            if fitter.cov is None:
+                raise RuntimeError(
+                    "--computeVariations requires the parameter covariance "
+                    "matrix and so is incompatible with --noHessian."
+                )
             if prefit:
                 cov_prefit = fitter.cov.numpy()
-                fitter.cov.assign(fitter.prefit_covariance(unconstrained_err=1.0))
+                fitter.cov.assign(
+                    fitter.prefit_covariance(unconstrained_err=1.0).to_dense()
+                )
 
             exp, aux = fitter.expected_events(
                 mapping,
@@ -407,6 +446,9 @@ def fit(args, fitter, ws, dofit=True):
             ws.add_1D_integer_hist(cb.loss_history, "epoch", "loss")
             ws.add_1D_integer_hist(cb.time_history, "epoch", "time")
 
+    # prefit variances as the default fallback for add_parms_hist below
+    parms_variances = None
+
     if not args.noHessian:
         # compute the covariance matrix and estimated distance to minimum
         _, grad, hess = fitter.loss_val_grad_hess()
@@ -446,10 +488,37 @@ def fit(args, fitter, ws, dofit=True):
                 global_impacts=True,
             )
 
+        parms_variances = tf.linalg.diag_part(fitter.cov)
+    else:
+        # --noHessian: avoid the full dense Hessian. Still compute edmval
+        # and the POI+NOI uncertainties via a Hessian-free conjugate
+        # gradient solve of H @ v = grad and H @ c_i = e_i, using only
+        # Hessian-vector products. The CG solves touch O(npar) memory
+        # per call instead of O(npar^2), so this works on problems
+        # where the full covariance would be infeasible.
+        _, grad = fitter.loss_val_grad()
+        npoi = int(fitter.poi_model.npoi)
+        noi_idx_in_x = np.asarray(fitter.indata.noiidxs, dtype=np.int64) + npoi
+        poi_noi_idx = np.concatenate([np.arange(npoi, dtype=np.int64), noi_idx_in_x])
+        edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)
+        logger.info(f"edmval: {edmval}")
+
+        # Build a full-length variance vector with the POI+NOI entries
+        # populated from the diagonal of the CG-solved rows and the rest
+        # left as NaN (we did not compute those). add_parms_hist stores
+        # the vector verbatim into the workspace.
+        n = int(fitter.x.shape[0])
+        parms_variances_np = np.full(n, np.nan, dtype=np.float64)
+        for k, i in enumerate(poi_noi_idx):
+            parms_variances_np[int(i)] = cov_rows[k, int(i)]
+        parms_variances = tf.constant(parms_variances_np, dtype=fitter.indata.dtype)
+
     nllvalreduced = fitter.reduced_nll().numpy()
 
     ndfsat = (
-        tf.size(fitter.nobs) - fitter.poi_model.npoi - fitter.indata.nsystnoconstraint
+        tf.size(fitter.nobs)
+        - fitter.param_model.nparams
+        - fitter.indata.nsystnoconstraint
     ).numpy()
 
     chi2_val = 2.0 * nllvalreduced
@@ -476,7 +545,7 @@ def fit(args, fitter, ws, dofit=True):
 
     ws.add_parms_hist(
         values=fitter.x,
-        variances=tf.linalg.diag_part(fitter.cov) if not args.noHessian else None,
+        variances=parms_variances,
         hist_name="parms",
     )
 
@@ -560,8 +629,31 @@ def main():
     if args.eager:
         tf.config.run_functions_eagerly(True)
 
-    if args.noHessian and args.doImpacts:
-        raise Exception('option "--noHessian" only works without "--doImpacts"')
+    # --noHessian skips computing the postfit Hessian, so the dense
+    # parameter covariance matrix is never available. Any feature that
+    # needs the covariance is incompatible.
+    if args.noHessian:
+        _incompat = []
+        if args.doImpacts:
+            _incompat.append("--doImpacts")
+        if args.computeVariations:
+            _incompat.append("--computeVariations")
+        if args.saveHists and not args.noChi2:
+            _incompat.append("--saveHists (without --noChi2)")
+        if args.computeHistErrors:
+            _incompat.append("--computeHistErrors")
+        if args.computeHistErrorsPerProcess:
+            _incompat.append("--computeHistErrorsPerProcess")
+        if args.computeHistCov:
+            _incompat.append("--computeHistCov")
+        if args.computeHistImpacts:
+            _incompat.append("--computeHistImpacts")
+        if args.computeHistGaussianImpacts:
+            _incompat.append("--computeHistGaussianImpacts")
+        if args.externalPostfit is not None:
+            _incompat.append("--externalPostfit")
+        if _incompat:
+            raise Exception("--noHessian is incompatible with: " + ", ".join(_incompat))
 
     global logger
     logger = logging.setup_logger(__file__, args.verbose, args.noColorLogger)
@@ -574,12 +666,12 @@ def main():
 
     indata = inputdata.FitInputData(args.filename, args.pseudoData)
 
-    _models = [ph.load_model(spec[0], indata, *spec[1:], **vars(args)) for spec in args.poiModel]
-    fitted_poi_model = _models[0] if len(_models) == 1 else poi_model.CompositePOIModel(_models)
+    model_specs = args.paramModel or [["Mu"]]
+    param_model = ph.load_models(model_specs, indata, **vars(args))
 
     ifitter = fitter.Fitter(
         indata,
-        fitted_poi_model,
+        param_model,
         args,
         do_blinding=any(blinded_fits),
         globalImpactsFromJVP=not args.globalImpactsDisableJVP,
@@ -615,8 +707,8 @@ def main():
         "meta_info": output_tools.make_meta_info_dict(args=args),
         "meta_info_input": ifitter.indata.metadata,
         "procs": ifitter.indata.procs,
-        "pois": ifitter.poi_model.pois,
-        "nois": ifitter.parms[ifitter.poi_model.npoi :][indata.noiidxs],
+        "pois": ifitter.param_model.params[: ifitter.param_model.npoi],
+        "nois": ifitter.parms[ifitter.param_model.nparams :][indata.noiidxs],
     }
 
     with workspace.Workspace(
@@ -679,7 +771,7 @@ def main():
 
                 ws.add_parms_hist(
                     values=ifitter.x,
-                    variances=tf.linalg.diag_part(ifitter.cov),
+                    variances=ifitter.var_prefit,
                     hist_name="parms_prefit",
                 )
 

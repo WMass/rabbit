@@ -82,11 +82,22 @@ class FitInputData:
             self.sparse = not "hnorm" in f
 
             if self.sparse:
-                print(
-                    "WARNING: The sparse tensor implementation is experimental and probably slower than with a dense tensor!"
-                )
+                # The TensorWriter sorts the sparse norm/logk indices into
+                # canonical row-major order at write time, so consumers can
+                # rely on that without an extra tf.sparse.reorder call.
                 self.norm = makesparsetensor(f["hnorm_sparse"])
                 self.logk = makesparsetensor(f["hlogk_sparse"])
+                # Pre-build a CSRSparseMatrix view of logk for use in the
+                # fitter's sparse matvec path via sm.matmul, which dispatches
+                # to a multi-threaded CSR kernel and is much faster per call
+                # than the equivalent gather + unsorted_segment_sum. NOTE:
+                # SparseMatrixMatMul has no XLA kernel, so any tf.function
+                # that calls sm.matmul must be built with jit_compile=False.
+                from tensorflow.python.ops.linalg.sparse import (
+                    sparse_csr_matrix_ops as tf_sparse_csr,
+                )
+
+                self.logk_csr = tf_sparse_csr.CSRSparseMatrix(self.logk)
             else:
                 self.norm = maketensor(f["hnorm"])
                 self.logk = maketensor(f["hlogk"])
@@ -181,6 +192,12 @@ class FitInputData:
                 print(channel, info)
 
             self.axis_procs = hist.axis.StrCategory(self.procs, name="processes")
+
+            # Load external likelihood terms (optional). See
+            # rabbit.external_likelihood for the per-entry dict schema.
+            from rabbit.external_likelihood import read_external_terms_from_h5
+
+            self.external_terms = read_external_terms_from_h5(f.get("external_terms"))
 
     @tf.function
     def expected_events_nominal(self):
