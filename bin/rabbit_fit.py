@@ -497,7 +497,7 @@ def fit(args, fitter, ws, dofit=True):
         # per call instead of O(npar^2), so this works on problems
         # where the full covariance would be infeasible.
         _, grad = fitter.loss_val_grad()
-        npoi = int(fitter.poi_model.npoi)
+        npoi = int(fitter.param_model.npoi)
         noi_idx_in_x = np.asarray(fitter.indata.noiidxs, dtype=np.int64) + npoi
         poi_noi_idx = np.concatenate([np.arange(npoi, dtype=np.int64), noi_idx_in_x])
         edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)

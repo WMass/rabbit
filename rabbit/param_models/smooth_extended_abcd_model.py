@@ -36,16 +36,22 @@ class SmoothExtendedABCD(ParamModel):
     Smooth ExtendedABCD background estimation model with 6 regions.
 
     Regions A, B, C, Ax, Bx have free parameters that follow an exponential
-    polynomial along the smoothing axis; region D is derived:
-        D = C * Ax * B² / (Bx * A²) * mc_factor_D.
+    polynomial along the smoothing axis; region D is derived as
+    ``rnorm_D = c · ax · b² / (bx · a²)`` (default,
+    ``yield_correction=False``) or with ``mc_factor_D = norm_C · norm_Ax ·
+    norm_B² / (norm_Bx · norm_A² · norm_D)`` multiplied in when
+    ``yield_correction=True``. See ABCD docstring for the rnorm-vs-yield
+    discussion.
 
     Parameters are pure model nuisances (npoi=0, npou=5·n_outer·(order+1)).
 
     CLI syntax:
-        --paramModel SmoothExtendedABCD <axis> [order:N] <process> \\
+        --paramModel SmoothExtendedABCD <axis> [order:N] [yieldCorrection:0|1] <process> \\
                      <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] \\
                      <ch_A>  [ax:val ...] <ch_B>  [ax:val ...] \\
                      <ch_C>  [ax:val ...] <ch_D>  [ax:val ...]
+    where ``yieldCorrection:0`` is the default; pass ``yieldCorrection:1``
+    to enable the yield-level form.
 
     Python constructor:
         SmoothExtendedABCD(indata, "pt", "nonprompt",
@@ -71,6 +77,7 @@ class SmoothExtendedABCD(ParamModel):
         channel_Bx,
         order=1,
         initial_params=None,
+        yield_correction=False,
         **kwargs,
     ):
         """
@@ -81,9 +88,13 @@ class SmoothExtendedABCD(ParamModel):
             channel_A/B/C/D: dicts {ch_name: {axis_name: bin_idx, ...}}.
             channel_Ax/Bx: extra sideband regions (further from signal than A/B).
             order: polynomial degree in the exponent (default 1 = log-linear).
+            yield_correction: if True, multiply ``rnorm_D`` by ``mc_factor_D``
+                to enforce the extended-ABCD relation on yields for
+                arbitrary MC templates. Default False.
         """
         self.indata = indata
         self.order = order
+        self.yield_correction = yield_correction
 
         # Validate process
         proc_name = (
@@ -272,17 +283,21 @@ class SmoothExtendedABCD(ParamModel):
         """Parse CLI arguments for SmoothExtendedABCD.
 
         Syntax:
-            --paramModel SmoothExtendedABCD <axis> [params:file.hdf5] [order:N] <process> \\
+            --paramModel SmoothExtendedABCD <axis> [params:file.hdf5] [order:N] \\
+                         [yieldCorrection:0|1] <process> \\
                          <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] \\
                          <ch_A>  [ax:val ...] <ch_B>  [ax:val ...] \\
                          <ch_C>  [ax:val ...] <ch_D>  [ax:val ...]
 
         The optional ``params:file.hdf5`` token loads a numpy array as initial
         parameter values (produced by setupRabbit.py --dumpSmoothingParams).
+        ``yieldCorrection`` defaults to 0 (no MC factor); pass
+        ``yieldCorrection:1`` to enable the yield-level form.
         """
         if len(args) < 8:
             raise ValueError(
-                "SmoothExtendedABCD expects: axis [params:file.hdf5] [order:N] process "
+                "SmoothExtendedABCD expects: axis [params:file.hdf5] [order:N] "
+                "[yieldCorrection:0|1] process "
                 "ch_Ax [ax:val ...] ch_Bx [ax:val ...] "
                 "ch_A [ax:val ...] ch_B [ax:val ...] "
                 "ch_C [ax:val ...] ch_D [ax:val ...]"
@@ -307,6 +322,10 @@ class SmoothExtendedABCD(ParamModel):
                 order = int(d["order"])
         elif tokens and tokens[0].startswith("order:"):
             order = int(tokens.pop(0).split(":", 1)[1])
+
+        yield_correction = False
+        if tokens and tokens[0].startswith("yieldCorrection:"):
+            yield_correction = bool(int(tokens.pop(0).split(":", 1)[1]))
 
         if not tokens:
             raise ValueError(
@@ -349,6 +368,7 @@ class SmoothExtendedABCD(ParamModel):
             channel_Bx,
             order=order,
             initial_params=initial_params,
+            yield_correction=yield_correction,
             **kwargs,
         )
 
@@ -393,7 +413,9 @@ class SmoothExtendedABCD(ParamModel):
 
         a_safe = tf.where(a_flat == 0.0, tf.ones_like(a_flat) * 1e-10, a_flat)
         bx_safe = tf.where(bx_flat == 0.0, tf.ones_like(bx_flat) * 1e-10, bx_flat)
-        d_flat = c_flat * ax_flat * b_flat**2 / (bx_safe * a_safe**2) * self.mc_factor_D
+        d_flat = c_flat * ax_flat * b_flat**2 / (bx_safe * a_safe**2)
+        if self.yield_correction:
+            d_flat = d_flat * self.mc_factor_D
 
         nbins = self.indata.nbinsfull if full else self.indata.nbins
         rnorm = tf.ones([nbins, self.indata.nproc], dtype=self.indata.dtype)

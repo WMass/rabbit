@@ -12,10 +12,14 @@ channel dicts automatically. The extended variants require at least 3 mt bins;
 the plain variants require at least 2.
 
 CLI syntax:
-    --paramModel ABCDIsoMT               <process> <channel>
-    --paramModel ExtendedABCDIsoMT       <process> <channel>
-    --paramModel SmoothABCDIsoMT         [order:N] <process> <channel>
-    --paramModel SmoothExtendedABCDIsoMT [order:N] <process> <channel>
+    --paramModel ABCDIsoMT               [yieldCorrection:0|1] <process> <channel>
+    --paramModel ExtendedABCDIsoMT       [yieldCorrection:0|1] <process> <channel>
+    --paramModel SmoothABCDIsoMT         [order:N] [yieldCorrection:0|1] <process> <channel>
+    --paramModel SmoothExtendedABCDIsoMT [params:file.hdf5 | order:N] \\
+                                         [yieldCorrection:0|1] <process> <channel>
+
+``yieldCorrection`` defaults to 0 (no MC factor); pass ``yieldCorrection:1``
+to enable the yield-level form. See the underlying ABCD model docstrings.
 
 Region layout (shared by all four):
 
@@ -50,22 +54,31 @@ def _isomtmt_regions(indata, channel_name):
     return mt_ax.size - 1, mt_ax.size - 2, mt_ax.size - 3
 
 
+def _pop_yield_correction(tokens):
+    """Consume an optional ``yieldCorrection:N`` token from the front of the list."""
+    if tokens and tokens[0].startswith("yieldCorrection:"):
+        return bool(int(tokens.pop(0).split(":", 1)[1]))
+    return False
+
+
 def _parse_isomtmt_args(tokens):
-    """Parse [order:N] <process> <channel> from a token list."""
+    """Parse [order:N] [yieldCorrection:0|1] <process> <channel> from a token list."""
     order = 1
     if tokens and tokens[0].startswith("order:"):
         order = int(tokens.pop(0).split(":", 1)[1])
+    yield_correction = _pop_yield_correction(tokens)
     if len(tokens) < 2:
         raise ValueError("Expected <process> <channel>")
     process = tokens.pop(0)
     channel = tokens.pop(0)
     if tokens:
         raise ValueError(f"Unexpected extra arguments: {tokens}")
-    return order, process, channel
+    return order, process, channel, yield_correction
 
 
 def _parse_isomtmt_args_with_params(tokens):
-    """Parse [params:file.hdf5 | order:N] <process> <channel> from a token list.
+    """Parse [params:file.hdf5 | order:N] [yieldCorrection:0|1] <process> <channel>
+    from a token list.
 
     ``params:`` and ``order:`` are mutually exclusive; the params file encodes
     the polynomial order via its stored ``order`` field.
@@ -81,13 +94,14 @@ def _parse_isomtmt_args_with_params(tokens):
 
     elif tokens and tokens[0].startswith("order:"):
         order = int(tokens.pop(0).split(":", 1)[1])
+    yield_correction = _pop_yield_correction(tokens)
     if len(tokens) < 2:
         raise ValueError("Expected <process> <channel>")
     process = tokens.pop(0)
     channel = tokens.pop(0)
     if tokens:
         raise ValueError(f"Unexpected extra arguments: {tokens}")
-    return order, process, channel, initial_params
+    return order, process, channel, initial_params, yield_correction
 
 
 class ABCDIsoMT(ABCD):
@@ -114,12 +128,17 @@ class ABCDIsoMT(ABCD):
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
         tokens = list(args)
+        yield_correction = _pop_yield_correction(tokens)
         if len(tokens) < 2:
-            raise ValueError("ABCDIsoMT expects: <process> <channel>")
+            raise ValueError(
+                "ABCDIsoMT expects: [yieldCorrection:0|1] <process> <channel>"
+            )
         process, channel = tokens[0], tokens[1]
         if len(tokens) > 2:
             raise ValueError(f"Unexpected extra arguments: {tokens[2:]}")
-        return cls(indata, process, channel, **kwargs)
+        return cls(
+            indata, process, channel, yield_correction=yield_correction, **kwargs
+        )
 
 
 class ExtendedABCDIsoMT(ExtendedABCD):
@@ -155,12 +174,17 @@ class ExtendedABCDIsoMT(ExtendedABCD):
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
         tokens = list(args)
+        yield_correction = _pop_yield_correction(tokens)
         if len(tokens) < 2:
-            raise ValueError("ExtendedABCDIsoMT expects: <process> <channel>")
+            raise ValueError(
+                "ExtendedABCDIsoMT expects: [yieldCorrection:0|1] <process> <channel>"
+            )
         process, channel = tokens[0], tokens[1]
         if len(tokens) > 2:
             raise ValueError(f"Unexpected extra arguments: {tokens[2:]}")
-        return cls(indata, process, channel, **kwargs)
+        return cls(
+            indata, process, channel, yield_correction=yield_correction, **kwargs
+        )
 
 
 class SmoothABCDIsoMT(SmoothABCD):
@@ -194,8 +218,15 @@ class SmoothABCDIsoMT(SmoothABCD):
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
         tokens = list(args)
-        order, process, channel = _parse_isomtmt_args(tokens)
-        return cls(indata, process, channel, order=order, **kwargs)
+        order, process, channel, yield_correction = _parse_isomtmt_args(tokens)
+        return cls(
+            indata,
+            process,
+            channel,
+            order=order,
+            yield_correction=yield_correction,
+            **kwargs,
+        )
 
 
 class SmoothExtendedABCDIsoMT(SmoothExtendedABCD):
@@ -240,14 +271,19 @@ class SmoothExtendedABCDIsoMT(SmoothExtendedABCD):
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
         tokens = list(args)
-        order, process, channel, initial_params = _parse_isomtmt_args_with_params(
-            tokens
-        )
+        (
+            order,
+            process,
+            channel,
+            initial_params,
+            yield_correction,
+        ) = _parse_isomtmt_args_with_params(tokens)
         return cls(
             indata,
             process,
             channel,
             order=order,
             initial_params=initial_params,
+            yield_correction=yield_correction,
             **kwargs,
         )

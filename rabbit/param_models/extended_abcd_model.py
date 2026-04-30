@@ -28,16 +28,23 @@ class ExtendedABCD(ParamModel):
     Extended ABCD background estimation model with 6 regions.
 
     Free parameters a_i, b_i, c_i, ax_i, bx_i for regions A, B, C, Ax, Bx.
-    Region D is derived: D = C * Ax * B² / (Bx * A²) * mc_factor_D.
+    Region D is derived: ``rnorm_D = c · ax · b² / (bx · a²)`` (default,
+    ``yield_correction=False``), or ``rnorm_D = (c · ax · b² / (bx · a²)) ·
+    mc_factor_D`` with ``mc_factor_D = norm_C · norm_Ax · norm_B² /
+    (norm_Bx · norm_A² · norm_D)`` when ``yield_correction=True``. The
+    factor enforces the extended-ABCD relation on yields for arbitrary MC
+    templates; see ABCD docstring for the rnorm-vs-yield discussion.
 
     Parameters are pure model nuisances (npoi=0, npou=5*n_bins). Positivity
     is enforced inside compute() via tf.square() on the raw fit variables.
 
     CLI syntax:
-        --paramModel ExtendedABCD <process> \\
+        --paramModel ExtendedABCD [yieldCorrection:0|1] <process> \\
             <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] \\
             <ch_A>  [ax:val ...] <ch_B>  [ax:val ...] \\
             <ch_C>  [ax:val ...] <ch_D>  [ax:val ...]
+    where ``yieldCorrection:0`` is the default; pass ``yieldCorrection:1`` to
+    enable the yield-level form.
 
     Python constructor:
         ExtendedABCD(indata, "nonprompt",
@@ -59,6 +66,7 @@ class ExtendedABCD(ParamModel):
         channel_D,
         channel_Ax,
         channel_Bx,
+        yield_correction=False,
         **kwargs,
     ):
         """
@@ -67,8 +75,12 @@ class ExtendedABCD(ParamModel):
             abcd_process: name of the background process (str).
             channel_A/B/C/D: dicts {ch_name: {axis_name: bin_idx, ...}}.
             channel_Ax/Bx: extra sideband regions (further from signal than A/B).
+            yield_correction: if True, multiply ``rnorm_D`` by ``mc_factor_D`` to
+                enforce the extended-ABCD relation on yields for arbitrary
+                MC templates. Default False.
         """
         self.indata = indata
+        self.yield_correction = yield_correction
 
         # Validate process
         proc_name = (
@@ -172,19 +184,26 @@ class ExtendedABCD(ParamModel):
         """Parse CLI arguments for ExtendedABCD.
 
         Syntax:
-            --paramModel ExtendedABCD <process> \\
+            --paramModel ExtendedABCD [yieldCorrection:0|1] <process> \\
                          <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] \\
                          <ch_A>  [ax:val ...] <ch_B>  [ax:val ...] \\
                          <ch_C>  [ax:val ...] <ch_D>  [ax:val ...]
+        ``yieldCorrection`` defaults to 0 (no MC factor); pass
+        ``yieldCorrection:1`` to enable the yield-level form.
         """
         if len(args) < 7:
             raise ValueError(
-                "ExtendedABCD expects: process "
+                "ExtendedABCD expects: [yieldCorrection:0|1] process "
                 "ch_Ax [ax:val ...] ch_Bx [ax:val ...] "
                 "ch_A [ax:val ...] ch_B [ax:val ...] "
                 "ch_C [ax:val ...] ch_D [ax:val ...]"
             )
         tokens = list(args)
+
+        yield_correction = False
+        if tokens and tokens[0].startswith("yieldCorrection:"):
+            yield_correction = bool(int(tokens.pop(0).split(":", 1)[1]))
+
         process = tokens.pop(0)
 
         def _parse_one_region(tokens, region_name):
@@ -219,6 +238,7 @@ class ExtendedABCD(ParamModel):
             channel_D,
             channel_Ax,
             channel_Bx,
+            yield_correction=yield_correction,
             **kwargs,
         )
 
@@ -240,7 +260,9 @@ class ExtendedABCD(ParamModel):
         # D = C * Ax * B² / (Bx * A²) * mc_factor_D
         a_safe = tf.where(a == 0.0, tf.ones_like(a) * 1e-10, a)
         bx_safe = tf.where(bx == 0.0, tf.ones_like(bx) * 1e-10, bx)
-        d = c * ax * b**2 / (bx_safe * a_safe**2) * self.mc_factor_D
+        d = c * ax * b**2 / (bx_safe * a_safe**2)
+        if self.yield_correction:
+            d = d * self.mc_factor_D
 
         nbins = self.indata.nbinsfull if full else self.indata.nbins
         rnorm = tf.ones([nbins, self.indata.nproc], dtype=self.indata.dtype)
