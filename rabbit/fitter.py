@@ -538,7 +538,7 @@ class Fitter:
     ):
         logger.debug(f"Unblind parameters with {unblind_parameter_expressions}")
         all_param_names = [
-            *self.param_model.params[: self.param_model.npoi,
+            *self.param_model.params[: self.param_model.npoi],
             *[self.indata.systs[i] for i in self.indata.noiidxs],
         ]
         unblind_parameters = match_regexp_params(
