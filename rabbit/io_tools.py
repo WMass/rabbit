@@ -47,7 +47,13 @@ def read_impacts_poi(
 ):
     # read impacts of a single POI
 
-    if asym and impact_type == "traditional":
+    if (
+        asym
+        and impact_type == "traditional"
+        and "impacts_asym" not in fitresult.keys()
+    ):
+        # Fallback: read asymmetric traditional impacts from a generic
+        # contour scan output if --asymImpacts wasn't run.
         h_impacts = fitresult["contour_scans"].get()[{"confidence_level": "1.0"}]
     else:
         impact_name = "impacts"

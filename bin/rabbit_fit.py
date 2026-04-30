@@ -213,6 +213,56 @@ def make_parser():
         help="compute impacts of frozen (non-profiled) systematics",
     )
     parser.add_argument(
+        "--asymImpacts",
+        default=False,
+        action="store_true",
+        help="Compute traditional asymmetric impacts on POIs by running a "
+        "Delta(2NLL)=1 contour scan per nuisance. Skips structurally "
+        "symmetric and unconstrained nuisances by default.",
+    )
+    parser.add_argument(
+        "--asymImpactsInclude",
+        default=None,
+        nargs="+",
+        help="Regex(es) restricting which nuisances are scanned for --asymImpacts.",
+    )
+    parser.add_argument(
+        "--asymImpactsExclude",
+        default=None,
+        nargs="+",
+        help="Regex(es) excluding nuisances from --asymImpacts.",
+    )
+    parser.add_argument(
+        "--asymImpactsAll",
+        default=False,
+        action="store_true",
+        help="Disable the structural-symmetric skip in --asymImpacts and scan "
+        "every constrained nuisance regardless of template content.",
+    )
+    parser.add_argument(
+        "--asymImpactsHess",
+        default="exact",
+        choices=["exact", "hvp", "frozen", "bfgs", "sr1"],
+        help="Constraint-Hessian mode for the contour-scan in --asymImpacts. "
+        "'exact' rebuilds the full N x N NLL Hessian each iteration (slow, "
+        "reference). 'hvp' uses Hessian-vector products via a LinearOperator "
+        "(exact, typically fastest for large N). 'frozen' uses cov^-1 from "
+        "the postfit as a constant Hessian (cheapest but produces silent "
+        "failures on non-Gaussian profiles -- speed reference only). "
+        "'bfgs'/'sr1' use a quasi-Newton estimate built up from the gradient "
+        "sequence (no extra TF calls per iteration; may need more iterations).",
+    )
+    parser.add_argument(
+        "--asymImpactsTol",
+        default=1e-6,
+        type=float,
+        help="trust-constr xtol/gtol for the --asymImpacts contour-scan. "
+        "Looser values (e.g. 1e-3) terminate before the iterate is on the "
+        "Delta(2NLL)=q contour, producing silent constraint violations. "
+        "Tighter values (1e-5, 1e-6) are slower with no benefit unless your "
+        "fit has nuisances whose profile is far from quadratic."
+    )
+    parser.add_argument(
         "--lCurveScan",
         default=False,
         action="store_true",
@@ -327,6 +377,37 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                 logger.info(f"    ndof: {ndf}")
                 logger.info(f"    2*deltaNLL: {round(chi2val, 2)}")
                 logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
+
+                # DEBUG: decompose chi2_sat = 2*(NLL_nom - NLL_sat)
+                #   = 2*(ln_nom-ln_sat)    [data-vs-prediction misfit]
+                #   + 2*(lc_nom-lc_sat)    [constrained-nuisance pull cost]
+                #   + 2*(lbeta_nom-lbeta_sat) [BBB pull cost]
+                ln_sat_t, lc_sat_t, lbeta_sat_t, _, _ = (
+                    fitter_saturated._compute_nll_components(profile=True)
+                )
+                ln_sat = float(ln_sat_t.numpy())
+                lc_sat = float(lc_sat_t.numpy())
+                lbeta_sat = (
+                    float(lbeta_sat_t.numpy()) if lbeta_sat_t is not None else 0.0
+                )
+                d_ln = 2.0 * (ws.results["ln_nom"] - ln_sat)
+                d_lc = 2.0 * (ws.results["lc_nom"] - lc_sat)
+                d_lbeta = 2.0 * (ws.results["lbeta_nom"] - lbeta_sat)
+                d_sum = d_ln + d_lc + d_lbeta
+                logger.info(f"Saturated chi2 decomposition for {mapping.key}:")
+                logger.info(f"    2*Delta ln    (data-vs-pred) : {d_ln:.4f}")
+                logger.info(f"    2*Delta lc    (nuis. pulls)  : {d_lc:.4f}")
+                logger.info(f"    2*Delta lbeta (BBB pulls)    : {d_lbeta:.4f}")
+                logger.info(
+                    f"    sum                          : {d_sum:.4f}"
+                    f"  (closure vs chi2val={chi2val:.4f}: {d_sum - chi2val:+.4f})"
+                )
+                if chi2val > 0:
+                    logger.info(
+                        f"    fractions: data {d_ln / chi2val * 100:5.1f}%  "
+                        f"nuis {d_lc / chi2val * 100:5.1f}%  "
+                        f"BBB  {d_lbeta / chi2val * 100:5.1f}%"
+                    )
 
                 ws.add_chi2(chi2val, ndf, prefit, mapping, saturated=True)
 
@@ -448,6 +529,22 @@ def fit(args, fitter, ws, dofit=True):
 
     nllvalreduced = fitter.reduced_nll().numpy()
 
+    # DEBUG: decompose nominal-fit NLL into (Poisson data, nuisance constraints, BBB)
+    # so the per-projection saturated chi2 below can be split into:
+    #   2*Delta ln  -> data-vs-prediction misfit
+    #   2*Delta lc  -> constrained-nuisance pull cost
+    #   2*Delta lb  -> BBB pull cost
+    ln_nom_t, lc_nom_t, lbeta_nom_t, _, _ = fitter._compute_nll_components(profile=True)
+    ln_nom = float(ln_nom_t.numpy())
+    lc_nom = float(lc_nom_t.numpy())
+    lbeta_nom = float(lbeta_nom_t.numpy()) if lbeta_nom_t is not None else 0.0
+    logger.info("NLL decomposition (nominal postfit):")
+    logger.info(f"    ln (Poisson data) : {ln_nom:.4f}")
+    logger.info(f"    lc (nuis. constr.): {lc_nom:.4f}")
+    logger.info(f"    lbeta (BBB)       : {lbeta_nom:.4f}")
+    logger.info(f"    sum               : {ln_nom + lc_nom + lbeta_nom:.4f}")
+    logger.info(f"    nllvalreduced     : {nllvalreduced:.4f}")
+
     ndfsat = (
         tf.size(fitter.nobs) - fitter.poi_model.npoi - fitter.indata.nsystnoconstraint
     ).numpy()
@@ -463,6 +560,9 @@ def fit(args, fitter, ws, dofit=True):
     ws.results.update(
         {
             "nllvalreduced": nllvalreduced,
+            "ln_nom": ln_nom,
+            "lc_nom": lc_nom,
+            "lbeta_nom": lbeta_nom,
             "ndfsat": ndfsat,
             "edmval": edmval,
             "postfit_profile": not args.noPostfitProfileBB,
@@ -484,6 +584,20 @@ def fit(args, fitter, ws, dofit=True):
         # TODO: based on covariance
         ws.add_impacts_asym_hist(
             *fitter.nonprofiled_impacts_parms(), base_name="nonprofiled_impacts_asym"
+        )
+
+    if args.asymImpacts:
+        ws.add_impacts_asym_hist(
+            *fitter.asym_impacts_parms(
+                nll_min=fitter.reduced_nll().numpy(),
+                include=args.asymImpactsInclude,
+                exclude=args.asymImpactsExclude,
+                skip_symmetric=not args.asymImpactsAll,
+                hess_mode=args.asymImpactsHess,
+                contour_xtol=args.asymImpactsTol,
+                contour_gtol=args.asymImpactsTol,
+            ),
+            base_name="impacts_asym",
         )
 
     # Likelihood scans

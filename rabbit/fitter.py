@@ -11,7 +11,12 @@ from wums import logging
 
 from rabbit import io_tools
 from rabbit import tfhelpers as tfh
-from rabbit.impacts import global_impacts, nonprofiled_impacts, traditional_impacts
+from rabbit.impacts import (
+    asym_impacts,
+    global_impacts,
+    nonprofiled_impacts,
+    traditional_impacts,
+)
 from rabbit.tfhelpers import edmval_cov
 
 logger = logging.child_logger(__name__)
@@ -140,6 +145,7 @@ class Fitter:
             poi_model,
             options.setConstraintMinimum,
             unblind=options.unblind,
+            blinding_group=getattr(options, "blindingGroup", []),
             freeze_parameters=options.freezeParameters,
         )
 
@@ -261,6 +267,7 @@ class Fitter:
         poi_model,
         set_constraint_minimum=[],
         unblind=False,
+        blinding_group=[],
         freeze_parameters=[],
     ):
         self.poi_model = poi_model
@@ -276,7 +283,7 @@ class Fitter:
                 trainable=False,
                 name="offset_theta",
             )
-            self.init_blinding_values(unblind)
+            self.init_blinding_values(unblind, blinding_group)
 
         self.parms = np.concatenate([self.poi_model.pois, self.indata.systs])
 
@@ -441,14 +448,16 @@ class Fitter:
         ]
         self.update_frozen_params()
 
-    def init_blinding_values(self, unblind_parameter_expressions=[]):
+    def init_blinding_values(
+        self, unblind_parameter_expressions=[], blinding_group_expressions=[]
+    ):
         logger.debug(f"Unblind parameters with {unblind_parameter_expressions}")
+        all_param_names = [
+            *self.poi_model.pois,
+            *[self.indata.systs[i] for i in self.indata.noiidxs],
+        ]
         unblind_parameters = match_regexp_params(
-            unblind_parameter_expressions,
-            [
-                *self.poi_model.pois,
-                *[self.indata.systs[i] for i in self.indata.noiidxs],
-            ],
+            unblind_parameter_expressions, all_param_names
         )
 
         # check if dataset is an integer (i.e. if it is real data or not) and use this to choose the random seed
@@ -473,14 +482,47 @@ class Fitter:
             value = rng.normal(loc=mean, scale=std)
             return value
 
+        # Build a map: param name -> seed string. Default is the param's own name; for
+        # parameters matching a blinding group the seed is the group regex string, so all
+        # members of the group share an identical deterministic offset (preserving relative
+        # differences while blinding absolute values).
+        if isinstance(blinding_group_expressions, str):
+            blinding_group_expressions = [blinding_group_expressions]
+        param_to_seed = {}
+        param_to_group = {}
+        for expr in blinding_group_expressions:
+            matched = match_regexp_params(expr, all_param_names)
+            for p in matched:
+                if p in param_to_seed:
+                    continue  # first matching group wins
+                param_to_seed[p] = expr
+                param_to_group[p] = expr
+
+        # Refuse to run if --unblind and --blindingGroup match the same parameter:
+        # the user's intent is ambiguous (unblind it, or share a group offset?), and
+        # silently picking one risks accidentally unblinding a sensitive parameter.
+        overlap = [p for p in unblind_parameters if p in param_to_group]
+        if overlap:
+            details = ", ".join(
+                f"{p.decode() if isinstance(p, bytes) else p}"
+                f" (group '{param_to_group[p]}')"
+                for p in overlap
+            )
+            raise RuntimeError(
+                "The following parameters match both --unblind and --blindingGroup; "
+                "refusing to proceed to avoid an ambiguous (un)blinding. "
+                f"Tighten the regexes to make the intent explicit: {details}"
+            )
+
         # multiply offset to nois
         self._blinding_values_theta = np.zeros(self.indata.nsyst, dtype=np.float64)
         for i in self.indata.noiidxs:
             param = self.indata.systs[i]
             if param in unblind_parameters:
                 continue
-            logger.debug(f"Blind parameter {param}")
-            value = deterministic_random_from_string(param)
+            seed = param_to_seed.get(param, param)
+            logger.debug(f"Blind parameter {param} (seed='{seed}')")
+            value = deterministic_random_from_string(seed)
             self._blinding_values_theta[i] = value
 
         # add offset to pois
@@ -489,8 +531,9 @@ class Fitter:
             param = self.poi_model.pois[i]
             if param in unblind_parameters:
                 continue
-            logger.debug(f"Blind signal strength modifier for {param}")
-            value = deterministic_random_from_string(param)
+            seed = param_to_seed.get(param, param)
+            logger.debug(f"Blind signal strength modifier for {param} (seed='{seed}')")
+            value = deterministic_random_from_string(seed)
             self._blinding_values_poi[i] = np.exp(value)
 
     def set_blinding_offsets(self, blind=True):
@@ -902,6 +945,78 @@ class Fitter:
         )
 
         return impacts, impacts_grouped
+
+    def asymmetric_nuisance_mask(self, atol=0.0):
+        """Boolean mask of length nsyst, True where the nuisance has nonzero
+        asymmetric (logkhalfdiff) tensor content."""
+        return asym_impacts.asymmetric_nuisance_mask(self.indata, atol=atol)
+
+    def asym_impacts_parms(
+        self,
+        nll_min=None,
+        q=1,
+        include=None,
+        exclude=None,
+        skip_symmetric=True,
+        skip_unconstrained=True,
+        contour_xtol=1e-6,
+        contour_gtol=1e-6,
+        contour_maxiter=200,
+        hess_mode="exact",
+    ):
+        """Traditional asymmetric impacts via per-nuisance contour scan.
+
+        Args:
+            nll_min: postfit reduced NLL. Computed from the current fit state
+                if None.
+            q: contour level (q=1 -> 1 sigma).
+            include: optional regex(es) restricting which nuisances to scan.
+            exclude: optional regex(es) excluding nuisances from the scan.
+            skip_symmetric: skip nuisances whose template content is structurally
+                symmetric (their asymmetric impact equals the Gaussian impact).
+            skip_unconstrained: skip nuisances with constraintweight=0 (no
+                finite Delta(2NLL)=q contour).
+        """
+        if nll_min is None:
+            nll_min = float(self.reduced_nll().numpy())
+
+        nsyst = self.indata.nsyst
+        cw = self.indata.constraintweights.numpy()
+        syst_names = np.array(self.indata.systs).astype(bytes)
+
+        selected = np.ones(nsyst, dtype=bool)
+        if skip_unconstrained:
+            selected &= cw > 0
+        if skip_symmetric:
+            selected &= self.asymmetric_nuisance_mask()
+        if include is not None:
+            keep = match_regexp_params(include, syst_names)
+            keep_set = set(keep)
+            selected &= np.array([n in keep_set for n in syst_names])
+        if exclude is not None:
+            drop = match_regexp_params(exclude, syst_names)
+            drop_set = set(drop)
+            selected &= np.array([n not in drop_set for n in syst_names])
+
+        selected_idxs = np.where(selected)[0]
+        selected_names = syst_names[selected_idxs]
+
+        logger.info(
+            f"asym_impacts_parms: selected {len(selected_idxs)}/{nsyst} nuisances "
+            f"(skip_symmetric={skip_symmetric}, skip_unconstrained={skip_unconstrained})"
+        )
+
+        return asym_impacts.asym_impacts_parms(
+            self,
+            nll_min,
+            selected_idxs,
+            selected_names,
+            q=q,
+            contour_xtol=contour_xtol,
+            contour_gtol=contour_gtol,
+            contour_maxiter=contour_maxiter,
+            hess_mode=hess_mode,
+        )
 
     def nonprofiled_impacts_parms(self, unconstrained_err=1.0):
         return nonprofiled_impacts.nonprofiled_impacts_parms(
@@ -2395,23 +2510,111 @@ class Fitter:
 
         return x_scans, y_scans, dnlls
 
-    def contour_scan(self, param, nll_min, q=1, signs=[-1, 1], fun=None):
-        # TODO this is basically traditional asymmetric impacts
-        def scipy_loss(x):
-            self.x.assign(x)
-            val = self.loss_val()
-            loss = val.numpy() - nll_min - 0.5 * q
-            return loss[None,]
+    def contour_scan(
+        self,
+        param,
+        nll_min,
+        q=1,
+        signs=[-1, 1],
+        fun=None,
+        xtol=1e-6,
+        gtol=1e-6,
+        maxiter=200,
+        hess_mode="exact",
+    ):
+        # Layered cache: trust-constr calls scipy_loss many times during line
+        # search (only val needed), and scipy_grad / scipy_hess on accepted
+        # steps. The cache is keyed by x content so repeated requests at the
+        # same point are free.
+        lg_cache = {"x": None, "val": None, "grad": None}
 
-        def scipy_grad(x):
+        def _ensure_loss_grad(x):
+            if lg_cache["x"] is not None and np.array_equal(lg_cache["x"], x):
+                return
             self.x.assign(x)
             val, grad = self.loss_val_grad()
-            return grad.numpy()[None,]
+            lg_cache["x"] = np.array(x, copy=True)
+            lg_cache["val"] = float(val.numpy()) - nll_min - 0.5 * q
+            lg_cache["grad"] = grad.numpy()
 
-        def scipy_hess(x, v):
-            self.x.assign(x)
-            val, grad, hess = self.loss_val_grad_hess()
-            return v[0] * hess.numpy()
+        # Constraint Hessian. Modes:
+        #   "exact": recompute the full NLL Hessian at every accepted iteration
+        #       (~25 s/eval for thousands of params; dominant cost). Reference.
+        #   "hvp": LinearOperator whose matvec computes one Hessian-vector
+        #       product via a nested GradientTape (~2x the cost of a gradient).
+        #       Exact (no approximation); avoids materializing the N x N matrix.
+        #       trust-constr only multiplies H against trial directions in its
+        #       inner CG, so HVP is typically much faster than "exact".
+        #   "frozen": constant Hessian = postfit precision matrix (cov^-1),
+        #       computed once. Cheapest, but the Lagrangian model is wrong off
+        #       the postfit, so trust-constr's KKT/optimality criterion can be
+        #       satisfied while the constraint violation is large -- producing
+        #       silent failures on non-Gaussian profiles. Useful only as a
+        #       speed reference, not as a production default.
+        #   "bfgs" / "sr1": quasi-Newton Hessian estimate built up by
+        #       trust-constr from the gradient sequence (no extra TF calls).
+        #       Cheapest per iteration; may need more iterations to converge.
+        #       SR1 is more robust for non-convex local geometry than BFGS.
+        if hess_mode == "hvp":
+            def scipy_hess(x, v):
+                _ensure_loss_grad(x)
+                n = len(x)
+                scale = float(v[0])
+
+                def _matvec(p):
+                    self.x.assign(x)
+                    p_tf = tf.convert_to_tensor(p, dtype=self.indata.dtype)
+                    _, _, hp = self.loss_val_grad_hessp(p_tf)
+                    return scale * hp.numpy()
+
+                return scipy.sparse.linalg.LinearOperator(
+                    shape=(n, n), matvec=_matvec, dtype=np.float64
+                )
+
+        elif hess_mode == "frozen":
+            postfit_hess = np.linalg.inv(self.cov.numpy())
+
+            def scipy_hess(x, v):
+                return v[0] * postfit_hess
+
+        elif hess_mode == "bfgs":
+            scipy_hess = scipy.optimize.BFGS()
+
+        elif hess_mode == "sr1":
+            scipy_hess = scipy.optimize.SR1()
+
+        elif hess_mode == "exact":
+            h_cache = {"x": None, "hess": None}
+
+            def _ensure_hess(x):
+                if h_cache["x"] is not None and np.array_equal(h_cache["x"], x):
+                    return
+                self.x.assign(x)
+                val, grad, hess = self.loss_val_grad_hess()
+                h_cache["x"] = np.array(x, copy=True)
+                h_cache["hess"] = hess.numpy()
+                # opportunistically refresh the loss/grad cache.
+                lg_cache["x"] = h_cache["x"]
+                lg_cache["val"] = float(val.numpy()) - nll_min - 0.5 * q
+                lg_cache["grad"] = grad.numpy()
+
+            def scipy_hess(x, v):
+                _ensure_hess(x)
+                return v[0] * h_cache["hess"]
+
+        else:
+            raise ValueError(
+                f"contour_scan: unknown hess_mode={hess_mode!r}; "
+                "expected one of 'exact', 'hvp', 'frozen', 'bfgs', 'sr1'."
+            )
+
+        def scipy_loss(x):
+            _ensure_loss_grad(x)
+            return np.array([lg_cache["val"]])
+
+        def scipy_grad(x):
+            _ensure_loss_grad(x)
+            return lg_cache["grad"][None, :]
 
         nlc = scipy.optimize.NonlinearConstraint(
             fun=scipy_loss,
@@ -2425,30 +2628,24 @@ class Fitter:
         params_values = np.full((len(signs), len(self.parms)), np.nan)
 
         xval = tf.identity(self.x)
-        xval_init = xval.numpy()
+        xval_np = xval.numpy()
 
         idx = np.where(self.parms.astype(str) == param)[0][0]
-        x0 = xval[idx]
+        x0 = xval_np[idx]
 
-        # initial guess from covariance
-        initial_fit = False
-
-        xup = xval[idx] + (self.cov[idx, idx] * q) ** 0.5
-        xdn = xval[idx] - (self.cov[idx, idx] * q) ** 0.5
+        # Gaussian-optimal warm start on the Delta(2NLL)=q contour:
+        # maximizing +/- dx[idx] subject to dx^T H dx = q (with H = cov^{-1})
+        # gives dx = sign * sqrt(q) * cov[:,idx] / sqrt(cov[idx,idx]).
+        # This lands all parameters on the contour in the Gaussian limit and
+        # is exact for nuisances with a near-quadratic likelihood, so the
+        # constrained minimization typically converges in just a few steps.
+        cov_col = self.cov[:, idx].numpy()
+        sigma_idx = float(self.cov[idx, idx].numpy()) ** 0.5
+        gauss_dx = (q**0.5) * cov_col / sigma_idx
 
         for i, sign in enumerate(signs):
-            # Objective function and its derivatives
-            if sign == -1:
-                xval_init[idx] = xdn
-            else:
-                xval_init[idx] = xup
-
-            if initial_fit:
-                # perform initial fit where contour is expected
-                self.x.assign(xval_init)
-                self.freeze_params(param)
-                self.minimize()
-                self.defreeze_params(param)
+            xval_init = xval_np + sign * gauss_dx
+            t_side0 = time.perf_counter()
 
             opt = {}
             if fun is None:
@@ -2511,20 +2708,27 @@ class Fitter:
                 jac=True,
                 constraints=[nlc],
                 options={
-                    "maxiter": 50000,
-                    "xtol": 1e-10,
-                    "gtol": 1e-10,
-                    # "barrier_tol": 1e-10,
+                    "maxiter": maxiter,
+                    "xtol": xtol,
+                    "gtol": gtol,
                 },
                 **opt,
             )
 
-            logger.info(f"Success: {res.success}")
+            t_side = time.perf_counter() - t_side0
+            logger.info(
+                f"Success: {res.success} sign={sign} time={t_side:.2f}s "
+                f"(nit={getattr(res, 'nit', '?')}, "
+                f"nfev={getattr(res, 'nfev', '?')}, "
+                f"njev={getattr(res, 'njev', '?')}, "
+                f"nhev={getattr(res, 'nhev', '?')})"
+            )
             logger.debug(f"Status: {res.status}")
             if not res.success:
                 logger.warning(f"Message: {res.message}")
                 logger.warning(f"Optimality (gtol): {res.optimality}")
                 logger.warning(f"Constraint Violation: {res.constr_violation}")
+                self.x.assign(xval)
                 continue
 
             params_values[i] = res["x"] - xval
