@@ -203,6 +203,26 @@ def common_parser():
         help="Mnimizer method used in scipy.optimize.minimize for the nominal fit minimization",
     )
     parser.add_argument(
+        "--hvpMethod",
+        default="revrev",
+        type=str,
+        choices=["fwdrev", "revrev"],
+        help="Autodiff mode for the Hessian-vector product. 'revrev' (reverse-over-reverse) "
+        "is the default and works well in combination with --jitCompile. 'fwdrev' "
+        "(forward-over-reverse, via tf.autodiff.ForwardAccumulator) is an alternative.",
+    )
+    parser.add_argument(
+        "--jitCompile",
+        default="auto",
+        type=str,
+        choices=["auto", "on", "off"],
+        help="Control XLA jit_compile=True on the loss/gradient/HVP tf.functions. "
+        "'auto' (default) enables jit_compile in dense mode and disables it in "
+        "sparse mode (where the CSR matmul kernels have no XLA implementation). "
+        "'on' forces jit_compile on (falling back to off with a warning in sparse "
+        "mode). 'off' disables jit_compile unconditionally.",
+    )
+    parser.add_argument(
         "--chisqFit",
         default=False,
         action="store_true",
@@ -321,11 +341,12 @@ def common_parser():
         help="Specify tuple with signal name and rate multiplier for signal expectation (used for fit starting values and for toys). E.g. '--expectSignal BSM 0.0 --expectSignal SM 1.0'",
     )
     parser.add_argument(
-        "--allowNegativePOI",
+        "--allowNegativeParam",
         default=False,
         action="store_true",
         help="allow signal strengths to be negative (otherwise constrained to be non-negative)",
     )
+
     parser.add_argument(
         "--noBinByBinStat",
         default=False,
@@ -345,11 +366,15 @@ def common_parser():
         help="Barlow-Beeston mode bin-by-bin statistical uncertainties",
     )
     parser.add_argument(
-        "--poiModel",
-        default=["Mu"],
+        "--paramModel",
+        default=None,
         nargs="+",
-        help="Specify POI model to be used to introduce non standard parameterization",
+        action="append",
+        help="Specify param model to be used to introduce non standard parameterization. "
+        "Can be specified multiple times to combine models via CompositeParamModel, "
+        "e.g. '--paramModel Mu --paramModel ABCD nonprompt ch_A ch_B ch_C ch_D'.",
     )
+
     parser.add_argument(
         "-m",
         "--mapping",

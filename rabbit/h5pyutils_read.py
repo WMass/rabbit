@@ -1,3 +1,4 @@
+import hdf5plugin  # noqa: F401  registers Blosc2/LZ4 filter used by the writer
 import tensorflow as tf
 
 

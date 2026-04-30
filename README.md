@@ -10,7 +10,7 @@ Implemented approximations in the limit of large sample size simplify intensive 
 
 Jupyter notebook tutorials are available in [notebooks/](notebooks/):
 - [Tutorial 1: Getting started](notebooks/tutorial_1_getting_started.ipynb)
-- [Tutorial 2: Advanced topics (mappings, masked channels, POI models)](notebooks/tutorial_2_advanced.ipynb)
+- [Tutorial 2: Advanced topics (mappings, masked channels, Param models)](notebooks/tutorial_2_advanced.ipynb)
 - [Tutorial 3: Fitting the Top Quark Mass](notebooks/tutorial_3_top_mass.ipynb)
 
 Talks given about rabbit:
@@ -168,17 +168,22 @@ Custom mappings can be defined.
 They can be specified with the full path to the custom mapping e.g. `-m custom_mapping.MyCustomMapping`. 
 The path must be accessible from your `$PYTHONPATH` variable and an `__init__.py` file must be in the directory.
 
-### POI models
-POI models can be used to introduce parameters of interest (POIs) and modify the number of predicted events in the fit.
-Baseline models are defined in `rabbit/poi_models/` and can be called in `rabbit_fit` with the `--poiModel` option, e.g. `--poiModel Mu`.
-Only one POI model can be used at a time.
-Available POI models are:
+### Param models
+Param models can be used to introduce free parameters to modify the number of predicted events in the fit.
+Baseline models are defined in `rabbit/param_models/` and can be called in `rabbit_fit` with the `--paramModel` option, e.g. `--paramModel Mu`.
+Multiple `--paramModel` arguments can be combined via a `CompositeParamModel`.
+Available Param models are:
 * `Mu`: Scale the number of events for each signal process with an unconstrained parameter, and background processes with 1. This is the default model.
 * `Ones`: Return ones, i.e. leave the number of predicted events the same.
-* `Mixture`: Scale the `primary` processes by `x` and the `complementary` processes by `1-x`
+* `Mixture`: Scale the `primary` processes by `x` and the `complementary` processes by `1-x`.
+* `ABCD`: Data-driven background estimation with four regions; D is predicted as `C·A/B` times an MC correction factor (`npoi=0`, `npou=3·n_bins`). CLI: `--paramModel ABCD <process> <ch_A> [ax:val ...] <ch_B> [ax:val ...] <ch_C> [ax:val ...] <ch_D> [ax:val ...]`.
+* `SmoothABCD`: Like `ABCD` but one axis is parameterised with an exponential Chebyshev polynomial of configurable order (default `order=1`), reducing parameters from `3·n_bins` to `3·n_outer·(order+1)`. CLI: `--paramModel SmoothABCD <axis> [order:N] <process> <ch_A> ... <ch_D>`.
+* `ExtendedABCD`: 6-region ABCD with log-linear fake-rate extrapolation: `D = C·Ax·B² / (Bx·A²)` (`npoi=0`, `npou=5·n_bins`). CLI: `--paramModel ExtendedABCD <process> <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] <ch_A> [ax:val ...] <ch_B> [ax:val ...] <ch_C> [ax:val ...] <ch_D> [ax:val ...]`.
+* `SmoothExtendedABCD`: Like `ExtendedABCD` but all five free-parameter regions are parameterised with an exponential Chebyshev polynomial along one smoothing axis (`npoi=0`, `npou=5·n_outer·(order+1)`). CLI: `--paramModel SmoothExtendedABCD <axis> [order:N] <process> <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] <ch_A> [ax:val ...] <ch_B> [ax:val ...] <ch_C> [ax:val ...] <ch_D> [ax:val ...]`.
+* `ABCDIsoMT`, `ExtendedABCDIsoMT`, `SmoothABCDIsoMT`, `SmoothExtendedABCDIsoMT`: Convenience wrappers for the above models in the (mt × relIso) plane, smoothed along `pt`, that derive all region dicts from a single channel name. CLI: `--paramModel SmoothExtendedABCDIsoMT [params:file.hdf5 | order:N] <process> <channel>`.
 
-Custom POI models can be defined.
-They can be specified with the full path to the custom mapping e.g. `--poiModel custom_model.MyCustomModel`. 
+Custom Param models can be defined.
+They can be specified with the full path to the custom mapping e.g. `--paramModel custom_model.MyCustomModel`. 
 The path must be accessible from your `$PYTHONPATH` variable and an `__init__.py` file must be in the directory.
 
 ## Fit diagnostics

@@ -5,91 +5,106 @@ import numpy as np
 import tensorflow as tf
 
 
-class POIModel:
+class ParamModel:
 
     def __init__(self, indata, *args, **kwargs):
         self.indata = indata
 
-        # # a POI model must set these attribues
-        # self.npoi = # number of parameters of interest (POIs)
-        # self.pois = # list of names for the POIs
-        # self.xpoidefault = # default values for the POIs
-        # self.is_linear = # define if the model is linear in the POIs
-        # self.allowNegativePOI = # define if the POI can be negative or not
+        # # a param model must set these attributes
+        # self.npoi = # number of true parameters of interest (POIs), reported as POIs in outputs
+        # self.npou = # number of model nuisance parameters (parameters of uninterest)
+        # self.params = # list of names for all parameters (POIs first, then model nuisances)
+        # self.xparamdefault = # default values for all parameters (length nparams)
+        # self.is_linear = # define if the model is linear in the parameters
+        # self.allowNegativeParam = # define if the POI parameters can be negative or not
 
-    # class function to parse strings as given by the argparse input e.g. --poiModel <Model> <arg[0]> <args[1]> ...
+    @property
+    def nparams(self):
+        """Total number of parameters: npoi + npou."""
+        return self.npoi + self.npou
+
+    # class function to parse strings as given by the argparse input e.g. --paramModel <Model> <arg[0]> <args[1]> ...
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
         return cls(indata, *args, **kwargs)
 
-    def compute(self, poi, full=False):
+    def compute(self, param, full=False):
         """
         Compute an array for the rate per process
-        :param params: 1D tensor of explicit parameters in the fit
+        :param param: 1D tensor of explicit parameters in the fit (length nparams)
         :return 2D tensor to be multiplied with [proc,bin] tensor
         """
 
-    def set_poi_default(self, expectSignal, allowNegativePOI=False):
+    def set_param_default(self, expectSignal, allowNegativeParam=False):
         """
-        Set default POI values, used by different POI models
+        Set default parameter values, used by different param models.
+        Only the first npoi entries (true POIs) support the squaring transform;
+        model nuisance parameters (npou entries) are always stored directly.
         """
-        poidefault = tf.ones([self.npoi], dtype=self.indata.dtype)
+        paramdefault = tf.ones([self.nparams], dtype=self.indata.dtype)
         if expectSignal is not None:
             indices = []
             updates = []
             for signal, value in expectSignal:
-                if signal.encode() not in self.pois:
+                if signal.encode() not in self.params:
                     raise ValueError(
-                        f"{signal.encode()} not in list of POIs: {self.pois}"
+                        f"{signal.encode()} not in list of params: {self.params}"
                     )
-                idx = np.where(np.isin(self.pois, signal.encode()))[0][0]
+                idx = np.where(np.isin(self.params, signal.encode()))[0][0]
 
                 indices.append([idx])
                 updates.append(float(value))
 
-            poidefault = tf.tensor_scatter_nd_update(poidefault, indices, updates)
+            paramdefault = tf.tensor_scatter_nd_update(paramdefault, indices, updates)
 
-        if allowNegativePOI:
-            self.xpoidefault = poidefault
+        # squaring transform applies only to the npoi true POI entries
+        poi_part = paramdefault[: self.npoi]
+        nui_part = paramdefault[self.npoi :]
+
+        if allowNegativeParam:
+            xpoi_part = poi_part
         else:
-            self.xpoidefault = tf.sqrt(poidefault)
+            xpoi_part = tf.sqrt(poi_part)
+
+        self.xparamdefault = tf.concat([xpoi_part, nui_part], axis=0)
 
 
-class CompositePOIModel(POIModel):
+class CompositeParamModel(ParamModel):
     """
-    multiply different POI models together
+    multiply different param models together
     """
 
     def __init__(
         self,
-        poi_models,
-        allowNegativePOI=False,
+        param_models,
+        allowNegativeParam=False,
     ):
 
-        self.poi_models = poi_models
+        self.param_models = param_models
 
-        self.npoi = sum([m.npoi for m in poi_models])
+        self.npoi = sum([m.npoi for m in param_models])
+        self.npou = sum([m.npou for m in param_models])
 
-        self.pois = np.concatenate([m.pois for m in poi_models])
+        self.params = np.concatenate([m.params for m in param_models])
 
-        self.allowNegativePOI = allowNegativePOI
+        self.allowNegativeParam = allowNegativeParam
 
-        self.is_linear = self.npoi == 0 or self.allowNegativePOI
+        self.is_linear = self.nparams == 0 or self.allowNegativeParam
 
-        self.xpoidefault = tf.concat([m.xpoidefault for m in poi_models], axis=0)
+        self.xparamdefault = tf.concat([m.xparamdefault for m in param_models], axis=0)
 
-    def compute(self, poi, full=False):
+    def compute(self, param, full=False):
         start = 0
         results = []
-        for m in self.poi_models:
-            results.append(m.compute(poi[start : start + m.npoi], full))
-            start += m.npoi
+        for m in self.param_models:
+            results.append(m.compute(param[start : start + m.nparams], full))
+            start += m.nparams
 
         rnorm = functools.reduce(lambda a, b: a * b, results)
         return rnorm
 
 
-class Ones(POIModel):
+class Ones(ParamModel):
     """
     multiply all processes with ones
     """
@@ -97,39 +112,44 @@ class Ones(POIModel):
     def __init__(self, indata, **kwargs):
         self.indata = indata
         self.npoi = 0
-        self.pois = np.array([])
-        self.poidefault = tf.zeros([], dtype=self.indata.dtype)
+        self.npou = 0
+        self.params = np.array([])
+        self.xparamdefault = tf.zeros([0], dtype=self.indata.dtype)
 
-        self.allowNegativePOI = False
+        self.allowNegativeParam = False
         self.is_linear = True
 
-    def compute(self, poi, full=False):
+    def compute(self, param, full=False):
         rnorm = tf.ones(self.indata.nproc, dtype=self.indata.dtype)
         rnorm = tf.reshape(rnorm, [1, -1])
         return rnorm
 
 
-class Mu(POIModel):
+class Mu(ParamModel):
     """
     multiply unconstrained parameter to signal processes, and ones otherwise
     """
 
-    def __init__(self, indata, expectSignal=None, allowNegativePOI=False, **kwargs):
+    def __init__(self, indata, expectSignal=None, allowNegativeParam=False, **kwargs):
         self.indata = indata
 
         self.npoi = self.indata.nsignals
+        self.npou = 0
 
-        self.pois = np.array([s for s in self.indata.signals])
+        self.params = np.array([s for s in self.indata.signals])
 
-        self.allowNegativePOI = allowNegativePOI
+        self.allowNegativeParam = allowNegativeParam
 
-        self.is_linear = self.npoi == 0 or self.allowNegativePOI
+        self.is_linear = self.nparams == 0 or self.allowNegativeParam
 
-        self.set_poi_default(expectSignal, allowNegativePOI)
+        self.set_param_default(expectSignal, allowNegativeParam)
 
-    def compute(self, poi, full=False):
+    def compute(self, param, full=False):
         rnorm = tf.concat(
-            [poi, tf.ones([self.indata.nproc - poi.shape[0]], dtype=self.indata.dtype)],
+            [
+                param,
+                tf.ones([self.indata.nproc - param.shape[0]], dtype=self.indata.dtype),
+            ],
             axis=0,
         )
 
@@ -137,7 +157,7 @@ class Mu(POIModel):
         return rnorm
 
 
-class Mixture(POIModel):
+class Mixture(ParamModel):
     """
     Based on unconstrained parameters x_i
     multiply `primary` process by x_i
@@ -150,7 +170,7 @@ class Mixture(POIModel):
         primary_processes,
         complementary_processes,
         expectSignal=None,
-        allowNegativePOI=False,
+        allowNegativeParam=False,
         **kwargs,
     ):
         self.indata = indata
@@ -186,7 +206,8 @@ class Mixture(POIModel):
         self.all_idx = np.concatenate([self.primary_idxs, self.complementary_idxs])
 
         self.npoi = len(primary_processes)
-        self.pois = np.array(
+        self.npou = 0
+        self.params = np.array(
             [
                 f"{p}_{c}_mixing".encode()
                 for p, c in zip(
@@ -195,16 +216,16 @@ class Mixture(POIModel):
             ]
         )
 
-        self.allowNegativePOI = allowNegativePOI
+        self.allowNegativeParam = allowNegativeParam
         self.is_linear = False
 
-        self.set_poi_default(expectSignal, allowNegativePOI)
+        self.set_param_default(expectSignal, allowNegativeParam)
 
     @classmethod
     def parse_args(cls, indata, *args, **kwargs):
         """
         parsing the input arguments into the constructor, is has to be called as
-        --poiModel Mixture <proc_0>,<proc_1>,... <proc_a>,<proc_b>,...
+        --paramModel Mixture <proc_0>,<proc_1>,... <proc_a>,<proc_b>,...
         to introduce a mixing parameter for proc_0 with proc_a, and proc_1 with proc_b, etc.
         """
 
@@ -218,10 +239,10 @@ class Mixture(POIModel):
 
         return cls(indata, primaries, complementaries, **kwargs)
 
-    def compute(self, poi, full=False):
+    def compute(self, param, full=False):
 
-        ones = tf.ones(self.npoi, dtype=self.indata.dtype)
-        updates = tf.concat([ones * poi, ones * (1 - poi)], axis=0)
+        ones = tf.ones(self.nparams, dtype=self.indata.dtype)
+        updates = tf.concat([ones * param, ones * (1 - param)], axis=0)
 
         # Single scatter update
         rnorm = tf.tensor_scatter_nd_update(
@@ -234,24 +255,32 @@ class Mixture(POIModel):
         return rnorm
 
 
-class SaturatedProjectModel(POIModel):
+class SaturatedProjectModel(ParamModel):
     """
     For computing the saturated test statistic of a projection.
     Add one free parameter for each projected bin
     """
 
     def __init__(
-        self, indata, channel_info, expectSignal=None, allowNegativePOI=False, **kwargs
+        self,
+        indata,
+        channel_info,
+        expectSignal=None,
+        allowNegativeParam=False,
+        **kwargs,
     ):
         self.indata = indata
         self.channel_info_mapping = channel_info
 
-        self.npoi = np.sum(
-            [
-                np.prod([a.size for a in v["axes"]]) if len(v["axes"]) else 1
-                for v in channel_info.values()
-            ]
+        self.npoi = int(
+            np.sum(
+                [
+                    np.prod([a.size for a in v["axes"]]) if len(v["axes"]) else 1
+                    for v in channel_info.values()
+                ]
+            )
         )
+        self.npou = 0
 
         names = []
         for k, v in self.channel_info_mapping.items():
@@ -259,15 +288,15 @@ class SaturatedProjectModel(POIModel):
                 label = "_".join(f"{a.name}{i}" for a, i in zip(v["axes"], idxs))
                 names.append(f"saturated_{k}_{label}".encode())
 
-        self.pois = np.array(names)
+        self.params = np.array(names)
 
-        self.allowNegativePOI = allowNegativePOI
+        self.allowNegativeParam = allowNegativeParam
 
-        self.is_linear = self.npoi == 0 or self.allowNegativePOI
+        self.is_linear = self.nparams == 0 or self.allowNegativeParam
 
-        self.set_poi_default(expectSignal, allowNegativePOI)
+        self.set_param_default(expectSignal, allowNegativeParam)
 
-    def compute(self, poi, full=False):
+    def compute(self, param, full=False):
         start = 0
         rnorms = []
         for k, v in self.indata.channel_info.items():
@@ -279,10 +308,10 @@ class SaturatedProjectModel(POIModel):
             if k in self.channel_info_mapping.keys():
                 mapping_axes = self.channel_info_mapping[k]["axes"]
                 shape_mapping = [a.size if a in mapping_axes else 1 for a in v["axes"]]
-                npoi = np.prod([a.size for a in mapping_axes])
-                ipoi = poi[start : start + npoi]
-                irnorm *= tf.reshape(ipoi, shape_mapping)
-                start += npoi
+                n_mapping_params = np.prod([a.size for a in mapping_axes])
+                iparam = param[start : start + n_mapping_params]
+                irnorm *= tf.reshape(iparam, shape_mapping)
+                start += n_mapping_params
 
             irnorm = tf.reshape(
                 irnorm,
