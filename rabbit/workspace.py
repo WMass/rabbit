@@ -60,12 +60,12 @@ class Workspace:
         self.impact_axis = hist.axis.StrCategory(parms, name="impacts")
         self.global_impact_axis = hist.axis.StrCategory(systs, name="impacts")
         self.grouped_impact_axis = getGroupedImpactsAxes(
-            fitter.indata, bin_by_bin_stat=fitter.binByBinStat, per_process=False
+            fitter.indata, bin_by_bin_stat=fitter.bbstat.enabled, per_process=False
         )
         self.grouped_global_impact_axis = getGroupedImpactsAxes(
             fitter.indata,
-            bin_by_bin_stat=fitter.binByBinStat,
-            per_process=fitter.binByBinStatMode == "full",
+            bin_by_bin_stat=fitter.bbstat.enabled,
+            per_process=fitter.bbstat.binByBinStatMode == "full",
         )
 
         self.extension = "hdf5"

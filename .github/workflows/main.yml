@@ -139,6 +139,7 @@ jobs:
       fail-fast: false
       matrix:
         test:
+          - test_bbstat.py
           - test_external_term.py
           - test_multi_systematic.py
           - test_sparse_fit.py
@@ -217,7 +218,7 @@ jobs:
 
   fitting:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, make-tensor]
+    needs: [setenv, unit-tests, make-tensor]
 
     steps:
       - env:
@@ -269,7 +270,7 @@ jobs:
 
   sparse-fits:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, make-tensor]
+    needs: [setenv, unit-tests, make-tensor]
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
@@ -291,7 +292,7 @@ jobs:
 
   alternative-fits:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, make-tensor]
+    needs: [setenv, unit-tests, make-tensor]
     strategy:
       fail-fast: false
       matrix:
@@ -382,7 +383,7 @@ jobs:
 
   regularization:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, make-tensor]
+    needs: [setenv, unit-tests, make-tensor]
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
@@ -409,7 +410,7 @@ jobs:
 
   bsm:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, make-tensor]
+    needs: [setenv, unit-tests, make-tensor]
 
     steps:
       - env:
@@ -532,7 +533,7 @@ jobs:
 
   likelihoodscans:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, make-tensor]
+    needs: [setenv, unit-tests, make-tensor]
 
     steps:
       - env:
@@ -595,7 +596,7 @@ jobs:
 
   abcd-fits:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, make-abcd-tensors]
+    needs: [setenv, unit-tests, make-abcd-tensors]
 
     steps:
       - env:

@@ -439,7 +439,7 @@ def fit(args, fitter, ws, dofit=True):
         # force profiling of beta with final parameter values
         # TODO avoid the extra calculation and jitting if possible since the relevant calculation
         # usually would have been done during the minimization
-        if fitter.binByBinStat and not args.noPostfitProfileBB:
+        if fitter.bbstat.enabled and not args.noPostfitProfileBB:
             fitter._profile_beta()
 
         if cb is not None:
@@ -460,7 +460,7 @@ def fit(args, fitter, ws, dofit=True):
         fitter.cov.assign(cov)
         del cov
 
-        if fitter.binByBinStat and fitter.diagnostics:
+        if fitter.bbstat.enabled and fitter.diagnostics:
             # This is the estimated distance to minimum with respect to variations of
             # the implicit binByBinStat nuisances beta at fixed parameter values.
             # It should be near-zero by construction as long as the analytic profiling is

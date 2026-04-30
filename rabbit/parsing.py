@@ -352,6 +352,16 @@ def common_parser():
         help="Barlow-Beeston mode bin-by-bin statistical uncertainties",
     )
     parser.add_argument(
+        "--minBBKstat",
+        default=0.0,
+        type=float,
+        help="Mask (bin, process) entries with effective MC stats kstat = sumw**2/sumw2 "
+        "below this threshold so their bin-by-bin nuisances are fixed at beta0. "
+        "Default 0 keeps the original behaviour. Useful for full-mode BBB to avoid "
+        "ill-conditioned profiles for processes with very low effective stats per bin "
+        "(e.g. mixed-sign-weight cancellations).",
+    )
+    parser.add_argument(
         "--paramModel",
         default=None,
         nargs="+",
