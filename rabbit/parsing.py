@@ -258,6 +258,20 @@ def common_parser():
         """,
     )
     parser.add_argument(
+        "--blindingGroup",
+        type=str,
+        default=[],
+        nargs="*",
+        help="""
+        Specify list of regex defining groups of parameters that share a single deterministic
+        blinding offset (seeded from the regex string itself). Useful to keep relative pulls /
+        differences between matched parameters meaningful while still blinding their absolute
+        values. E.g. '--blindingGroup ^alphaS_y\\d+$' applies the same offset to all alphaS
+        rapidity-bin parameters. Parameters not matching any group keep per-name blinding.
+        Overlap with --unblind is treated as a configuration error and aborts the fit.
+        """,
+    )
+    parser.add_argument(
         "--setConstraintMinimum",
         default=[],
         nargs=2,
