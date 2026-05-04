@@ -267,6 +267,15 @@ def make_parser():
         "sequence (no extra TF calls per iteration; may need more iterations).",
     )
     parser.add_argument(
+        "--asymImpactsMaxiter",
+        default=200,
+        type=int,
+        help="trust-constr maxiter for the --asymImpacts contour-scan. Lower "
+        "values cap the cost of nuisances that don't converge (useful for "
+        "sanity benchmarks); higher values give genuinely-non-Gaussian "
+        "nuisances more chances to converge.",
+    )
+    parser.add_argument(
         "--asymImpactsTol",
         default=1e-6,
         type=float,
@@ -274,7 +283,49 @@ def make_parser():
         "Looser values (e.g. 1e-3) terminate before the iterate is on the "
         "Delta(2NLL)=q contour, producing silent constraint violations. "
         "Tighter values (1e-5, 1e-6) are slower with no benefit unless your "
-        "fit has nuisances whose profile is far from quadratic."
+        "fit has nuisances whose profile is far from quadratic.",
+    )
+    parser.add_argument(
+        "--globalAsymImpacts",
+        default=False,
+        action="store_true",
+        help="Compute fully likelihood-based asymmetric global impacts on POIs "
+        "by shifting each constrained nuisance's theta0 by +/- 1 prefit sigma "
+        "and re-running the fit. In the Gaussian limit this reproduces "
+        "--gaussianGlobalImpacts; deviations measure non-Gaussianity of the "
+        "joint profile. Cost is N_selected x 2 full minimizations -- gate with "
+        "--globalAsymImpactsInclude in practice.",
+    )
+    parser.add_argument(
+        "--globalAsymImpactsInclude",
+        default=None,
+        nargs="+",
+        help="Regex(es) restricting which nuisances are scanned for "
+        "--globalAsymImpacts.",
+    )
+    parser.add_argument(
+        "--globalAsymImpactsExclude",
+        default=None,
+        nargs="+",
+        help="Regex(es) excluding nuisances from --globalAsymImpacts.",
+    )
+    parser.add_argument(
+        "--globalAsymImpactsSigma",
+        default=1.0,
+        type=float,
+        help="theta0 shift magnitude for --globalAsymImpacts, in units of the "
+        "prefit constraint width (1.0 = 1 prefit sigma).",
+    )
+    parser.add_argument(
+        "--globalAsymImpactsLinearWarmstart",
+        default=False,
+        action="store_true",
+        help="EXPERIMENTAL: warm-start each --globalAsymImpacts refit at the "
+        "Gaussian-approximation new minimum x_nom + dxdtheta0[:, i] * shift "
+        "(same Jacobian as --gaussianGlobalImpacts). On near-Gaussian "
+        "nuisances this should reduce per-nuisance refit cost by 10-50x. "
+        "Adds one --gaussianGlobalImpacts-equivalent precompute up front. "
+        "Off by default until validated on real tensors.",
     )
     parser.add_argument(
         "--lCurveScan",
@@ -665,8 +716,20 @@ def fit(args, fitter, ws, dofit=True):
                 hess_mode=args.asymImpactsHess,
                 contour_xtol=args.asymImpactsTol,
                 contour_gtol=args.asymImpactsTol,
+                contour_maxiter=args.asymImpactsMaxiter,
             ),
             base_name="impacts_asym",
+        )
+
+    if args.globalAsymImpacts:
+        ws.add_impacts_asym_hist(
+            *fitter.global_asym_impacts_parms(
+                include=args.globalAsymImpactsInclude,
+                exclude=args.globalAsymImpactsExclude,
+                sigma=args.globalAsymImpactsSigma,
+                linear_warmstart=args.globalAsymImpactsLinearWarmstart,
+            ),
+            base_name="global_impacts_asym",
         )
 
     # Likelihood scans

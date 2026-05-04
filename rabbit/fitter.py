@@ -14,6 +14,7 @@ from rabbit import external_likelihood, io_tools
 from rabbit import tfhelpers as tfh
 from rabbit.impacts import (
     asym_impacts,
+    global_asym_impacts,
     global_impacts,
     nonprofiled_impacts,
     traditional_impacts,
@@ -28,23 +29,26 @@ def solve_quad_eq(a, b, c):
 
 
 def match_regexp_params(regular_expressions, parameter_names):
+    # Match parameter names against a list of expressions where each entry may
+    # be either an exact parameter name or a regex (re.match, anchored to the
+    # start). Returns the union of exact and regex matches, preserving the
+    # parameter_names order and de-duplicating. Mixing exact and regex entries
+    # in the same call is supported.
     if isinstance(regular_expressions, str):
         regular_expressions = [regular_expressions]
 
-    # Check for exact matches first
-    exact_matches = [
-        s for expr in regular_expressions for s in parameter_names if s.decode() == expr
-    ]
-    if exact_matches:
-        return exact_matches
-
-    # Fall back to regex matching
+    exact_lookup = set(regular_expressions)
     compiled_expressions = [re.compile(expr) for expr in regular_expressions]
-    return [
-        s
-        for s in parameter_names
-        if any(regex.match(s.decode()) for regex in compiled_expressions)
-    ]
+
+    matched = []
+    seen = set()
+    for s in parameter_names:
+        decoded = s.decode() if hasattr(s, "decode") else s
+        if decoded in exact_lookup or any(r.match(decoded) for r in compiled_expressions):
+            if decoded not in seen:
+                seen.add(decoded)
+                matched.append(s)
+    return matched
 
 
 class FitterCallback:
@@ -538,7 +542,7 @@ class Fitter:
     ):
         logger.debug(f"Unblind parameters with {unblind_parameter_expressions}")
         all_param_names = [
-            *self.param_model.params[: self.param_model.npoi,
+            *self.param_model.params[: self.param_model.npoi],
             *[self.indata.systs[i] for i in self.indata.noiidxs],
         ]
         unblind_parameters = match_regexp_params(
@@ -1207,6 +1211,61 @@ class Fitter:
             contour_gtol=contour_gtol,
             contour_maxiter=contour_maxiter,
             hess_mode=hess_mode,
+        )
+
+    def global_asym_impacts_parms(
+        self,
+        include=None,
+        exclude=None,
+        skip_unconstrained=True,
+        sigma=1.0,
+        linear_warmstart=False,
+    ):
+        """Fully likelihood-based asymmetric global impacts.
+
+        For each selected nuisance i, shift theta0[i] by +/- sigma (in units of
+        the prefit constraint width) and re-run the full fit. POI shifts at
+        each sign are the asymmetric global impacts.
+
+        Args:
+            include: optional regex(es) restricting which nuisances to scan.
+            exclude: optional regex(es) excluding nuisances from the scan.
+            skip_unconstrained: skip nuisances with constraintweight=0; their
+                "1 prefit sigma" is undefined.
+            sigma: shift magnitude in prefit-sigma units.
+            linear_warmstart: experimental, see
+                global_asym_impacts.global_asym_impacts_parms.
+        """
+        nsyst = self.indata.nsyst
+        cw = self.indata.constraintweights.numpy()
+        syst_names = np.array(self.indata.systs).astype(bytes)
+
+        selected = np.ones(nsyst, dtype=bool)
+        if skip_unconstrained:
+            selected &= cw > 0
+        if include is not None:
+            keep = match_regexp_params(include, syst_names)
+            keep_set = set(keep)
+            selected &= np.array([n in keep_set for n in syst_names])
+        if exclude is not None:
+            drop = match_regexp_params(exclude, syst_names)
+            drop_set = set(drop)
+            selected &= np.array([n not in drop_set for n in syst_names])
+
+        selected_idxs = np.where(selected)[0]
+        selected_names = syst_names[selected_idxs]
+
+        logger.info(
+            f"global_asym_impacts_parms: selected {len(selected_idxs)}/{nsyst} "
+            f"nuisances (skip_unconstrained={skip_unconstrained})"
+        )
+
+        return global_asym_impacts.global_asym_impacts_parms(
+            self,
+            selected_idxs,
+            selected_names,
+            sigma=sigma,
+            linear_warmstart=linear_warmstart,
         )
 
     def nonprofiled_impacts_parms(self, unconstrained_err=1.0):
@@ -2869,6 +2928,7 @@ class Fitter:
         #       Cheapest per iteration; may need more iterations to converge.
         #       SR1 is more robust for non-convex local geometry than BFGS.
         if hess_mode == "hvp":
+
             def scipy_hess(x, v):
                 _ensure_loss_grad(x)
                 n = len(x)
