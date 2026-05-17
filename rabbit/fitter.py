@@ -2147,6 +2147,33 @@ class Fitter:
 
         return intervals, params_values
 
+    def profiled_nll_at_poi(self, param, value):
+        """Reduced NLL profiled over all other parameters with `param` fixed.
+
+        `value` is interpreted in the internal parameter (`self.x`) space, the
+        same convention used by `contour_scan` (for `allowNegativeParam` POIs
+        this coincides with the physical signal strength). The unconditional
+        best-fit state of `self.x` is restored before returning so the fitter
+        is left untouched.
+        """
+        xsave = tf.identity(self.x)
+        idx = np.where(self.parms.astype(str) == param)[0][0]
+
+        xval = xsave.numpy()
+        xval[idx] = value
+        self.x.assign(xval)
+
+        self.freeze_params(param)
+        self.minimize()
+        self.defreeze_params(param)
+
+        nll = self.reduced_nll().numpy()
+
+        # restore the unconditional best fit
+        self.x.assign(xsave)
+
+        return nll
+
     def contour_scan2D(self, param_tuple, nll_min, cl=1, n_points=16):
         # Not yet working
         def scipy_loss(xval):

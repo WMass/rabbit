@@ -166,6 +166,9 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
 
         # this is the denominator of q for likelihood based limits
         nllvalreduced_asimov = fitter_asimov.reduced_nll().numpy()
+        if fit_data:
+            # global minimum on data (unconditional fit, done above)
+            nllvalreduced = fitter.reduced_nll().numpy()
 
         for j, cl_s in enumerate(args.levels):
             logger.info(f" -- AsymptoticLimits ( CLs={round(cl_s*100,1):4.1f}% ) -- ")
@@ -200,16 +203,24 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
                     key, xobs, xobs_err, xerr, cl_s
                 )
 
-            if "likelihood" in args.modes:
-                # Likelihood approximation
-                if mapping is not None:
-                    # TODO: implement for channels
-                    pass
-                else:
-                    # TODO: make it work
-                    # nllvalreduced = fitter.reduced_nll().numpy()
-                    # limits_nll_obs[i, j] = asymptotic_limits.compute_likelihood_limit(fitter, fitter_asimov, nllvalreduced, nllvalreduced_asimov, key, cl_s)
-                    pass
+            if "likelihood" in args.modes and fit_data:
+                # Likelihood approximation (covers both the parameter case
+                # fun=None and the channel/mapping case fun=mapping.compute_flat)
+                limits_nll_obs[i, j] = asymptotic_limits.compute_likelihood_limit(
+                    fitter,
+                    fitter_asimov,
+                    nllvalreduced,
+                    nllvalreduced_asimov,
+                    key,
+                    cl_s,
+                    fun=fun,
+                    r_init=(
+                        limits_obs[i, j]
+                        if (mapping is None and "gaussian" in args.modes)
+                        else None
+                    ),
+                    allow_negative=args.allowNegativeParam,
+                )
 
     if "gaussian" in args.modes:
         ws.add_limits_hist(
@@ -228,7 +239,6 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
         )
 
     if "likelihood" in args.modes:
-        # TODO: implement for channels
         ws.add_limits_hist(
             limits_nll,
             args.asymptoticLimits,
@@ -237,13 +247,12 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
             base_name="likelihood_asymptoticLimits_expected",
         )
 
-        # TODO: make it work
-        # ws.add_limits_hist(
-        #     limits_nll_obs,
-        #     args.asymptoticLimits,
-        #     args.levels,
-        #     base_name="likelihood_asymptoticLimits_observed",
-        # )
+        ws.add_limits_hist(
+            limits_nll_obs,
+            args.asymptoticLimits,
+            args.levels,
+            base_name="likelihood_asymptoticLimits_observed",
+        )
 
 
 def main():
