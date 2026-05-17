@@ -1,6 +1,6 @@
 import argparse
 
-from rabbit import fitter
+from rabbit.bbstat.bbstat import VALID_BIN_BY_BIN_STAT_TYPES
 
 
 class OptionalListAction(argparse.Action):
@@ -241,6 +241,22 @@ def common_parser():
         help="Don't compute the hessian of parameters",
     )
     parser.add_argument(
+        "--noEDM",
+        default=False,
+        action="store_true",
+        help="Don't compute the estimated distance to minimum as fit quality evaluation",
+    )
+    parser.add_argument(
+        "--forceLinear",
+        default=False,
+        action="store_true",
+        help="Force the fitter to treat the likelihood as purely quadratic and "
+        "solve via a single Gaussian (Cholesky) step, even when the param "
+        "model, asymmetry, or systematic type would otherwise mark it as "
+        "nonlinear. Useful for iterative linearized unfolding where the outer "
+        "loop re-anchors the linearization point.",
+    )
+    parser.add_argument(
         "--prefitUnconstrainedNuisanceUncertainty",
         default=0.0,
         type=float,
@@ -342,7 +358,7 @@ def common_parser():
     parser.add_argument(
         "--binByBinStatType",
         default="automatic",
-        choices=["automatic", *fitter.Fitter.valid_bin_by_bin_stat_types],
+        choices=["automatic", *VALID_BIN_BY_BIN_STAT_TYPES],
         help="probability density for bin-by-bin statistical uncertainties, ('automatic' is 'gamma' except for data covariance where it is 'normal')",
     )
     parser.add_argument(

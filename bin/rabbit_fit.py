@@ -440,6 +440,7 @@ def fit(args, fitter, ws, dofit=True):
         # TODO avoid the extra calculation and jitting if possible since the relevant calculation
         # usually would have been done during the minimization
         if fitter.bbstat.enabled and not args.noPostfitProfileBB:
+            logger.info(f"profile beta")
             fitter._profile_beta()
 
         if cb is not None:
@@ -449,7 +450,7 @@ def fit(args, fitter, ws, dofit=True):
     # prefit variances as the default fallback for add_parms_hist below
     parms_variances = None
 
-    if not args.noHessian:
+    if not args.noEDM and not args.noHessian:
         # compute the covariance matrix and estimated distance to minimum
         _, grad, hess = fitter.loss_val_grad_hess()
         edmval, cov = fitter.edmval_cov(grad, hess)
@@ -489,7 +490,7 @@ def fit(args, fitter, ws, dofit=True):
             )
 
         parms_variances = tf.linalg.diag_part(fitter.cov)
-    else:
+    elif not args.noEDM:
         # --noHessian: avoid the full dense Hessian. Still compute edmval
         # and the POI+NOI uncertainties via a Hessian-free conjugate
         # gradient solve of H @ v = grad and H @ c_i = e_i, using only
@@ -650,8 +651,6 @@ def main():
             _incompat.append("--computeHistImpacts")
         if args.computeHistGaussianImpacts:
             _incompat.append("--computeHistGaussianImpacts")
-        if args.externalPostfit is not None:
-            _incompat.append("--externalPostfit")
         if _incompat:
             raise Exception("--noHessian is incompatible with: " + ", ".join(_incompat))
 
