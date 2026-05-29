@@ -241,6 +241,49 @@ def common_parser():
         help="Don't compute the hessian of parameters",
     )
     parser.add_argument(
+        "--noEDM",
+        default=False,
+        action="store_true",
+        help="Skip the Hessian-free EDM/CG postfit step (only meaningful with "
+        "--noHessian). Skips both the edmval estimate and the POI+NOI "
+        "uncertainty rows; their entries in the output are NaN.",
+    )
+    parser.add_argument(
+        "--paramModelPriors",
+        default=False,
+        action="store_true",
+        help="Opt in to Gaussian priors on ParamModel parameters. When set, "
+        "the Fitter reads param_model.prior_sigmas (np.ndarray of shape "
+        "(nparams,), entries finite > 0 → prior of that width, NaN → free) "
+        "and param_model.prior_means (defaults to param_model.xparamdefault) "
+        "and adds the corresponding penalty to the NLL constraint term. By "
+        "default the feature is off and ParamModel params float free.",
+    )
+    parser.add_argument(
+        "--minimizerMaxiter",
+        type=int,
+        default=None,
+        help="Cap the number of scipy.optimize.minimize iterations. "
+        "Passed as options={'maxiter': N} to the minimizer. None (default) "
+        "uses scipy's method-specific default (typically 1000+).",
+    )
+    parser.add_argument(
+        "--minimizerGtol",
+        type=float,
+        default=None,
+        help="Gradient-norm tolerance for the minimizer. Passed as "
+        "options={'gtol': X} (recognized by trust-krylov, L-BFGS-B, BFGS, CG). "
+        "None (default) uses scipy's per-method default.",
+    )
+    parser.add_argument(
+        "--minimizerFtol",
+        type=float,
+        default=None,
+        help="Function-value tolerance for the minimizer (L-BFGS-B only). "
+        "Passed as options={'ftol': X}. None (default) uses scipy's default "
+        "(2.22e-9 for L-BFGS-B). Ignored by methods that don't honor 'ftol'.",
+    )
+    parser.add_argument(
         "--prefitUnconstrainedNuisanceUncertainty",
         default=0.0,
         type=float,

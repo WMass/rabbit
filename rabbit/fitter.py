@@ -66,7 +66,14 @@ class FitterCallback:
     def __call__(self, intermediate_result):
         loss = intermediate_result.fun
 
-        logger.debug(f"Iteration {self.iiter}: loss value {loss}")
+        elapsed = time.time() - self.t0
+        prev = self.time_history[-1] if self.time_history else 0.0
+        dt = elapsed - prev
+
+        logger.debug(
+            f"Iteration {self.iiter}: loss {loss}  "
+            f"[dt={dt:.2f}s elapsed={elapsed:.2f}s]"
+        )
         if np.isnan(loss):
             raise ValueError(f"Loss value is NaN at iteration {self.iiter}")
 
@@ -80,7 +87,7 @@ class FitterCallback:
             )
 
         self.loss_history.append(loss)
-        self.time_history.append(time.time() - self.t0)
+        self.time_history.append(elapsed)
 
         self.xval = intermediate_result.x
         self.iiter += 1
@@ -131,6 +138,12 @@ class Fitter:
 
         self.diagnostics = options.diagnostics
         self.minimizer_method = options.minimizerMethod
+        # Optional scipy.optimize.minimize tolerances. None entries are
+        # skipped at call site so each method falls back to scipy defaults
+        # for what's not set.
+        self.minimizer_maxiter = getattr(options, "minimizerMaxiter", None)
+        self.minimizer_gtol    = getattr(options, "minimizerGtol",    None)
+        self.minimizer_ftol    = getattr(options, "minimizerFtol",    None)
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
         # jitCompile accepts "auto" (the default), "on", or "off".
         # True / False from programmatic callers are accepted as
@@ -190,6 +203,7 @@ class Fitter:
             unblind=options.unblind,
             blinding_group=getattr(options, "blindingGroup", []),
             freeze_parameters=options.freezeParameters,
+            options=options,
         )
 
         # --- observed number of events per bin
@@ -312,6 +326,7 @@ class Fitter:
         unblind=False,
         blinding_group=[],
         freeze_parameters=[],
+        options=None,
     ):
         self.param_model = param_model
 
@@ -390,6 +405,75 @@ class Fitter:
             self.parms,
             self.indata.dtype,
         )
+
+        # ParamModel Gaussian priors (opt-in via --paramModelPriors).
+        # When enabled, the Fitter reads two optional attributes from the
+        # ParamModel:
+        #   - prior_sigmas: np.ndarray shape (nparams,). Entries that are
+        #     finite and > 0 are Gaussian-constrained at that width; NaN /
+        #     non-finite / 0 entries leave the corresponding parameter free.
+        #   - prior_means : np.ndarray shape (nparams,), optional.
+        #     Defaults to param_model.xparamdefault when not provided.
+        # The penalty 0.5 * (x - μ)^2 / σ^2 is added to _compute_lc.
+        self.param_prior_active = False
+        self.param_prior_mask_np = None
+        self.param_prior_sigmas_np = None
+        self.param_prior_means_np = None
+        if getattr(options, "paramModelPriors", False):
+            pm = self.param_model
+            sigmas = getattr(pm, "prior_sigmas", None)
+            if sigmas is not None:
+                sigmas = np.asarray(sigmas, dtype=np.float64)
+                if sigmas.shape != (pm.nparams,):
+                    raise ValueError(
+                        f"param_model.prior_sigmas must have shape ({pm.nparams},); "
+                        f"got {sigmas.shape}"
+                    )
+                means = getattr(pm, "prior_means", None)
+                if means is None:
+                    means = pm.xparamdefault.numpy().astype(np.float64)
+                else:
+                    means = np.asarray(means, dtype=np.float64)
+                    if means.shape != (pm.nparams,):
+                        raise ValueError(
+                            f"param_model.prior_means must have shape ({pm.nparams},); "
+                            f"got {means.shape}"
+                        )
+                mask = np.isfinite(sigmas) & (sigmas > 0)
+                n_priored = int(mask.sum())
+                if n_priored > 0:
+                    self.param_prior_active = True
+                    self.param_prior_mask_np = mask.copy()
+                    self.param_prior_sigmas_np = np.where(mask, sigmas, np.nan)
+                    self.param_prior_means_np = np.where(mask, means, np.nan)
+                    inv2_np = np.where(mask, 1.0 / sigmas**2, 0.0)
+                    self.param_prior_mask  = tf.constant(mask, dtype=tf.bool)
+                    self.param_prior_inv2  = tf.constant(inv2_np, dtype=self.indata.dtype)
+                    self.param_prior_means = tf.constant(
+                        np.where(mask, means, 0.0), dtype=self.indata.dtype
+                    )
+                    self.param_prior_log_sigma2 = tf.constant(
+                        np.where(mask, np.log(np.where(mask, sigmas, 1.0) ** 2), 0.0),
+                        dtype=self.indata.dtype,
+                    )
+                    logger.info(
+                        f"[paramPriors] applying Gaussian priors to "
+                        f"{n_priored}/{pm.nparams} ParamModel params:"
+                    )
+                    for i, p in enumerate(pm.params):
+                        if mask[i]:
+                            name = p.decode() if isinstance(p, bytes) else str(p)
+                            logger.info(f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}")
+                else:
+                    logger.info(
+                        "[paramPriors] --paramModelPriors set but prior_sigmas "
+                        "has no finite entries; no priors applied."
+                    )
+            else:
+                logger.info(
+                    "[paramPriors] --paramModelPriors set but ParamModel does "
+                    "not declare prior_sigmas; no priors applied."
+                )
 
         # constraint minima for nuisance parameters
         self.theta0 = tf.Variable(
@@ -655,7 +739,17 @@ class Fitter:
     def get_model_nui(self):
         npoi = self.param_model.npoi
         npou = self.param_model.npou
-        return self.x[npoi : npoi + npou]
+        nui = self.x[npoi : npoi + npou]
+        # Apply frozen_params_mask the same way get_poi() and get_theta() do.
+        # Without this, --freezeParameters silently fails to freeze POUs:
+        # the param is registered as frozen but no stop_gradient is applied,
+        # so the optimizer updates it anyway.
+        nui = tf.where(
+            self.frozen_params_mask[npoi : npoi + npou],
+            tf.stop_gradient(nui),
+            nui,
+        )
+        return nui
 
     def get_poi(self):
         xpoi = self.x[: self.param_model.npoi]
@@ -2382,7 +2476,28 @@ class Fitter:
             # normalization factor for normal distribution: log(1/sqrt(2*pi)) = -0.9189385332046727
             lc = lc + 0.9189385332046727 * self.indata.constraintweights
 
-        return tf.reduce_sum(lc)
+        total = tf.reduce_sum(lc)
+
+        # ParamModel Gaussian priors (opt-in via --paramModelPriors).
+        # Per-entry mask is baked into param_prior_inv2 (zero where mask is
+        # False), so this is a single elementwise op with no branching.
+        if self.param_prior_active:
+            pm_params = tf.concat(
+                [self.get_poi(), self.get_model_nui()], axis=0
+            )
+            lc_pm = 0.5 * self.param_prior_inv2 * tf.square(
+                pm_params - self.param_prior_means
+            )
+            if full_nll:
+                # 0.5*log(2π σ²) on entries with a prior. The log(σ²) term is
+                # precomputed (zero where masked off).
+                mask_dtype = tf.cast(self.param_prior_mask, lc_pm.dtype)
+                lc_pm = lc_pm + mask_dtype * (
+                    0.9189385332046727 + 0.5 * self.param_prior_log_sigma2
+                )
+            total = total + tf.reduce_sum(lc_pm)
+
+        return total
 
     def _compute_lbeta(self, beta, full_nll=False):
         if self.binByBinStat:
@@ -2671,6 +2786,23 @@ class Fitter:
         else:
             info_minimize = dict()
 
+        # Build scipy.optimize.minimize options from --minimizerMaxiter/
+        # --minimizerGtol/--minimizerFtol. Anything not set explicitly falls
+        # back to the historical tol=0.0 baseline below (run to the tightest
+        # internal criteria), since `tol` only fills options keys that are not
+        # already present. Methods that don't recognize an option ignore it
+        # with an OptimizeWarning (no crash).
+        sci_opts = {}
+        if self.minimizer_maxiter is not None:
+            sci_opts["maxiter"] = int(self.minimizer_maxiter)
+        if self.minimizer_gtol is not None:
+            sci_opts["gtol"] = float(self.minimizer_gtol)
+        if self.minimizer_ftol is not None:
+            sci_opts["ftol"] = float(self.minimizer_ftol)
+        logger.info(
+            f"[minimize] method={self.minimizer_method} options={sci_opts}"
+        )
+
         try:
             res = scipy.optimize.minimize(
                 scipy_loss,
@@ -2679,6 +2811,7 @@ class Fitter:
                 jac=True,
                 tol=0.0,
                 callback=callback,
+                options=sci_opts,
                 **info_minimize,
             )
         except Exception as ex:
