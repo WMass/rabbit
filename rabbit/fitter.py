@@ -1158,6 +1158,47 @@ class Fitter:
 
         return edmval, cov_rows
 
+    def _resolved_param_impact_groups(self):
+        """
+        ParamModel impact groups resolved to floating full-x parameter indices.
+        """
+        groups = getattr(self.param_model, "param_impact_groups", None)
+        if not groups:
+            return []
+        parms = self.parms.astype(str)
+        name_to_idx = {p: i for i, p in enumerate(parms)}
+        frozen = set(int(i) for i in np.atleast_1d(self.frozen_indices))
+        resolved = []
+        for label, pnames in groups.items():
+            idxs = [
+                name_to_idx[p]
+                for p in pnames
+                if p in name_to_idx and name_to_idx[p] not in frozen
+            ]
+            if idxs:
+                resolved.append((label, np.array(idxs, dtype=np.int32)))
+        return resolved
+
+    def _cov_stat_floating(self, hess, nstat):
+        """
+        Invert the stat sub-Hessian hess[:nstat, :nstat], excluding frozen params.
+        """
+        hess_stat = hess[:nstat, :nstat]
+        if len(self.frozen_params) == 0:
+            return tf.linalg.inv(hess_stat)
+        stat_float = self.floating_indices[self.floating_indices < nstat]
+        sub = tf.gather(tf.gather(hess_stat, stat_float, axis=0), stat_float, axis=1)
+        sub_inv = tf.linalg.inv(sub)
+        coords = tf.reshape(
+            tf.stack(tf.meshgrid(stat_float, stat_float, indexing="ij"), axis=-1),
+            [-1, 2],
+        )
+        return tf.scatter_nd(
+            tf.cast(coords, tf.int64),
+            tf.reshape(sub_inv, [-1]),
+            tf.constant([nstat, nstat], dtype=tf.int64),
+        )
+
     @tf.function
     def impacts_parms(self, hess):
 
@@ -1166,18 +1207,17 @@ class Fitter:
             + self.param_model.npou
             + self.indata.nsystnoconstraint
         )
-        hess_stat = hess[:nstat, :nstat]
-        cov_stat = tf.linalg.inv(hess_stat)
+        cov_stat = self._cov_stat_floating(hess, nstat)
 
         if self.binByBinStat:
             val_no_bbb, grad_no_bbb, hess_no_bbb = self.loss_val_grad_hess(
                 profile=False
             )
-            hess_stat_no_bbb = hess_no_bbb[:nstat, :nstat]
-            cov_stat_no_bbb = tf.linalg.inv(hess_stat_no_bbb)
+            cov_stat_no_bbb = self._cov_stat_floating(hess_no_bbb, nstat)
         else:
             cov_stat_no_bbb = None
 
+        param_groups = self._resolved_param_impact_groups()
         impacts, impacts_grouped = traditional_impacts.impacts_parms(
             self.cov,
             cov_stat,
@@ -1185,6 +1225,8 @@ class Fitter:
             self.param_model.npoi,
             self.indata.noiidxs,
             self.indata.systgroupidxs,
+            nmodel_params=self.param_model.npoi + self.param_model.npou,
+            param_groupidxs=[idxs for _, idxs in param_groups],
         )
 
         return impacts, impacts_grouped

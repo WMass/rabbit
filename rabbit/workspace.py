@@ -13,13 +13,19 @@ axis_downUpVar = hist.axis.Regular(
 )
 
 
-def getGroupedImpactsAxes(indata, bin_by_bin_stat=False, per_process=False):
+def getGroupedImpactsAxes(
+    indata, bin_by_bin_stat=False, per_process=False, extra_groups=None
+):
     impact_names = list(indata.systgroups.astype(str))
     impact_names.append("stat")
     if bin_by_bin_stat:
         impact_names.append("binByBinStat")
         if per_process:
             impact_names.extend([f"binByBinStat{p}" for p in indata.procs.astype(str)])
+    # ParamModel parameter groups are appended at the end, matching the column
+    # order produced by traditional_impacts.impacts_parms.
+    if extra_groups:
+        impact_names.extend(extra_groups)
     return hist.axis.StrCategory(impact_names, name="impacts")
 
 
@@ -59,8 +65,16 @@ class Workspace:
         parms = list(fitter.parms.astype(str))
         self.impact_axis = hist.axis.StrCategory(parms, name="impacts")
         self.global_impact_axis = hist.axis.StrCategory(systs, name="impacts")
+        # ParamModel impact groups (e.g. SCETlib NP gamma_nu / F_eff) are only
+        # computed by the traditional impacts, so extend that axis only.
+        param_impact_group_names = [
+            name for name, _ in fitter._resolved_param_impact_groups()
+        ]
         self.grouped_impact_axis = getGroupedImpactsAxes(
-            fitter.indata, bin_by_bin_stat=fitter.binByBinStat, per_process=False
+            fitter.indata,
+            bin_by_bin_stat=fitter.binByBinStat,
+            per_process=False,
+            extra_groups=param_impact_group_names,
         )
         self.grouped_global_impact_axis = getGroupedImpactsAxes(
             fitter.indata,
