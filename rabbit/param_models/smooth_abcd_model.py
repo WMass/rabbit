@@ -29,14 +29,20 @@ class SmoothABCD(ParamModel):
     Smooth ABCD background estimation model.
 
     Regions A, B, C have free parameters that follow an exponential polynomial
-    along the smoothing axis; region D is derived as d = a·c/b · mc_factor_D.
+    along the smoothing axis; region D is derived as ``d = a·c/b`` (default,
+    ``yield_correction=False``) or ``d = a·c/b · mc_factor_D`` with
+    ``mc_factor_D = norm_A · norm_C / (norm_B · norm_D)`` when
+    ``yield_correction=True``. See ABCD docstring for the rnorm-vs-yield
+    discussion.
 
     Parameters are pure model nuisances (npoi=0, npou=3·n_outer·(order+1)).
 
     CLI syntax:
-        --paramModel SmoothABCD <axis> [order:N] <process> \\
+        --paramModel SmoothABCD <axis> [order:N] [yieldCorrection:0|1] <process> \\
                      <ch_A> [ax:val ...] <ch_B> [ax:val ...] \\
                      <ch_C> [ax:val ...] <ch_D> [ax:val ...]
+    where ``yieldCorrection:0`` is the default; pass ``yieldCorrection:1`` to
+    enable the yield-level form.
 
     Python constructor:
         SmoothABCD(indata, "pt", "nonprompt",
@@ -57,6 +63,7 @@ class SmoothABCD(ParamModel):
         channel_C,
         channel_D,
         order=1,
+        yield_correction=False,
         **kwargs,
     ):
         """
@@ -66,9 +73,13 @@ class SmoothABCD(ParamModel):
             abcd_process: name of the background process (str).
             channel_A/B/C/D: dicts {ch_name: {axis_name: bin_idx, ...}}.
             order: polynomial degree in the exponent (default 1 = log-linear).
+            yield_correction: if True, multiply ``rnorm_D`` by ``mc_factor_D``
+                to enforce the ABCD relation on yields for arbitrary MC
+                templates. Default False.
         """
         self.indata = indata
         self.order = order
+        self.yield_correction = yield_correction
 
         # Validate process
         proc_name = (
@@ -236,13 +247,15 @@ class SmoothABCD(ParamModel):
         """Parse CLI arguments for SmoothABCD.
 
         Syntax:
-            --paramModel SmoothABCD <axis> [order:N] <process> \\
+            --paramModel SmoothABCD <axis> [order:N] [yieldCorrection:0|1] <process> \\
                          <ch_A> [ax:val ...] <ch_B> [ax:val ...] \\
                          <ch_C> [ax:val ...] <ch_D> [ax:val ...]
+        ``yieldCorrection`` defaults to 0 (no MC factor); pass
+        ``yieldCorrection:1`` to enable the yield-level form.
         """
         if len(args) < 6:
             raise ValueError(
-                "SmoothABCD expects: axis [order:N] process "
+                "SmoothABCD expects: axis [order:N] [yieldCorrection:0|1] process "
                 "ch_A [ax:val ...] ch_B [ax:val ...] ch_C [ax:val ...] ch_D [ax:val ...]"
             )
         tokens = list(args)
@@ -251,6 +264,10 @@ class SmoothABCD(ParamModel):
         order = 1
         if tokens and tokens[0].startswith("order:"):
             order = int(tokens.pop(0).split(":", 1)[1])
+
+        yield_correction = False
+        if tokens and tokens[0].startswith("yieldCorrection:"):
+            yield_correction = bool(int(tokens.pop(0).split(":", 1)[1]))
 
         if not tokens:
             raise ValueError("SmoothABCD: expected process name after axis/order")
@@ -286,6 +303,7 @@ class SmoothABCD(ParamModel):
             channel_C,
             channel_D,
             order=order,
+            yield_correction=yield_correction,
             **kwargs,
         )
 
@@ -317,7 +335,9 @@ class SmoothABCD(ParamModel):
         c_flat = tf.reshape(c, [-1])
 
         b_safe = tf.where(b_flat == 0.0, tf.ones_like(b_flat) * 1e-10, b_flat)
-        d_flat = a_flat * c_flat / b_safe * self.mc_factor_D
+        d_flat = a_flat * c_flat / b_safe
+        if self.yield_correction:
+            d_flat = d_flat * self.mc_factor_D
 
         nbins = self.indata.nbinsfull if full else self.indata.nbins
         rnorm = tf.ones([nbins, self.indata.nproc], dtype=self.indata.dtype)

@@ -180,6 +180,11 @@ def make_parser():
         action="store_true",
         help="Plot actual nuisance parameter value, by default nuisance parameter difference w.r.t. prefit value",
     )
+    parser.add_argument(
+        "--prefit",
+        action="store_true",
+        help="Make prefit impacts (only supported for mappings), else postfit",
+    )
     return parser
 
 
@@ -1278,6 +1283,7 @@ def main():
                     fitresult_ref, mapping_key_ref
                 )
 
+            fittype = "prefit" if args.prefit else "postfit"
             for channel, hists in channels.items():
                 if args.channel and channel not in args.channel:
                     continue
@@ -1286,11 +1292,11 @@ def main():
                 for mode in modes:
                     group = mode == "group"
 
-                    key = f"hist_postfit_inclusive_{impacts_name}"
+                    key = f"hist_{fittype}_inclusive_{impacts_name}"
                     if group:
                         key += "_grouped"
 
-                    hist_total = hists["hist_postfit_inclusive"].get()
+                    hist_total = hists[f"hist_{fittype}_inclusive"].get()
 
                     hist = hists[key].get()
 
@@ -1312,7 +1318,7 @@ def main():
                         hists_ref = res_ref[mapping_key_ref]["channels"][channel_ref]
 
                         hist_ref = hists_ref[key].get()
-                        hist_total_ref = hists_ref["hist_postfit_inclusive"].get()
+                        hist_total_ref = hists_ref[f"hist_{fittype}_inclusive"].get()
 
                     for idxs in itertools.product(
                         *[np.arange(a.size) for a in hist_total.axes]
@@ -1320,13 +1326,16 @@ def main():
                         ibin = {a: i for a, i in zip(hist_total.axes.name, idxs)}
                         print(f"Now at {ibin}")
 
-                        ibin_str = "_".join([f"{a}{i}" for a, i in ibin.items()])
+                        outfile_pieces = [impacts_name, fittype]
                         if group:
-                            outfile = f"{impacts_name}_grouped_{ibin_str}.html"
-                        else:
-                            outfile = f"{impacts_name}_{ibin_str}.html"
-                            if not args.noPulls:
-                                outfile = f"pulls_and_{outfile}"
+                            outfile_pieces.append("grouped")
+                        elif not args.noPulls:
+                            outfile_pieces.insert(0, "pulls_and")
+
+                        ibin_str = "_".join([f"{a}{i}" for a, i in ibin.items()])
+                        outfile_pieces.append(ibin_str)
+
+                        outfile = "_".join(outfile_pieces) + ".html"
 
                         produce_plots_hist(
                             args,

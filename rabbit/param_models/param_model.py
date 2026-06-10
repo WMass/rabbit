@@ -335,3 +335,565 @@ class SaturatedProjectModel(ParamModel):
         rnorm = tf.reshape(rnorm, [-1, 1])
 
         return rnorm
+
+
+class AxisNormModel(ParamModel):
+    """
+    One independent normalization parameter per (process, bin-combination) of a
+    caller-specified set of axes, within a named channel.  Each process in
+    proc_spec gets its own set of per-cell parameters; they are never shared
+    across processes.  All other channels and processes are left at scale factor 1.
+
+    Usage::
+
+        --paramModel AxisNormModel <channel> <proc_spec> <axes>
+
+    where proc_spec is ``all`` or a comma-separated list of process names,
+    and axes is a comma-separated list of axis names.
+
+    Example (btojpsik: independent per-cell norms for signal and flat bkg)::
+
+        --paramModel AxisNormModel btojpsik_stuff signal,flatBkg bkmm_kaon_pt,bkmm_kaon_eta,bkmm_kaon_charge
+    """
+
+    @classmethod
+    def parse_args(cls, indata, *args, **kwargs):
+        if len(args) != 3:
+            raise ValueError(
+                f"AxisNormModel requires exactly 3 positional arguments "
+                f"(channel, proc_spec, axes) but got {len(args)}: {args}"
+            )
+        channel, proc_spec, axes_csv = args
+        return cls(indata, channel, proc_spec, axes_csv, **kwargs)
+
+    def __init__(
+        self,
+        indata,
+        channel,
+        proc_spec,
+        axes_csv,
+        expectSignal=None,
+        allowNegativeParam=False,
+        **kwargs,
+    ):
+        self.indata = indata
+
+        if channel not in indata.channel_info:
+            raise ValueError(
+                f"Channel '{channel}' not found in tensor. "
+                f"Available: {list(indata.channel_info.keys())}"
+            )
+        self.channel = channel
+        axes = indata.channel_info[channel]["axes"]
+        axis_by_name = {a.name: a for a in axes}
+
+        requested_names = [n.strip() for n in axes_csv.split(",")]
+        for name in requested_names:
+            if name not in axis_by_name:
+                raise ValueError(
+                    f"Axis '{name}' not found in channel '{channel}'. "
+                    f"Available: {list(axis_by_name.keys())}"
+                )
+        self.requested_axis_names = set(requested_names)
+        self.requested_axes = [axis_by_name[n] for n in requested_names]
+
+        if proc_spec == "all":
+            target_encoded = list(indata.procs)
+        else:
+            target_encoded = []
+            for name in [p.strip() for p in proc_spec.split(",")]:
+                encoded = name.encode() if isinstance(name, str) else name
+                if encoded not in indata.procs:
+                    raise ValueError(
+                        f"Process '{name}' not found in tensor. "
+                        f"Available: {[p.decode() if isinstance(p, bytes) else p for p in indata.procs]}"
+                    )
+                target_encoded.append(encoded)
+        self.proc_idxs = [
+            int(np.where(indata.procs == p)[0][0]) for p in target_encoded
+        ]
+
+        cell_shape = [a.size for a in self.requested_axes]
+        self.n_cell = int(np.prod(cell_shape))
+        self.npoi = len(self.proc_idxs) * self.n_cell
+
+        names = []
+        for proc_encoded in target_encoded:
+            proc_name = (
+                proc_encoded.decode()
+                if isinstance(proc_encoded, bytes)
+                else str(proc_encoded)
+            )
+            for idxs in itertools.product(*[range(s) for s in cell_shape]):
+                label = "_".join(
+                    f"{a.name}{i}" for a, i in zip(self.requested_axes, idxs)
+                )
+                names.append(f"norm_{proc_name}_{label}".encode())
+        self.params = np.array(names)
+
+        self.npou = 0
+        # Enforce non-negativity via x^2 (commented out) or softplus (current) applied inside compute()
+        # so this works correctly whether called standalone or inside a composite.
+        # allowNegativeParam=True tells the fitter/composite to pass raw x through;
+        # the squaring is handled here. Default raw = sqrt(1) = 1 so norm starts at 1 (same true for softplus).
+        self.allowNegativeParam = True
+        self.is_linear = False
+        paramdefault = np.ones(self.npoi, dtype=np.float64)
+        if expectSignal is not None:
+            for signal, value in expectSignal:
+                encoded = signal.encode() if isinstance(signal, str) else signal
+                matches = np.where(np.isin(self.params, encoded))[0]
+                if len(matches) == 0:
+                    raise ValueError(f"{encoded} not in list of params: {self.params}")
+                paramdefault[matches[0]] = float(value)
+        # x^2
+        self.xparamdefault = tf.constant(np.sqrt(paramdefault), dtype=self.indata.dtype)
+        # softplus
+        _softplus_inv_1 = float(np.log(np.exp(1.0) - 1.0))
+        # self.xparamdefault = tf.constant(
+        #    _softplus_inv_1 * paramdefault, dtype=self.indata.dtype
+        # )
+
+    def compute(self, param, full=False):
+        reshape = [
+            a.size if a.name in self.requested_axis_names else 1
+            for a in self.indata.channel_info[self.channel]["axes"]
+        ]
+        shape_input = [a.size for a in self.indata.channel_info[self.channel]["axes"]]
+
+        rnorms = []
+        for k, v in self.indata.channel_info.items():
+            if v["masked"] and not full:
+                continue
+            nbins_channel = int(np.prod([a.size for a in v["axes"]]))
+            irnorm = tf.ones(
+                [nbins_channel, self.indata.nproc], dtype=self.indata.dtype
+            )
+            if k == self.channel:
+                for i, proc_idx in enumerate(self.proc_idxs):
+                    ipoi = param[i * self.n_cell : (i + 1) * self.n_cell]
+                    # x^2
+                    scaling = tf.reshape(
+                        tf.broadcast_to(
+                            tf.reshape(tf.square(ipoi), reshape), shape_input
+                        ),
+                        [-1, 1],
+                    )
+                    # softplus
+                    # scaling = tf.reshape(
+                    #    tf.broadcast_to(tf.reshape(tf.nn.softplus(ipoi), reshape), shape_input), [-1, 1]
+                    # )
+                    proc_col = tf.one_hot(
+                        proc_idx, self.indata.nproc, dtype=self.indata.dtype
+                    )
+                    irnorm = irnorm + (scaling - 1.0) * tf.reshape(proc_col, [1, -1])
+            rnorms.append(irnorm)
+
+        return tf.concat(rnorms, axis=0)
+
+
+class AxisExpModel(ParamModel):
+    """
+    Per-(process, cell) exponential background param model.
+
+    For each process in proc_spec and each bin of the cell axes, assigns two
+    independent parameters (lnAmpl, slope).  In compute() produces::
+
+        rnorm = exp(lnAmpl_ijk + slope_ijk · x_m)
+
+    where x_m is the normalized center of shape-axis bin m (range [0, 1]).
+    Both parameters are unconstrained reals (allowNegativeParam always True):
+      lnAmpl controls the per-cell log-amplitude (exp(lnAmpl) is the yield at x=0).
+      slope < 0 gives a falling exponential, slope = 0 is flat, slope > 0 is rising.
+    The flat-background case (slope = 0) is an interior point, so the Hessian is
+    non-degenerate there.  All other channels and processes are left at 1.0.
+
+    Usage::
+
+        --paramModel AxisExpModel <channel> <proc_spec> <shape_axis> <cell_axes>
+
+    Example::
+
+        --paramModel AxisExpModel btojpsik_stuff bkgExp \\
+            bkmm_jpsimc_mass \\
+            bkmm_kaon_pt,bkmm_kaon_eta,bkmm_kaon_charge
+    """
+
+    @classmethod
+    def parse_args(cls, indata, *args, **kwargs):
+        if len(args) not in (4, 5):
+            raise ValueError(
+                f"AxisExpModel requires 4 or 5 positional arguments "
+                f"(channel, proc_spec, shape_axis, cell_axes[, slope_axes]) "
+                f"but got {len(args)}: {args}"
+            )
+        channel, proc_spec, shape_axis, cell_axes_csv = args[:4]
+        slope_axes_csv = args[4] if len(args) == 5 else None
+        return cls(
+            indata,
+            channel,
+            proc_spec,
+            shape_axis,
+            cell_axes_csv,
+            slope_axes_csv=slope_axes_csv,
+            **kwargs,
+        )
+
+    def __init__(
+        self,
+        indata,
+        channel,
+        proc_spec,
+        shape_axis,
+        cell_axes_csv,
+        slope_axes_csv=None,
+        expectSignal=None,
+        allowNegativeParam=False,
+        **kwargs,
+    ):
+        self.indata = indata
+
+        if channel not in indata.channel_info:
+            raise ValueError(
+                f"Channel '{channel}' not found in tensor. "
+                f"Available: {list(indata.channel_info.keys())}"
+            )
+        self.channel = channel
+        channel_axes = indata.channel_info[channel]["axes"]
+        axis_by_name = {a.name: a for a in channel_axes}
+
+        if shape_axis not in axis_by_name:
+            raise ValueError(
+                f"Shape axis '{shape_axis}' not found in channel '{channel}'. "
+                f"Available: {list(axis_by_name.keys())}"
+            )
+
+        cell_names = [n.strip() for n in cell_axes_csv.split(",")]
+        for name in cell_names:
+            if name not in axis_by_name:
+                raise ValueError(
+                    f"Cell axis '{name}' not found in channel '{channel}'. "
+                    f"Available: {list(axis_by_name.keys())}"
+                )
+            if name == shape_axis:
+                raise ValueError(
+                    f"Axis '{name}' appears in both shape_axis and cell_axes."
+                )
+        self.cell_axis_names = set(cell_names)
+        self.cell_axes = [axis_by_name[n] for n in cell_names]
+        self.shape_axis = shape_axis
+
+        # Slope axes: subset of cell axes; default = all cell axes (per-cell slopes)
+        if slope_axes_csv is None:
+            slope_names = cell_names
+        else:
+            slope_names = [n.strip() for n in slope_axes_csv.split(",")]
+            bad = [n for n in slope_names if n not in self.cell_axis_names]
+            if bad:
+                raise ValueError(
+                    f"Slope axes {bad} are not in cell_axes '{cell_axes_csv}'. "
+                    f"Slope axes must be a subset of cell axes."
+                )
+        self.slope_axis_names = set(slope_names)
+        self.slope_axes = [axis_by_name[n] for n in slope_names]
+        slope_shape = [a.size for a in self.slope_axes]
+        self.n_slope_groups = int(np.prod(slope_shape))
+
+        if proc_spec == "all":
+            target_encoded = list(indata.procs)
+        else:
+            target_encoded = []
+            for name in [p.strip() for p in proc_spec.split(",")]:
+                encoded = name.encode() if isinstance(name, str) else name
+                if encoded not in indata.procs:
+                    raise ValueError(
+                        f"Process '{name}' not found in tensor. "
+                        f"Available: {[p.decode() if isinstance(p, bytes) else p for p in indata.procs]}"
+                    )
+                target_encoded.append(encoded)
+        self.proc_idxs = [
+            int(np.where(indata.procs == p)[0][0]) for p in target_encoded
+        ]
+
+        cell_shape = [a.size for a in self.cell_axes]
+        self.n_cell = int(np.prod(cell_shape))
+        self.npoi = len(self.proc_idxs) * (self.n_cell + self.n_slope_groups)
+
+        names = []
+        for proc_encoded in target_encoded:
+            proc_name = (
+                proc_encoded.decode()
+                if isinstance(proc_encoded, bytes)
+                else str(proc_encoded)
+            )
+            for idxs in itertools.product(*[range(s) for s in cell_shape]):
+                label = "_".join(f"{a.name}{i}" for a, i in zip(self.cell_axes, idxs))
+                names.append(f"lnAmpl_{proc_name}_{label}".encode())
+            for idxs in itertools.product(*[range(s) for s in slope_shape]):
+                label = "_".join(f"{a.name}{i}" for a, i in zip(self.slope_axes, idxs))
+                names.append(f"slope_{proc_name}_{label}".encode())
+        self.params = np.array(names)
+
+        # Normalized shape-axis bin centers in [0, 1]
+        centers = np.asarray(axis_by_name[shape_axis].centers, dtype=np.float32)
+        span = max(float(centers[-1] - centers[0]), 1e-6)
+        x_m = (centers - centers[0]) / span
+        self.x_m = tf.constant(x_m, dtype=indata.dtype)
+
+        # Reshape helpers built from channel axis ordering
+        full_shape = [a.size for a in channel_axes]
+        self.full_shape = full_shape
+        self.cell_reshape = [
+            a.size if a.name in self.cell_axis_names else 1 for a in channel_axes
+        ]
+        self.slope_cell_reshape = [
+            a.size if a.name in self.slope_axis_names else 1 for a in channel_axes
+        ]
+        self.shape_reshape = [
+            a.size if a.name == shape_axis else 1 for a in channel_axes
+        ]
+
+        # Always unconstrained: exp(lnAmpl + slope*x) is positive for any real (lnAmpl, slope).
+        self.npou = 0
+        self.allowNegativeParam = True
+        self.is_linear = False
+        # Default: lnAmpl=0 → amplitude=1, slope=0 → flat shape.
+        self.xparamdefault = tf.zeros([self.npoi], dtype=indata.dtype)
+
+    def compute(self, param, full=False):
+        x_reshaped = tf.reshape(self.x_m, self.shape_reshape)
+
+        rnorms = []
+        for k, v in self.indata.channel_info.items():
+            if v["masked"] and not full:
+                continue
+            nbins_channel = int(np.prod([a.size for a in v["axes"]]))
+            irnorm = tf.ones(
+                [nbins_channel, self.indata.nproc], dtype=self.indata.dtype
+            )
+            if k == self.channel:
+                for i, proc_idx in enumerate(self.proc_idxs):
+                    stride = self.n_cell + self.n_slope_groups
+                    a_poi = param[i * stride : i * stride + self.n_cell]
+                    b_poi = param[i * stride + self.n_cell : (i + 1) * stride]
+                    a = tf.reshape(a_poi, self.cell_reshape)
+                    b = tf.reshape(b_poi, self.slope_cell_reshape)
+                    scaling = tf.reshape(
+                        tf.broadcast_to(tf.exp(a + b * x_reshaped), self.full_shape),
+                        [-1, 1],
+                    )
+                    proc_col = tf.one_hot(
+                        proc_idx, self.indata.nproc, dtype=self.indata.dtype
+                    )
+                    irnorm = irnorm + (scaling - 1.0) * tf.reshape(proc_col, [1, -1])
+            rnorms.append(irnorm)
+
+        return tf.concat(rnorms, axis=0)
+
+
+class AxisBernsteinModel(ParamModel):
+    """
+    Per-(process, cell) first-order Bernstein background param model.
+
+    For each process in proc_spec and each cell, assigns two non-negative
+    parameters (c0, c1).  In compute() produces::
+
+        rnorm(x_m) = c0 · (1 − x_m) + c1 · x_m
+
+    where x_m is the normalized center of shape-axis bin m (range [0, 1]).
+    c0 is the relative rate at the low edge of the mass window; c1 at the high
+    edge.  Non-negativity is enforced via softplus applied inside compute().
+    Default c0=c1=1 gives a flat unit background.
+    All other channels and processes are left at 1.0.
+
+    Usage::
+
+        --paramModel AxisBernsteinModel <channel> <proc_spec> <shape_axis> <cell_axes>
+
+    Example::
+
+        --paramModel AxisBernsteinModel btojpsik_stuff bkgBernstein \\
+            bkmm_jpsimc_mass \\
+            bkmm_kaon_pt,bkmm_kaon_eta,bkmm_kaon_charge
+    """
+
+    @classmethod
+    def parse_args(cls, indata, *args, **kwargs):
+        if len(args) != 4:
+            raise ValueError(
+                f"AxisBernsteinModel requires exactly 4 positional arguments "
+                f"(channel, proc_spec, shape_axis, cell_axes) but got {len(args)}: {args}"
+            )
+        channel, proc_spec, shape_axis, cell_axes_csv = args
+        return cls(indata, channel, proc_spec, shape_axis, cell_axes_csv, **kwargs)
+
+    def __init__(
+        self,
+        indata,
+        channel,
+        proc_spec,
+        shape_axis,
+        cell_axes_csv,
+        expectSignal=None,
+        allowNegativeParam=False,
+        **kwargs,
+    ):
+        self.indata = indata
+
+        if channel not in indata.channel_info:
+            raise ValueError(
+                f"Channel '{channel}' not found in tensor. "
+                f"Available: {list(indata.channel_info.keys())}"
+            )
+        self.channel = channel
+        channel_axes = indata.channel_info[channel]["axes"]
+        axis_by_name = {a.name: a for a in channel_axes}
+
+        if shape_axis not in axis_by_name:
+            raise ValueError(
+                f"Shape axis '{shape_axis}' not found in channel '{channel}'. "
+                f"Available: {list(axis_by_name.keys())}"
+            )
+
+        cell_names = [n.strip() for n in cell_axes_csv.split(",")]
+        for name in cell_names:
+            if name not in axis_by_name:
+                raise ValueError(
+                    f"Cell axis '{name}' not found in channel '{channel}'. "
+                    f"Available: {list(axis_by_name.keys())}"
+                )
+            if name == shape_axis:
+                raise ValueError(
+                    f"Axis '{name}' appears in both shape_axis and cell_axes."
+                )
+        self.cell_axis_names = set(cell_names)
+        self.cell_axes = [axis_by_name[n] for n in cell_names]
+        self.shape_axis = shape_axis
+
+        if proc_spec == "all":
+            target_encoded = list(indata.procs)
+        else:
+            target_encoded = []
+            for name in [p.strip() for p in proc_spec.split(",")]:
+                encoded = name.encode() if isinstance(name, str) else name
+                if encoded not in indata.procs:
+                    raise ValueError(
+                        f"Process '{name}' not found in tensor. "
+                        f"Available: {[p.decode() if isinstance(p, bytes) else p for p in indata.procs]}"
+                    )
+                target_encoded.append(encoded)
+        self.proc_idxs = [
+            int(np.where(indata.procs == p)[0][0]) for p in target_encoded
+        ]
+
+        cell_shape = [a.size for a in self.cell_axes]
+        self.n_cell = int(np.prod(cell_shape))
+        self.npoi = len(self.proc_idxs) * 2 * self.n_cell
+
+        names = []
+        for proc_encoded in target_encoded:
+            proc_name = (
+                proc_encoded.decode()
+                if isinstance(proc_encoded, bytes)
+                else str(proc_encoded)
+            )
+            # nominal: independent softplus endpoints
+            for prefix in ("c0", "c1"):
+                # alternative (lnAmpl+frac): decouples amplitude from shape, avoids 2D null space
+                # for prefix in ("lnAmpl", "frac"):
+                for idxs in itertools.product(*[range(s) for s in cell_shape]):
+                    label = "_".join(
+                        f"{a.name}{i}" for a, i in zip(self.cell_axes, idxs)
+                    )
+                    names.append(f"{prefix}_{proc_name}_{label}".encode())
+        self.params = np.array(names)
+
+        # Normalized shape-axis bin centers in [0, 1]
+        centers = np.asarray(axis_by_name[shape_axis].centers, dtype=np.float32)
+        span = max(float(centers[-1] - centers[0]), 1e-6)
+        x_m = (centers - centers[0]) / span
+        self.x_m = tf.constant(x_m, dtype=indata.dtype)
+
+        # Reshape helpers built from channel axis ordering
+        full_shape = [a.size for a in channel_axes]
+        self.full_shape = full_shape
+        self.cell_reshape = [
+            a.size if a.name in self.cell_axis_names else 1 for a in channel_axes
+        ]
+        self.shape_reshape = [
+            a.size if a.name == shape_axis else 1 for a in channel_axes
+        ]
+
+        # Non-negativity via softplus inside compute(); allowNegativeParam=True
+        # so the fitter passes raw params through and squaring is not applied.
+        # Default raw = softplus_inv(1) ≈ 0.5413 so c0=c1=1 (flat unit background).
+        self.npou = 0
+        self.allowNegativeParam = True
+        self.is_linear = False
+        if expectSignal is not None:
+            raise ValueError(
+                "AxisBernsteinModel does not support expectSignal; "
+                "set initial Bernstein coefficients via --expectSignal on another model."
+            )
+        # nominal: softplus_inv(1) so c0=c1=1 at init (flat unit background)
+        _softplus_inv_1 = float(np.log(np.exp(1.0) - 1.0))  # ≈ 0.5413
+        self.xparamdefault = tf.constant(
+            _softplus_inv_1 * np.ones(self.npoi), dtype=self.indata.dtype
+        )
+        # alternative (lnAmpl+frac): lnAmpl=0, frac=0 → flat unit background
+        # self.xparamdefault = tf.constant(
+        #     np.zeros(self.npoi), dtype=self.indata.dtype
+        # )
+
+    def compute(self, param, full=False):
+        x_reshaped = tf.reshape(self.x_m, self.shape_reshape)
+
+        rnorms = []
+        for k, v in self.indata.channel_info.items():
+            if v["masked"] and not full:
+                continue
+            nbins_channel = int(np.prod([a.size for a in v["axes"]]))
+            irnorm = tf.ones(
+                [nbins_channel, self.indata.nproc], dtype=self.indata.dtype
+            )
+            if k == self.channel:
+                for i, proc_idx in enumerate(self.proc_idxs):
+                    # nominal: independent softplus endpoints
+                    c0_poi = param[
+                        i * 2 * self.n_cell : i * 2 * self.n_cell + self.n_cell
+                    ]
+                    c1_poi = param[
+                        i * 2 * self.n_cell + self.n_cell : (i + 1) * 2 * self.n_cell
+                    ]
+                    c0 = tf.reshape(tf.nn.softplus(c0_poi), self.cell_reshape)
+                    c1 = tf.reshape(tf.nn.softplus(c1_poi), self.cell_reshape)
+                    scaling = tf.reshape(
+                        tf.broadcast_to(
+                            c0 * (1.0 - x_reshaped) + c1 * x_reshaped,
+                            self.full_shape,
+                        ),
+                        [-1, 1],
+                    )
+                    # alternative (lnAmpl+frac): amplitude decoupled from shape;
+                    # 1D null space per empty cell instead of 2D, better-conditioned Hessian
+                    # lnAmpl_poi = param[i * 2 * self.n_cell : i * 2 * self.n_cell + self.n_cell]
+                    # frac_poi = param[i * 2 * self.n_cell + self.n_cell : (i + 1) * 2 * self.n_cell]
+                    # lnAmpl = tf.reshape(lnAmpl_poi, self.cell_reshape)
+                    # frac = tf.reshape(frac_poi, self.cell_reshape)
+                    # scaling = tf.reshape(
+                    #     tf.broadcast_to(
+                    #         2.0 * tf.exp(lnAmpl) * (
+                    #             tf.sigmoid(frac) * (1.0 - x_reshaped)
+                    #             + tf.sigmoid(-frac) * x_reshaped
+                    #         ),
+                    #         self.full_shape,
+                    #     ),
+                    #     [-1, 1],
+                    # )
+                    proc_col = tf.one_hot(
+                        proc_idx, self.indata.nproc, dtype=self.indata.dtype
+                    )
+                    irnorm = irnorm + (scaling - 1.0) * tf.reshape(proc_col, [1, -1])
+            rnorms.append(irnorm)
+
+        return tf.concat(rnorms, axis=0)

@@ -5,6 +5,9 @@ baseline_models = {
     "Ones": "param_model",
     "Mu": "param_model",
     "Mixture": "param_model",
+    "AxisNormModel": "param_model",
+    "AxisExpModel": "param_model",
+    "AxisBernsteinModel": "param_model",
     "ABCD": "abcd_model",
     "ExtendedABCD": "extended_abcd_model",
     "SmoothABCD": "smooth_abcd_model",
@@ -36,6 +39,5 @@ def load_models(model_specs, indata, **kwargs):
     models = [load_model(spec[0], indata, *spec[1:], **kwargs) for spec in model_specs]
     if len(models) == 1:
         return models[0]
-    return CompositeParamModel(
-        models, allowNegativeParam=kwargs.get("allowNegativeParam", False)
-    )
+    allow_neg = any(getattr(m, "allowNegativeParam", False) for m in models)
+    return CompositeParamModel(models, allowNegativeParam=allow_neg)

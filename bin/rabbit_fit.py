@@ -575,6 +575,7 @@ def fit(args, fitter, ws, dofit=True):
         # usually would have been done during the minimization
         if fitter.binByBinStat and not args.noPostfitProfileBB:
             _t_bb = time.perf_counter()
+            logger.info(f"profile beta")
             fitter._profile_beta()
             logger.debug(f"[timing] _profile_beta(): {time.perf_counter() - _t_bb:.1f} s")
 
@@ -590,7 +591,7 @@ def fit(args, fitter, ws, dofit=True):
     # prefit variances as the default fallback for add_parms_hist below
     parms_variances = None
 
-    if not args.noHessian:
+    if not args.noEDM and not args.noHessian:
         # compute the covariance matrix and estimated distance to minimum
         _, grad, hess = fitter.loss_val_grad_hess()
         edmval, cov = fitter.edmval_cov(grad, hess)
@@ -601,7 +602,7 @@ def fit(args, fitter, ws, dofit=True):
         fitter.cov.assign(cov)
         del cov
 
-        if fitter.binByBinStat and fitter.diagnostics:
+        if fitter.bbstat.enabled and fitter.diagnostics:
             # This is the estimated distance to minimum with respect to variations of
             # the implicit binByBinStat nuisances beta at fixed parameter values.
             # It should be near-zero by construction as long as the analytic profiling is
@@ -630,13 +631,25 @@ def fit(args, fitter, ws, dofit=True):
             )
 
         parms_variances = tf.linalg.diag_part(fitter.cov)
-    else:
+    elif not args.noEDM:
         # --noHessian: avoid the full dense Hessian. Still compute edmval
         # and the POI+NOI uncertainties via a Hessian-free conjugate
         # gradient solve of H @ v = grad and H @ c_i = e_i, using only
         # Hessian-vector products. The CG solves touch O(npar) memory
         # per call instead of O(npar^2), so this works on problems
         # where the full covariance would be infeasible.
+
+        _, grad = fitter.loss_val_grad()
+        npoi = int(fitter.param_model.npoi)
+        noi_idx_in_x = np.asarray(fitter.indata.noiidxs, dtype=np.int64) + npoi
+        poi_noi_idx = np.concatenate([np.arange(npoi, dtype=np.int64), noi_idx_in_x])
+        edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)
+        logger.info(f"edmval: {edmval}")
+
+        # Build a full-length variance vector with the POI+NOI entries
+        # populated from the diagonal of the CG-solved rows and the rest
+        # left as NaN (we did not compute those). add_parms_hist stores
+        # the vector verbatim into the workspace.
         n = int(fitter.x.shape[0])
         if getattr(args, "noEDM", False):
             logger.debug("[timing] --noEDM set: skipping Hessian-free EDM/CG step")
@@ -848,8 +861,6 @@ def main():
             _incompat.append("--computeHistImpacts")
         if args.computeHistGaussianImpacts:
             _incompat.append("--computeHistGaussianImpacts")
-        if args.externalPostfit is not None:
-            _incompat.append("--externalPostfit")
         if _incompat:
             raise Exception("--noHessian is incompatible with: " + ", ".join(_incompat))
 

@@ -73,6 +73,10 @@ def plot_scan(
     x = np.array(h_scan.axes["scan"]).astype(float)[mask]
     y = h_scan.values()[mask] * 2
 
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
     if xlim is None:
         xlim = (min(x), max(x))
     if ylim is None:

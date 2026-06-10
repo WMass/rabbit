@@ -87,16 +87,30 @@ class ABCD(ParamModel):
     ABCD background estimation model.
 
     Defines free parameters a_i, b_i, c_i for regions A, B, C per bin.
-    Region D (signal region) is derived: D_i = a_i * c_i / b_i * mc_factor_D_i,
-    where mc_factor_D_i = N_A^MC * N_C^MC / (N_B^MC * N_D^MC) accounts for
-    non-unity MC templates.
+    Region D (signal region) is derived from the ABCD relation. The
+    relation can be enforced at two levels:
+
+    - rnorm-level (default, ``yield_correction=False``):
+        ``rnorm_D = a · c / b``. Relation on yields then holds only when
+        ``norm_A · norm_C = norm_B · norm_D`` (e.g. all four MC templates
+        share the same per-bin shape, which is the typical case when the
+        regions are different bin-slices of the same channel).
+    - yield-level (``yield_correction=True``):
+        ``rnorm_D = (a · c / b) · mc_factor_D`` with
+        ``mc_factor_D = norm_A · norm_C / (norm_B · norm_D)``. This makes
+        ``nexp_A · nexp_C = nexp_B · nexp_D`` hold for arbitrary MC
+        templates, at the cost of folding the MC shape difference between
+        regions into the parametrisation.
 
     Parameters are pure model nuisances (npoi=0, npou=3*n_bins). Positivity
     is enforced inside compute() via tf.square() on the raw fit variables.
 
     CLI syntax:
-        --paramModel ABCD <process> <ch_A> [ax:val ...] <ch_B> [ax:val ...] \\
+        --paramModel ABCD [yieldCorrection:0] <process> \\
+                          <ch_A> [ax:val ...] <ch_B> [ax:val ...] \\
                           <ch_C> [ax:val ...] <ch_D> [ax:val ...]
+    where ``yieldCorrection:0`` is the default (no MC factor); pass
+    ``yieldCorrection:1`` to enable the yield-level form.
 
     Python constructor:
         ABCD(indata, "nonprompt",
@@ -114,6 +128,7 @@ class ABCD(ParamModel):
         channel_B,
         channel_C,
         channel_D,
+        yield_correction=False,
         **kwargs,
     ):
         """
@@ -122,8 +137,12 @@ class ABCD(ParamModel):
             abcd_process: name of the background process to apply ABCD to (str).
             channel_A/B/C/D: dicts {ch_name: {axis_name: bin_idx, ...}} defining
                 each ABCD region. An empty inner dict selects all bins of the channel.
+            yield_correction: if True, multiply ``rnorm_D`` by ``mc_factor_D`` to
+                enforce the ABCD relation on yields for arbitrary MC templates.
+                Default False.
         """
         self.indata = indata
+        self.yield_correction = yield_correction
 
         # Validate process
         proc_name = (
@@ -206,18 +225,26 @@ class ABCD(ParamModel):
         """Parse CLI arguments for ABCDModel.
 
         Syntax:
-            --paramModel ABCD <process> <ch_A> [ax:val ...] <ch_B> [ax:val ...] \\
+            --paramModel ABCD [yieldCorrection:0|1] <process> \\
+                              <ch_A> [ax:val ...] <ch_B> [ax:val ...] \\
                               <ch_C> [ax:val ...] <ch_D> [ax:val ...]
 
         Each channel name is followed by zero or more axis:value pairs.
-        Axis values are integers.
+        Axis values are integers. ``yieldCorrection`` defaults to 0 (no MC
+        factor); pass ``yieldCorrection:1`` to enable the yield-level form.
         """
         if len(args) < 5:
             raise ValueError(
-                "ABCDModel expects: process ch_A [ax:val ...] ch_B [ax:val ...] "
+                "ABCDModel expects: [yieldCorrection:0|1] process "
+                "ch_A [ax:val ...] ch_B [ax:val ...] "
                 "ch_C [ax:val ...] ch_D [ax:val ...]"
             )
         tokens = list(args)
+
+        yield_correction = False
+        if tokens and tokens[0].startswith("yieldCorrection:"):
+            yield_correction = bool(int(tokens.pop(0).split(":", 1)[1]))
+
         process = tokens.pop(0)
 
         def _parse_one_region(tokens, region_name):
@@ -242,7 +269,14 @@ class ABCD(ParamModel):
             raise ValueError(f"Unexpected extra arguments after channel_D: {tokens}")
 
         return cls(
-            indata, process, channel_A, channel_B, channel_C, channel_D, **kwargs
+            indata,
+            process,
+            channel_A,
+            channel_B,
+            channel_C,
+            channel_D,
+            yield_correction=yield_correction,
+            **kwargs,
         )
 
     def compute(self, param, full=False):
@@ -264,7 +298,9 @@ class ABCD(ParamModel):
         c = tf.square(param[2 * n :])
 
         b_safe = tf.where(b == 0.0, tf.ones_like(b) * 1e-10, b)
-        d = a * c / b_safe * self.mc_factor_D
+        d = a * c / b_safe
+        if self.yield_correction:
+            d = d * self.mc_factor_D
 
         nbins = self.indata.nbinsfull if full else self.indata.nbins
         rnorm = tf.ones([nbins, self.indata.nproc], dtype=self.indata.dtype)

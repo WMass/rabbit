@@ -72,14 +72,14 @@ class Workspace:
         ]
         self.grouped_impact_axis = getGroupedImpactsAxes(
             fitter.indata,
-            bin_by_bin_stat=fitter.binByBinStat,
+            bin_by_bin_stat=fitter.bbstat.enabled,
             per_process=False,
             extra_groups=param_impact_group_names,
         )
         self.grouped_global_impact_axis = getGroupedImpactsAxes(
             fitter.indata,
-            bin_by_bin_stat=fitter.binByBinStat,
-            per_process=fitter.binByBinStatMode == "full",
+            bin_by_bin_stat=fitter.bbstat.enabled,
+            per_process=fitter.bbstat.binByBinStatMode == "full",
         )
 
         self.extension = "hdf5"
