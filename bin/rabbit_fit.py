@@ -434,24 +434,41 @@ def fit(args, fitter, ws, dofit=True):
         ws.add_1D_integer_hist([max_curvature], "best", "lcurve")
 
     if dofit:
+        _t_min = time.perf_counter()
         cb = fitter.minimize()
+        logger.debug(
+            f"[timing] fitter.minimize(): {time.perf_counter() - _t_min:.1f} s"
+        )
 
         # force profiling of beta with final parameter values
         # TODO avoid the extra calculation and jitting if possible since the relevant calculation
         # usually would have been done during the minimization
         if fitter.bbstat.enabled and not args.noPostfitProfileBB:
+            _t_bb = time.perf_counter()
             logger.info(f"profile beta")
             fitter._profile_beta()
+            logger.debug(
+                f"[timing] _profile_beta(): {time.perf_counter() - _t_bb:.1f} s"
+            )
 
         if cb is not None:
             ws.add_1D_integer_hist(cb.loss_history, "epoch", "loss")
             ws.add_1D_integer_hist(cb.time_history, "epoch", "time")
+            try:
+                n_iter = len(cb.loss_history)
+                logger.debug(f"[timing] L-BFGS: {n_iter} epochs recorded")
+            except Exception:
+                pass
 
     # prefit variances as the default fallback for add_parms_hist below
     parms_variances = None
 
-    # take covariance from externalPostfit in case the fit was skipped
-    if dofit or args.externalPostfit is None:
+    # take covariance from externalPostfit in case the fit was skipped —
+    # unless a Hessian is explicitly wanted (no --noHessian): the two-pass
+    # straight-through covariance recipe (--externalPostfit ... --noFit,
+    # WITHOUT --noHessian) relies on recomputing the Hessian at the loaded
+    # postfit point.
+    if dofit or args.externalPostfit is None or not args.noHessian:
         if not args.noEDM and not args.noHessian:
             # compute the covariance matrix and estimated distance to minimum
             _, grad, hess = fitter.loss_val_grad_hess()
@@ -499,13 +516,26 @@ def fit(args, fitter, ws, dofit=True):
             # Hessian-vector products. The CG solves touch O(npar) memory
             # per call instead of O(npar^2), so this works on problems
             # where the full covariance would be infeasible.
+            _t_lg = time.perf_counter()
             _, grad = fitter.loss_val_grad()
+            logger.debug(
+                f"[timing] loss_val_grad() (postfit): {time.perf_counter() - _t_lg:.1f} s"
+            )
+
             npoi = int(fitter.param_model.npoi)
             noi_idx_in_x = np.asarray(fitter.indata.noiidxs, dtype=np.int64) + npoi
             poi_noi_idx = np.concatenate(
                 [np.arange(npoi, dtype=np.int64), noi_idx_in_x]
             )
+            logger.debug(
+                f"[timing] EDM CG: solving for {len(poi_noi_idx)} POI+NOI rows"
+            )
+
+            _t_edm = time.perf_counter()
             edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)
+            logger.debug(
+                f"[timing] edmval_cov_rows_hessfree(): {time.perf_counter() - _t_edm:.1f} s"
+            )
             logger.info(f"edmval: {edmval}")
 
             # Build a full-length variance vector with the POI+NOI entries
@@ -748,6 +778,19 @@ def main():
             for j, (data_values, data_variances) in enumerate(datasets):
 
                 ifitter.defaultassign()
+                # If --externalPostfit was supplied AND this is an
+                # asimov toy (-t -1), load the postfit values BEFORE we
+                # compute the expected yield. Otherwise expected_yield()
+                # below is evaluated at the prefit point (because
+                # defaultassign() just reset x), so we'd get a
+                # prefit-Asimov regardless of --externalPostfit. The
+                # in-fit() load (around line 551) then re-runs harmlessly.
+                if ifit == -1 and args.externalPostfit is not None:
+                    ifitter.load_fitresult(
+                        args.externalPostfit,
+                        args.externalPostfitResult,
+                        profile=not args.noPostfitProfileBB,
+                    )
                 if ifit == -1:
                     group.append("asimov")
                     ifitter.set_nobs(ifitter.expected_yield())

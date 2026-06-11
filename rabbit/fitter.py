@@ -54,7 +54,14 @@ class FitterCallback:
     def __call__(self, intermediate_result):
         loss = intermediate_result.fun
 
-        logger.debug(f"Iteration {self.iiter}: loss value {loss}")
+        elapsed = time.time() - self.t0
+        prev = self.time_history[-1] if self.time_history else 0.0
+        dt = elapsed - prev
+
+        logger.debug(
+            f"Iteration {self.iiter}: loss {loss}  "
+            f"[dt={dt:.2f}s elapsed={elapsed:.2f}s]"
+        )
         if np.isnan(loss):
             raise ValueError(f"Loss value is NaN at iteration {self.iiter}")
 
@@ -68,7 +75,7 @@ class FitterCallback:
             )
 
         self.loss_history.append(loss)
-        self.time_history.append(time.time() - self.t0)
+        self.time_history.append(elapsed)
 
         self.xval = intermediate_result.x
         self.iiter += 1
@@ -92,6 +99,12 @@ class Fitter:
 
         self.diagnostics = options.diagnostics
         self.minimizer_method = options.minimizerMethod
+        # Optional scipy.optimize.minimize tolerances. None entries are
+        # skipped at call site so each method falls back to scipy defaults
+        # for what's not set.
+        self.minimizer_maxiter = getattr(options, "minimizerMaxiter", None)
+        self.minimizer_gtol = getattr(options, "minimizerGtol", None)
+        self.minimizer_ftol = getattr(options, "minimizerFtol", None)
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
         # jitCompile accepts "auto" (the default), "on", or "off".
         # True / False from programmatic callers are accepted as
@@ -1862,6 +1875,21 @@ class Fitter:
         else:
             info_minimize = dict()
 
+        # Build scipy.optimize.minimize options from --minimizerMaxiter/
+        # --minimizerGtol/--minimizerFtol. Anything not set explicitly falls
+        # back to the historical tol=0.0 baseline below (run to the tightest
+        # internal criteria), since `tol` only fills options keys that are not
+        # already present. Methods that don't recognize an option ignore it
+        # with an OptimizeWarning (no crash).
+        sci_opts = {}
+        if self.minimizer_maxiter is not None:
+            sci_opts["maxiter"] = int(self.minimizer_maxiter)
+        if self.minimizer_gtol is not None:
+            sci_opts["gtol"] = float(self.minimizer_gtol)
+        if self.minimizer_ftol is not None:
+            sci_opts["ftol"] = float(self.minimizer_ftol)
+        logger.info(f"[minimize] method={self.minimizer_method} options={sci_opts}")
+
         try:
             res = scipy.optimize.minimize(
                 scipy_loss,
@@ -1870,6 +1898,7 @@ class Fitter:
                 jac=True,
                 tol=0.0,
                 callback=callback,
+                options=sci_opts,
                 **info_minimize,
             )
         except Exception as ex:

@@ -244,7 +244,33 @@ def common_parser():
         "--noEDM",
         default=False,
         action="store_true",
-        help="Don't compute the estimated distance to minimum as fit quality evaluation",
+        help="Skip the Hessian-free EDM/CG postfit step (only meaningful with "
+        "--noHessian). Skips both the edmval estimate and the POI+NOI "
+        "uncertainty rows; their entries in the output are NaN.",
+    )
+    parser.add_argument(
+        "--minimizerMaxiter",
+        type=int,
+        default=None,
+        help="Cap the number of scipy.optimize.minimize iterations. "
+        "Passed as options={'maxiter': N} to the minimizer. None (default) "
+        "uses scipy's method-specific default (typically 1000+).",
+    )
+    parser.add_argument(
+        "--minimizerGtol",
+        type=float,
+        default=None,
+        help="Gradient-norm tolerance for the minimizer. Passed as "
+        "options={'gtol': X} (recognized by trust-krylov, L-BFGS-B, BFGS, CG). "
+        "None (default) uses scipy's per-method default.",
+    )
+    parser.add_argument(
+        "--minimizerFtol",
+        type=float,
+        default=None,
+        help="Function-value tolerance for the minimizer (L-BFGS-B only). "
+        "Passed as options={'ftol': X}. None (default) uses scipy's default "
+        "(2.22e-9 for L-BFGS-B). Ignored by methods that don't honor 'ftol'.",
     )
     parser.add_argument(
         "--forceLinear",
