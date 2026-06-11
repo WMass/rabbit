@@ -282,7 +282,6 @@ def common_parser():
         help="Function-value tolerance for the minimizer (L-BFGS-B only). "
         "Passed as options={'ftol': X}. None (default) uses scipy's default "
         "(2.22e-9 for L-BFGS-B). Ignored by methods that don't honor 'ftol'.",
-        help="Don't compute the estimated distance to minimum as fit quality evaluation",
     )
     parser.add_argument(
         "--forceLinear",
