@@ -568,7 +568,9 @@ def fit(args, fitter, ws, dofit=True):
     if dofit:
         _t_min = time.perf_counter()
         cb = fitter.minimize()
-        logger.debug(f"[timing] fitter.minimize(): {time.perf_counter() - _t_min:.1f} s")
+        logger.debug(
+            f"[timing] fitter.minimize(): {time.perf_counter() - _t_min:.1f} s"
+        )
 
         # force profiling of beta with final parameter values
         # TODO avoid the extra calculation and jitting if possible since the relevant calculation
@@ -577,7 +579,9 @@ def fit(args, fitter, ws, dofit=True):
             _t_bb = time.perf_counter()
             logger.info(f"profile beta")
             fitter._profile_beta()
-            logger.debug(f"[timing] _profile_beta(): {time.perf_counter() - _t_bb:.1f} s")
+            logger.debug(
+                f"[timing] _profile_beta(): {time.perf_counter() - _t_bb:.1f} s"
+            )
 
         if cb is not None:
             ws.add_1D_integer_hist(cb.loss_history, "epoch", "loss")
@@ -922,10 +926,10 @@ def main():
     # can see what was applied without parsing the rabbit log.
     if getattr(ifitter, "param_prior_active", False):
         meta["param_priors"] = {
-            "params": ifitter.param_model.params,           # all nparams names
-            "mask":   ifitter.param_prior_mask_np,          # bool array
-            "sigmas": ifitter.param_prior_sigmas_np,        # NaN where mask False
-            "means":  ifitter.param_prior_means_np,         # NaN where mask False
+            "params": ifitter.param_model.params,  # all nparams names
+            "mask": ifitter.param_prior_mask_np,  # bool array
+            "sigmas": ifitter.param_prior_sigmas_np,  # NaN where mask False
+            "means": ifitter.param_prior_means_np,  # NaN where mask False
         }
 
     with workspace.Workspace(

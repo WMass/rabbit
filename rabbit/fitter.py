@@ -41,7 +41,9 @@ def match_regexp_params(regular_expressions, parameter_names):
     seen = set()
     for s in parameter_names:
         decoded = s.decode() if hasattr(s, "decode") else s
-        if decoded in exact_lookup or any(r.match(decoded) for r in compiled_expressions):
+        if decoded in exact_lookup or any(
+            r.match(decoded) for r in compiled_expressions
+        ):
             if decoded not in seen:
                 seen.add(decoded)
                 matched.append(s)
@@ -112,8 +114,8 @@ class Fitter:
         # skipped at call site so each method falls back to scipy defaults
         # for what's not set.
         self.minimizer_maxiter = getattr(options, "minimizerMaxiter", None)
-        self.minimizer_gtol    = getattr(options, "minimizerGtol",    None)
-        self.minimizer_ftol    = getattr(options, "minimizerFtol",    None)
+        self.minimizer_gtol = getattr(options, "minimizerGtol", None)
+        self.minimizer_ftol = getattr(options, "minimizerFtol", None)
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
         # jitCompile accepts "auto" (the default), "on", or "off".
         # True / False from programmatic callers are accepted as
@@ -375,8 +377,10 @@ class Fitter:
                     self.param_prior_sigmas_np = np.where(mask, sigmas, np.nan)
                     self.param_prior_means_np = np.where(mask, means, np.nan)
                     inv2_np = np.where(mask, 1.0 / sigmas**2, 0.0)
-                    self.param_prior_mask  = tf.constant(mask, dtype=tf.bool)
-                    self.param_prior_inv2  = tf.constant(inv2_np, dtype=self.indata.dtype)
+                    self.param_prior_mask = tf.constant(mask, dtype=tf.bool)
+                    self.param_prior_inv2 = tf.constant(
+                        inv2_np, dtype=self.indata.dtype
+                    )
                     self.param_prior_means = tf.constant(
                         np.where(mask, means, 0.0), dtype=self.indata.dtype
                     )
@@ -391,7 +395,9 @@ class Fitter:
                     for i, p in enumerate(pm.params):
                         if mask[i]:
                             name = p.decode() if isinstance(p, bytes) else str(p)
-                            logger.info(f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}")
+                            logger.info(
+                                f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}"
+                            )
                 else:
                     logger.info(
                         "[paramPriors] --paramModelPriors set but prior_sigmas "
@@ -1950,11 +1956,11 @@ class Fitter:
         # Per-entry mask is baked into param_prior_inv2 (zero where mask is
         # False), so this is a single elementwise op with no branching.
         if self.param_prior_active:
-            pm_params = tf.concat(
-                [self.get_poi(), self.get_model_nui()], axis=0
-            )
-            lc_pm = 0.5 * self.param_prior_inv2 * tf.square(
-                pm_params - self.param_prior_means
+            pm_params = tf.concat([self.get_poi(), self.get_model_nui()], axis=0)
+            lc_pm = (
+                0.5
+                * self.param_prior_inv2
+                * tf.square(pm_params - self.param_prior_means)
             )
             if full_nll:
                 # 0.5*log(2π σ²) on entries with a prior. The log(σ²) term is
@@ -2214,9 +2220,7 @@ class Fitter:
             sci_opts["gtol"] = float(self.minimizer_gtol)
         if self.minimizer_ftol is not None:
             sci_opts["ftol"] = float(self.minimizer_ftol)
-        logger.info(
-            f"[minimize] method={self.minimizer_method} options={sci_opts}"
-        )
+        logger.info(f"[minimize] method={self.minimizer_method} options={sci_opts}")
 
         try:
             res = scipy.optimize.minimize(

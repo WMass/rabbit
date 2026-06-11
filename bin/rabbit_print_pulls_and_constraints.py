@@ -143,7 +143,9 @@ def main():
             )
         )
     else:
-        header = f"   {'Parameter':<30} {'pull':>6} +/- {'constraint':>10}{prefit_header}"
+        header = (
+            f"   {'Parameter':<30} {'pull':>6} +/- {'constraint':>10}{prefit_header}"
+        )
         print(header)
         print("   " + "-" * (len(header) - 3))
         print(
