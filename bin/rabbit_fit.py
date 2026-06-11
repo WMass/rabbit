@@ -575,7 +575,7 @@ def fit(args, fitter, ws, dofit=True):
         # force profiling of beta with final parameter values
         # TODO avoid the extra calculation and jitting if possible since the relevant calculation
         # usually would have been done during the minimization
-        if fitter.binByBinStat and not args.noPostfitProfileBB:
+        if fitter.bbstat.enabled and not args.noPostfitProfileBB:
             _t_bb = time.perf_counter()
             logger.info(f"profile beta")
             fitter._profile_beta()

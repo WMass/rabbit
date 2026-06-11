@@ -152,7 +152,7 @@ def global_asym_impacts_parms(
 
             try:
                 fitter.minimize()
-                if fitter.binByBinStat:
+                if fitter.bbstat.enabled:
                     fitter._profile_beta()
                 impacts[k, j] = (fitter.x.value() - x_nom).numpy()
             except Exception as e:
@@ -167,7 +167,7 @@ def global_asym_impacts_parms(
     # Restore the fit state so downstream postfit computations see the nominal.
     fitter.theta0.assign(theta0_nom)
     fitter.x.assign(x_nom)
-    if fitter.binByBinStat:
+    if fitter.bbstat.enabled:
         fitter._profile_beta()
 
     if n_scanned > 0:
