@@ -17,6 +17,16 @@ class ParamModel:
         # self.xparamdefault = # default values for all parameters (length nparams)
         # self.is_linear = # define if the model is linear in the parameters
         # self.allowNegativeParam = # define if the POI parameters can be negative or not
+        #
+        # # optional: Gaussian priors on the model's parameters
+        # # consumed by Fitter when --paramModelPriors is set (otherwise ignored).
+        # self.prior_sigmas = # np.ndarray, shape (nparams,). Entries that are
+        #                     # finite and > 0 are Gaussian-constrained at that
+        #                     # width; NaN / non-finite / 0 entries leave the
+        #                     # corresponding parameter free. Convention is up
+        #                     # to the model (e.g. POIs free, POUs constrained).
+        # self.prior_means  = # np.ndarray, shape (nparams,). Optional; defaults
+        #                     # to self.xparamdefault when not provided.
 
     @property
     def nparams(self):

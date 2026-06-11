@@ -823,6 +823,17 @@ def main():
         "nois": ifitter.parms[ifitter.param_model.nparams :][indata.noiidxs],
     }
 
+    # ParamModel Gaussian priors (if --paramModelPriors was used and the
+    # model declared sigmas). Stored as a small dict so downstream tooling
+    # can see what was applied without parsing the rabbit log.
+    if getattr(ifitter, "param_prior_active", False):
+        meta["param_priors"] = {
+            "params": ifitter.param_model.params,  # all nparams names
+            "mask": ifitter.param_prior_mask_np,  # bool array
+            "sigmas": ifitter.param_prior_sigmas_np,  # NaN where mask False
+            "means": ifitter.param_prior_means_np,  # NaN where mask False
+        }
+
     with workspace.Workspace(
         args.outpath,
         args.outname,

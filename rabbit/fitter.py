@@ -31,23 +31,28 @@ CONTOUR_HESS_MODES = ("exact", "hvp", "frozen", "bfgs", "sr1")
 
 
 def match_regexp_params(regular_expressions, parameter_names):
+    # Match parameter names against a list of expressions where each entry may
+    # be either an exact parameter name or a regex (re.match, anchored to the
+    # start). Returns the union of exact and regex matches, preserving the
+    # parameter_names order and de-duplicating. Mixing exact and regex entries
+    # in the same call is supported.
     if isinstance(regular_expressions, str):
         regular_expressions = [regular_expressions]
 
-    # Check for exact matches first
-    exact_matches = [
-        s for expr in regular_expressions for s in parameter_names if s.decode() == expr
-    ]
-    if exact_matches:
-        return exact_matches
-
-    # Fall back to regex matching
+    exact_lookup = set(regular_expressions)
     compiled_expressions = [re.compile(expr) for expr in regular_expressions]
-    return [
-        s
-        for s in parameter_names
-        if any(regex.match(s.decode()) for regex in compiled_expressions)
-    ]
+
+    matched = []
+    seen = set()
+    for s in parameter_names:
+        decoded = s.decode() if hasattr(s, "decode") else s
+        if decoded in exact_lookup or any(
+            r.match(decoded) for r in compiled_expressions
+        ):
+            if decoded not in seen:
+                seen.add(decoded)
+                matched.append(s)
+    return matched
 
 
 class FitterCallback:
@@ -207,7 +212,9 @@ class Fitter:
             param_model,
             options.setConstraintMinimum,
             unblind=options.unblind,
+            blinding_group=getattr(options, "blindingGroup", []),
             freeze_parameters=options.freezeParameters,
+            options=options,
         )
 
         self.nexpnom = tf.Variable(
@@ -219,7 +226,9 @@ class Fitter:
         param_model,
         set_constraint_minimum=[],
         unblind=False,
+        blinding_group=[],
         freeze_parameters=[],
+        options=None,
     ):
         self.param_model = param_model
 
@@ -246,7 +255,7 @@ class Fitter:
                 trainable=False,
                 name="offset_theta",
             )
-            self.init_blinding_values(unblind)
+            self.init_blinding_values(unblind, blinding_group)
 
         self.parms = np.concatenate([self.param_model.params, self.indata.systs])
 
@@ -310,6 +319,79 @@ class Fitter:
             self.parms,
             self.indata.dtype,
         )
+
+        # ParamModel Gaussian priors (opt-in via --paramModelPriors).
+        # When enabled, the Fitter reads two optional attributes from the
+        # ParamModel:
+        #   - prior_sigmas: np.ndarray shape (nparams,). Entries that are
+        #     finite and > 0 are Gaussian-constrained at that width; NaN /
+        #     non-finite / 0 entries leave the corresponding parameter free.
+        #   - prior_means : np.ndarray shape (nparams,), optional.
+        #     Defaults to param_model.xparamdefault when not provided.
+        # The penalty 0.5 * (x - μ)^2 / σ^2 is added to _compute_lc.
+        self.param_prior_active = False
+        self.param_prior_mask_np = None
+        self.param_prior_sigmas_np = None
+        self.param_prior_means_np = None
+        if getattr(options, "paramModelPriors", False):
+            pm = self.param_model
+            sigmas = getattr(pm, "prior_sigmas", None)
+            if sigmas is not None:
+                sigmas = np.asarray(sigmas, dtype=np.float64)
+                if sigmas.shape != (pm.nparams,):
+                    raise ValueError(
+                        f"param_model.prior_sigmas must have shape ({pm.nparams},); "
+                        f"got {sigmas.shape}"
+                    )
+                means = getattr(pm, "prior_means", None)
+                if means is None:
+                    means = pm.xparamdefault.numpy().astype(np.float64)
+                else:
+                    means = np.asarray(means, dtype=np.float64)
+                    if means.shape != (pm.nparams,):
+                        raise ValueError(
+                            f"param_model.prior_means must have shape ({pm.nparams},); "
+                            f"got {means.shape}"
+                        )
+                mask = np.isfinite(sigmas) & (sigmas > 0)
+                n_priored = int(mask.sum())
+                if n_priored > 0:
+                    self.param_prior_active = True
+                    self.param_prior_mask_np = mask.copy()
+                    self.param_prior_sigmas_np = np.where(mask, sigmas, np.nan)
+                    self.param_prior_means_np = np.where(mask, means, np.nan)
+                    inv2_np = np.where(mask, 1.0 / sigmas**2, 0.0)
+                    self.param_prior_mask = tf.constant(mask, dtype=tf.bool)
+                    self.param_prior_inv2 = tf.constant(
+                        inv2_np, dtype=self.indata.dtype
+                    )
+                    self.param_prior_means = tf.constant(
+                        np.where(mask, means, 0.0), dtype=self.indata.dtype
+                    )
+                    self.param_prior_log_sigma2 = tf.constant(
+                        np.where(mask, np.log(np.where(mask, sigmas, 1.0) ** 2), 0.0),
+                        dtype=self.indata.dtype,
+                    )
+                    logger.info(
+                        f"[paramPriors] applying Gaussian priors to "
+                        f"{n_priored}/{pm.nparams} ParamModel params:"
+                    )
+                    for i, p in enumerate(pm.params):
+                        if mask[i]:
+                            name = p.decode() if isinstance(p, bytes) else str(p)
+                            logger.info(
+                                f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}"
+                            )
+                else:
+                    logger.info(
+                        "[paramPriors] --paramModelPriors set but prior_sigmas "
+                        "has no finite entries; no priors applied."
+                    )
+            else:
+                logger.info(
+                    "[paramPriors] --paramModelPriors set but ParamModel does "
+                    "not declare prior_sigmas; no priors applied."
+                )
 
         # constraint minima for nuisance parameters
         self.theta0 = tf.Variable(
@@ -466,14 +548,16 @@ class Fitter:
         ]
         self.update_frozen_params()
 
-    def init_blinding_values(self, unblind_parameter_expressions=[]):
+    def init_blinding_values(
+        self, unblind_parameter_expressions=[], blinding_group_expressions=[]
+    ):
         logger.debug(f"Unblind parameters with {unblind_parameter_expressions}")
+        all_param_names = [
+            *self.param_model.params[: self.param_model.npoi],
+            *[self.indata.systs[i] for i in self.indata.noiidxs],
+        ]
         unblind_parameters = match_regexp_params(
-            unblind_parameter_expressions,
-            [
-                *self.param_model.params[: self.param_model.npoi],
-                *[self.indata.systs[i] for i in self.indata.noiidxs],
-            ],
+            unblind_parameter_expressions, all_param_names
         )
 
         # check if dataset is an integer (i.e. if it is real data or not) and use this to choose the random seed
@@ -498,14 +582,47 @@ class Fitter:
             value = rng.normal(loc=mean, scale=std)
             return value
 
+        # Build a map: param name -> seed string. Default is the param's own name; for
+        # parameters matching a blinding group the seed is the group regex string, so all
+        # members of the group share an identical deterministic offset (preserving relative
+        # differences while blinding absolute values).
+        if isinstance(blinding_group_expressions, str):
+            blinding_group_expressions = [blinding_group_expressions]
+        param_to_seed = {}
+        param_to_group = {}
+        for expr in blinding_group_expressions:
+            matched = match_regexp_params(expr, all_param_names)
+            for p in matched:
+                if p in param_to_seed:
+                    continue  # first matching group wins
+                param_to_seed[p] = expr
+                param_to_group[p] = expr
+
+        # Refuse to run if --unblind and --blindingGroup match the same parameter:
+        # the user's intent is ambiguous (unblind it, or share a group offset?), and
+        # silently picking one risks accidentally unblinding a sensitive parameter.
+        overlap = [p for p in unblind_parameters if p in param_to_group]
+        if overlap:
+            details = ", ".join(
+                f"{p.decode() if isinstance(p, bytes) else p}"
+                f" (group '{param_to_group[p]}')"
+                for p in overlap
+            )
+            raise RuntimeError(
+                "The following parameters match both --unblind and --blindingGroup; "
+                "refusing to proceed to avoid an ambiguous (un)blinding. "
+                f"Tighten the regexes to make the intent explicit: {details}"
+            )
+
         # multiply offset to nois
         self._blinding_values_theta = np.zeros(self.indata.nsyst, dtype=np.float64)
         for i in self.indata.noiidxs:
             param = self.indata.systs[i]
             if param in unblind_parameters:
                 continue
-            logger.debug(f"Blind parameter {param}")
-            value = deterministic_random_from_string(param)
+            seed = param_to_seed.get(param, param)
+            logger.debug(f"Blind parameter {param} (seed='{seed}')")
+            value = deterministic_random_from_string(seed)
             self._blinding_values_theta[i] = value
 
         # add offset to pois
@@ -514,8 +631,9 @@ class Fitter:
             param = self.param_model.params[i]
             if param in unblind_parameters:
                 continue
-            logger.debug(f"Blind signal strength modifier for {param}")
-            value = deterministic_random_from_string(param)
+            seed = param_to_seed.get(param, param)
+            logger.debug(f"Blind signal strength modifier for {param} (seed='{seed}')")
+            value = deterministic_random_from_string(seed)
             self._blinding_values_poi[i] = np.exp(value)
 
     def set_blinding_offsets(self, blind=True):
@@ -1834,7 +1952,28 @@ class Fitter:
             # normalization factor for normal distribution: log(1/sqrt(2*pi)) = -0.9189385332046727
             lc = lc + 0.9189385332046727 * self.indata.constraintweights
 
-        return tf.reduce_sum(lc)
+        total = tf.reduce_sum(lc)
+
+        # ParamModel Gaussian priors (opt-in via --paramModelPriors).
+        # Per-entry mask is baked into param_prior_inv2 (zero where mask is
+        # False), so this is a single elementwise op with no branching.
+        if self.param_prior_active:
+            pm_params = tf.concat([self.get_poi(), self.get_model_nui()], axis=0)
+            lc_pm = (
+                0.5
+                * self.param_prior_inv2
+                * tf.square(pm_params - self.param_prior_means)
+            )
+            if full_nll:
+                # 0.5*log(2π σ²) on entries with a prior. The log(σ²) term is
+                # precomputed (zero where masked off).
+                mask_dtype = tf.cast(self.param_prior_mask, lc_pm.dtype)
+                lc_pm = lc_pm + mask_dtype * (
+                    0.9189385332046727 + 0.5 * self.param_prior_log_sigma2
+                )
+            total = total + tf.reduce_sum(lc_pm)
+
+        return total
 
     def _compute_lbeta(self, beta, full_nll=False):
         return self.bbstat.lbeta(beta, full_nll=full_nll)

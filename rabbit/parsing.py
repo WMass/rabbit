@@ -247,6 +247,17 @@ def common_parser():
         help="Don't compute the estimated distance to minimum as fit quality evaluation",
     )
     parser.add_argument(
+        "--paramModelPriors",
+        default=False,
+        action="store_true",
+        help="Opt in to Gaussian priors on ParamModel parameters. When set, "
+        "the Fitter reads param_model.prior_sigmas (np.ndarray of shape "
+        "(nparams,), entries finite > 0 → prior of that width, NaN → free) "
+        "and param_model.prior_means (defaults to param_model.xparamdefault) "
+        "and adds the corresponding penalty to the NLL constraint term. By "
+        "default the feature is off and ParamModel params float free.",
+    )
+    parser.add_argument(
         "--forceLinear",
         default=False,
         action="store_true",
@@ -271,6 +282,20 @@ def common_parser():
         help="""
         Specify list of regex to unblind matching parameters of interest.
         E.g. use '--unblind ^signal$' to unblind a parameter named signal or '--unblind' to unblind all.
+        """,
+    )
+    parser.add_argument(
+        "--blindingGroup",
+        type=str,
+        default=[],
+        nargs="*",
+        help="""
+        Specify list of regex defining groups of parameters that share a single deterministic
+        blinding offset (seeded from the regex string itself). Useful to keep relative pulls /
+        differences between matched parameters meaningful while still blinding their absolute
+        values. E.g. '--blindingGroup ^alphaS_y\\d+$' applies the same offset to all alphaS
+        rapidity-bin parameters. Parameters not matching any group keep per-name blinding.
+        Overlap with --unblind is treated as a configuration error and aborts the fit.
         """,
     )
     parser.add_argument(
