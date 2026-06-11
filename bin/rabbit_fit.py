@@ -461,12 +461,8 @@ def fit(args, fitter, ws, dofit=True):
     # prefit variances as the default fallback for add_parms_hist below
     parms_variances = None
 
-    # take covariance from externalPostfit in case the fit was skipped —
-    # unless a Hessian is explicitly wanted (no --noHessian): the two-pass
-    # straight-through covariance recipe (--externalPostfit ... --noFit,
-    # WITHOUT --noHessian) relies on recomputing the Hessian at the loaded
-    # postfit point.
-    if dofit or args.externalPostfit is None or not args.noHessian:
+    # take covariance from externalPostfit in case the fit was skipped
+    if dofit or args.externalPostfit is None:
         if not args.noEDM and not args.noHessian:
             # compute the covariance matrix and estimated distance to minimum
             _, grad, hess = fitter.loss_val_grad_hess()
