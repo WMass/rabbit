@@ -454,11 +454,9 @@ def fit(args, fitter, ws, dofit=True):
         if cb is not None:
             ws.add_1D_integer_hist(cb.loss_history, "epoch", "loss")
             ws.add_1D_integer_hist(cb.time_history, "epoch", "time")
-            try:
-                n_iter = len(cb.loss_history)
-                logger.debug(f"[timing] L-BFGS: {n_iter} epochs recorded")
-            except Exception:
-                pass
+            logger.debug(
+                f"[timing] minimizer: {len(cb.loss_history)} iterations recorded"
+            )
 
     # prefit variances as the default fallback for add_parms_hist below
     parms_variances = None
