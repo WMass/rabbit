@@ -45,7 +45,14 @@ def impacts_parms(
     param_groupidxs=None,
 ):
     """
-    Gaussian approximation
+    Gaussian approximation.
+
+    Impacts are computed FOR the POIs and NOIs only (the rows of the
+    returned tensors). nmodel_params = npoi + npou is needed to locate the
+    NOI entries in the full parameter vector when the ParamModel has POU
+    (model nuisance) parameters; the POUs themselves do not get impact
+    rows. POUs enter only as impact *sources*: optionally grouped via
+    param_groupidxs (columns appended after the syst/stat groups).
     """
     if nmodel_params is None:
         nmodel_params = nsignal_params

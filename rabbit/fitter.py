@@ -1005,14 +1005,17 @@ class Fitter:
         q=1,
         include=None,
         exclude=None,
-        skip_symmetric=True,
+        skip_symmetric=False,
         skip_unconstrained=True,
         contour_xtol=1e-6,
         contour_gtol=1e-6,
-        contour_maxiter=200,
+        contour_maxiter=5000,
         hess_mode="exact",
     ):
         """Traditional asymmetric impacts via per-nuisance contour scan.
+
+        All constrained nuisances are scanned by default; use include/exclude
+        to restrict the selection.
 
         Args:
             nll_min: postfit reduced NLL. Computed from the current fit state
@@ -1020,8 +1023,10 @@ class Fitter:
             q: contour level (q=1 -> 1 sigma).
             include: optional regex(es) restricting which nuisances to scan.
             exclude: optional regex(es) excluding nuisances from the scan.
-            skip_symmetric: skip nuisances whose template content is structurally
-                symmetric (their asymmetric impact equals the Gaussian impact).
+            skip_symmetric: optionally skip nuisances whose template content is
+                structurally symmetric (logkhalfdiff identically zero). Off by
+                default since nonlinear effects can produce asymmetric impacts
+                even for symmetric templates.
             skip_unconstrained: skip nuisances with constraintweight=0 (no
                 finite Delta(2NLL)=q contour).
         """
@@ -2267,7 +2272,7 @@ class Fitter:
         fun=None,
         xtol=1e-6,
         gtol=1e-6,
-        maxiter=200,
+        maxiter=5000,
         hess_mode="exact",
     ):
         # Layered cache: trust-constr calls scipy_loss many times during line

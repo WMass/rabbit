@@ -7,11 +7,12 @@ The shifts of every fitter parameter at those points are the asymmetric
 impacts. Group impacts are obtained by quadrature envelope of the contained
 nuisances, separately for the down and up sides.
 
-Nuisances that are structurally symmetric (logkhalfdiff identically zero)
-or unconstrained (constraintweight = 0) are skipped by default: the first
-case has asymmetric impact equal to the Gaussian impact (already produced by
-traditional_impacts.impacts_parms), and the second has no finite Delta(2NLL)
-contour.
+All constrained nuisances are scanned by default (nonlinear effects can
+produce asymmetric impacts even for structurally symmetric templates);
+use include/exclude to restrict the selection. Unconstrained nuisances
+(constraintweight = 0) are skipped since they have no finite Delta(2NLL)
+contour. An optional structural-symmetry skip (logkhalfdiff identically
+zero) is available programmatically via skip_symmetric.
 """
 
 import time
@@ -74,7 +75,7 @@ def asym_impacts_parms(
     q=1,
     contour_xtol=1e-4,
     contour_gtol=1e-4,
-    contour_maxiter=200,
+    contour_maxiter=5000,
     hess_mode="exact",
 ):
     """Run a per-nuisance contour scan and assemble the asymmetric-impact tensor.

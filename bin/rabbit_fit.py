@@ -247,13 +247,6 @@ def make_parser():
         help="Regex(es) excluding nuisances from --asymImpacts.",
     )
     parser.add_argument(
-        "--asymImpactsAll",
-        default=False,
-        action="store_true",
-        help="Disable the structural-symmetric skip in --asymImpacts and scan "
-        "every constrained nuisance regardless of template content.",
-    )
-    parser.add_argument(
         "--asymImpactsHess",
         default="exact",
         choices=["exact", "hvp", "frozen", "bfgs", "sr1"],
@@ -265,15 +258,6 @@ def make_parser():
         "failures on non-Gaussian profiles -- speed reference only). "
         "'bfgs'/'sr1' use a quasi-Newton estimate built up from the gradient "
         "sequence (no extra TF calls per iteration; may need more iterations).",
-    )
-    parser.add_argument(
-        "--asymImpactsMaxiter",
-        default=200,
-        type=int,
-        help="trust-constr maxiter for the --asymImpacts contour-scan. Lower "
-        "values cap the cost of nuisances that don't converge (useful for "
-        "sanity benchmarks); higher values give genuinely-non-Gaussian "
-        "nuisances more chances to converge.",
     )
     parser.add_argument(
         "--asymImpactsTol",
@@ -667,11 +651,9 @@ def fit(args, fitter, ws, dofit=True):
                 nll_min=fitter.reduced_nll().numpy(),
                 include=args.asymImpactsInclude,
                 exclude=args.asymImpactsExclude,
-                skip_symmetric=not args.asymImpactsAll,
                 hess_mode=args.asymImpactsHess,
                 contour_xtol=args.asymImpactsTol,
                 contour_gtol=args.asymImpactsTol,
-                contour_maxiter=args.asymImpactsMaxiter,
             ),
             base_name="impacts_asym",
         )
