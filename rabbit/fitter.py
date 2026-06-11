@@ -13,7 +13,13 @@ from wums import logging
 from rabbit import external_likelihood, io_tools
 from rabbit import tfhelpers as tfh
 from rabbit.bbstat.bbstat import BinByBinStat
-from rabbit.impacts import global_impacts, nonprofiled_impacts, traditional_impacts
+from rabbit.impacts import (
+    asym_impacts,
+    global_asym_impacts,
+    global_impacts,
+    nonprofiled_impacts,
+    traditional_impacts,
+)
 from rabbit.tfhelpers import edmval_cov
 
 logger = logging.child_logger(__name__)
@@ -537,7 +543,17 @@ class Fitter:
     def get_model_nui(self):
         npoi = self.param_model.npoi
         npou = self.param_model.npou
-        return self.x[npoi : npoi + npou]
+        nui = self.x[npoi : npoi + npou]
+        # Apply frozen_params_mask the same way get_poi() and get_theta() do.
+        # Without this, --freezeParameters silently fails to freeze POUs:
+        # the param is registered as frozen but no stop_gradient is applied,
+        # so the optimizer updates it anyway.
+        nui = tf.where(
+            self.frozen_params_mask[npoi : npoi + npou],
+            tf.stop_gradient(nui),
+            nui,
+        )
+        return nui
 
     def get_poi(self):
         xpoi = self.x[: self.param_model.npoi]
@@ -858,6 +874,47 @@ class Fitter:
 
         return edmval, cov_rows
 
+    def _resolved_param_impact_groups(self):
+        """
+        ParamModel impact groups resolved to floating full-x parameter indices.
+        """
+        groups = getattr(self.param_model, "param_impact_groups", None)
+        if not groups:
+            return []
+        parms = self.parms.astype(str)
+        name_to_idx = {p: i for i, p in enumerate(parms)}
+        frozen = set(int(i) for i in np.atleast_1d(self.frozen_indices))
+        resolved = []
+        for label, pnames in groups.items():
+            idxs = [
+                name_to_idx[p]
+                for p in pnames
+                if p in name_to_idx and name_to_idx[p] not in frozen
+            ]
+            if idxs:
+                resolved.append((label, np.array(idxs, dtype=np.int32)))
+        return resolved
+
+    def _cov_stat_floating(self, hess, nstat):
+        """
+        Invert the stat sub-Hessian hess[:nstat, :nstat], excluding frozen params.
+        """
+        hess_stat = hess[:nstat, :nstat]
+        if len(self.frozen_params) == 0:
+            return tf.linalg.inv(hess_stat)
+        stat_float = self.floating_indices[self.floating_indices < nstat]
+        sub = tf.gather(tf.gather(hess_stat, stat_float, axis=0), stat_float, axis=1)
+        sub_inv = tf.linalg.inv(sub)
+        coords = tf.reshape(
+            tf.stack(tf.meshgrid(stat_float, stat_float, indexing="ij"), axis=-1),
+            [-1, 2],
+        )
+        return tf.scatter_nd(
+            tf.cast(coords, tf.int64),
+            tf.reshape(sub_inv, [-1]),
+            tf.constant([nstat, nstat], dtype=tf.int64),
+        )
+
     @tf.function
     def impacts_parms(self, hess):
 
@@ -866,18 +923,17 @@ class Fitter:
             + self.param_model.npou
             + self.indata.nsystnoconstraint
         )
-        hess_stat = hess[:nstat, :nstat]
-        cov_stat = tf.linalg.inv(hess_stat)
+        cov_stat = self._cov_stat_floating(hess, nstat)
 
         if self.bbstat.enabled:
             val_no_bbb, grad_no_bbb, hess_no_bbb = self.loss_val_grad_hess(
                 profile=False
             )
-            hess_stat_no_bbb = hess_no_bbb[:nstat, :nstat]
-            cov_stat_no_bbb = tf.linalg.inv(hess_stat_no_bbb)
+            cov_stat_no_bbb = self._cov_stat_floating(hess_no_bbb, nstat)
         else:
             cov_stat_no_bbb = None
 
+        param_groups = self._resolved_param_impact_groups()
         impacts, impacts_grouped = traditional_impacts.impacts_parms(
             self.cov,
             cov_stat,
@@ -885,6 +941,8 @@ class Fitter:
             self.param_model.npoi,
             self.indata.noiidxs,
             self.indata.systgroupidxs,
+            nmodel_params=self.param_model.npoi + self.param_model.npou,
+            param_groupidxs=[idxs for _, idxs in param_groups],
         )
 
         return impacts, impacts_grouped
@@ -935,6 +993,133 @@ class Fitter:
         )
 
         return impacts, impacts_grouped
+
+    def asymmetric_nuisance_mask(self, atol=0.0):
+        """Boolean mask of length nsyst, True where the nuisance has nonzero
+        asymmetric (logkhalfdiff) tensor content."""
+        return asym_impacts.asymmetric_nuisance_mask(self.indata, atol=atol)
+
+    def asym_impacts_parms(
+        self,
+        nll_min=None,
+        q=1,
+        include=None,
+        exclude=None,
+        skip_symmetric=True,
+        skip_unconstrained=True,
+        contour_xtol=1e-6,
+        contour_gtol=1e-6,
+        contour_maxiter=200,
+        hess_mode="exact",
+    ):
+        """Traditional asymmetric impacts via per-nuisance contour scan.
+
+        Args:
+            nll_min: postfit reduced NLL. Computed from the current fit state
+                if None.
+            q: contour level (q=1 -> 1 sigma).
+            include: optional regex(es) restricting which nuisances to scan.
+            exclude: optional regex(es) excluding nuisances from the scan.
+            skip_symmetric: skip nuisances whose template content is structurally
+                symmetric (their asymmetric impact equals the Gaussian impact).
+            skip_unconstrained: skip nuisances with constraintweight=0 (no
+                finite Delta(2NLL)=q contour).
+        """
+        if nll_min is None:
+            nll_min = float(self.reduced_nll().numpy())
+
+        nsyst = self.indata.nsyst
+        cw = self.indata.constraintweights.numpy()
+        syst_names = np.array(self.indata.systs).astype(bytes)
+
+        selected = np.ones(nsyst, dtype=bool)
+        if skip_unconstrained:
+            selected &= cw > 0
+        if skip_symmetric:
+            selected &= self.asymmetric_nuisance_mask()
+        if include is not None:
+            keep = match_regexp_params(include, syst_names)
+            keep_set = set(keep)
+            selected &= np.array([n in keep_set for n in syst_names])
+        if exclude is not None:
+            drop = match_regexp_params(exclude, syst_names)
+            drop_set = set(drop)
+            selected &= np.array([n not in drop_set for n in syst_names])
+
+        selected_idxs = np.where(selected)[0]
+        selected_names = syst_names[selected_idxs]
+
+        logger.info(
+            f"asym_impacts_parms: selected {len(selected_idxs)}/{nsyst} nuisances "
+            f"(skip_symmetric={skip_symmetric}, skip_unconstrained={skip_unconstrained})"
+        )
+
+        return asym_impacts.asym_impacts_parms(
+            self,
+            nll_min,
+            selected_idxs,
+            selected_names,
+            q=q,
+            contour_xtol=contour_xtol,
+            contour_gtol=contour_gtol,
+            contour_maxiter=contour_maxiter,
+            hess_mode=hess_mode,
+        )
+
+    def global_asym_impacts_parms(
+        self,
+        include=None,
+        exclude=None,
+        skip_unconstrained=True,
+        sigma=1.0,
+        linear_warmstart=False,
+    ):
+        """Fully likelihood-based asymmetric global impacts.
+
+        For each selected nuisance i, shift theta0[i] by +/- sigma (in units of
+        the prefit constraint width) and re-run the full fit. POI shifts at
+        each sign are the asymmetric global impacts.
+
+        Args:
+            include: optional regex(es) restricting which nuisances to scan.
+            exclude: optional regex(es) excluding nuisances from the scan.
+            skip_unconstrained: skip nuisances with constraintweight=0; their
+                "1 prefit sigma" is undefined.
+            sigma: shift magnitude in prefit-sigma units.
+            linear_warmstart: experimental, see
+                global_asym_impacts.global_asym_impacts_parms.
+        """
+        nsyst = self.indata.nsyst
+        cw = self.indata.constraintweights.numpy()
+        syst_names = np.array(self.indata.systs).astype(bytes)
+
+        selected = np.ones(nsyst, dtype=bool)
+        if skip_unconstrained:
+            selected &= cw > 0
+        if include is not None:
+            keep = match_regexp_params(include, syst_names)
+            keep_set = set(keep)
+            selected &= np.array([n in keep_set for n in syst_names])
+        if exclude is not None:
+            drop = match_regexp_params(exclude, syst_names)
+            drop_set = set(drop)
+            selected &= np.array([n not in drop_set for n in syst_names])
+
+        selected_idxs = np.where(selected)[0]
+        selected_names = syst_names[selected_idxs]
+
+        logger.info(
+            f"global_asym_impacts_parms: selected {len(selected_idxs)}/{nsyst} "
+            f"nuisances (skip_unconstrained={skip_unconstrained})"
+        )
+
+        return global_asym_impacts.global_asym_impacts_parms(
+            self,
+            selected_idxs,
+            selected_names,
+            sigma=sigma,
+            linear_warmstart=linear_warmstart,
+        )
 
     def nonprofiled_impacts_parms(self, unconstrained_err=1.0):
         return nonprofiled_impacts.nonprofiled_impacts_parms(
@@ -2073,23 +2258,112 @@ class Fitter:
 
         return x_scans, y_scans, dnlls
 
-    def contour_scan(self, param, nll_min, q=1, signs=[-1, 1], fun=None):
-        # TODO this is basically traditional asymmetric impacts
-        def scipy_loss(x):
-            self.x.assign(x)
-            val = self.loss_val()
-            loss = val.numpy() - nll_min - 0.5 * q
-            return loss[None,]
+    def contour_scan(
+        self,
+        param,
+        nll_min,
+        q=1,
+        signs=[-1, 1],
+        fun=None,
+        xtol=1e-6,
+        gtol=1e-6,
+        maxiter=200,
+        hess_mode="exact",
+    ):
+        # Layered cache: trust-constr calls scipy_loss many times during line
+        # search (only val needed), and scipy_grad / scipy_hess on accepted
+        # steps. The cache is keyed by x content so repeated requests at the
+        # same point are free.
+        lg_cache = {"x": None, "val": None, "grad": None}
 
-        def scipy_grad(x):
+        def _ensure_loss_grad(x):
+            if lg_cache["x"] is not None and np.array_equal(lg_cache["x"], x):
+                return
             self.x.assign(x)
             val, grad = self.loss_val_grad()
-            return grad.numpy()[None,]
+            lg_cache["x"] = np.array(x, copy=True)
+            lg_cache["val"] = float(val.numpy()) - nll_min - 0.5 * q
+            lg_cache["grad"] = grad.numpy()
 
-        def scipy_hess(x, v):
-            self.x.assign(x)
-            val, grad, hess = self.loss_val_grad_hess()
-            return v[0] * hess.numpy()
+        # Constraint Hessian. Modes:
+        #   "exact": recompute the full NLL Hessian at every accepted iteration
+        #       (~25 s/eval for thousands of params; dominant cost). Reference.
+        #   "hvp": LinearOperator whose matvec computes one Hessian-vector
+        #       product via a nested GradientTape (~2x the cost of a gradient).
+        #       Exact (no approximation); avoids materializing the N x N matrix.
+        #       trust-constr only multiplies H against trial directions in its
+        #       inner CG, so HVP is typically much faster than "exact".
+        #   "frozen": constant Hessian = postfit precision matrix (cov^-1),
+        #       computed once. Cheapest, but the Lagrangian model is wrong off
+        #       the postfit, so trust-constr's KKT/optimality criterion can be
+        #       satisfied while the constraint violation is large -- producing
+        #       silent failures on non-Gaussian profiles. Useful only as a
+        #       speed reference, not as a production default.
+        #   "bfgs" / "sr1": quasi-Newton Hessian estimate built up by
+        #       trust-constr from the gradient sequence (no extra TF calls).
+        #       Cheapest per iteration; may need more iterations to converge.
+        #       SR1 is more robust for non-convex local geometry than BFGS.
+        if hess_mode == "hvp":
+
+            def scipy_hess(x, v):
+                _ensure_loss_grad(x)
+                n = len(x)
+                scale = float(v[0])
+
+                def _matvec(p):
+                    self.x.assign(x)
+                    p_tf = tf.convert_to_tensor(p, dtype=self.indata.dtype)
+                    _, _, hp = self.loss_val_grad_hessp(p_tf)
+                    return scale * hp.numpy()
+
+                return scipy.sparse.linalg.LinearOperator(
+                    shape=(n, n), matvec=_matvec, dtype=np.float64
+                )
+
+        elif hess_mode == "frozen":
+            postfit_hess = np.linalg.inv(self.cov.numpy())
+
+            def scipy_hess(x, v):
+                return v[0] * postfit_hess
+
+        elif hess_mode == "bfgs":
+            scipy_hess = scipy.optimize.BFGS()
+
+        elif hess_mode == "sr1":
+            scipy_hess = scipy.optimize.SR1()
+
+        elif hess_mode == "exact":
+            h_cache = {"x": None, "hess": None}
+
+            def _ensure_hess(x):
+                if h_cache["x"] is not None and np.array_equal(h_cache["x"], x):
+                    return
+                self.x.assign(x)
+                val, grad, hess = self.loss_val_grad_hess()
+                h_cache["x"] = np.array(x, copy=True)
+                h_cache["hess"] = hess.numpy()
+                # opportunistically refresh the loss/grad cache.
+                lg_cache["x"] = h_cache["x"]
+                lg_cache["val"] = float(val.numpy()) - nll_min - 0.5 * q
+                lg_cache["grad"] = grad.numpy()
+
+            def scipy_hess(x, v):
+                _ensure_hess(x)
+                return v[0] * h_cache["hess"]
+
+        else:
+            raise ValueError(
+                f"contour_scan: unknown hess_mode={hess_mode!r}; "
+                "expected one of 'exact', 'hvp', 'frozen', 'bfgs', 'sr1'."
+            )
+
+        def scipy_loss(x):
+            _ensure_loss_grad(x)
+            return np.array([lg_cache["val"]])
+
+        def scipy_grad(x):
+            _ensure_loss_grad(x)
+            return lg_cache["grad"][None, :]
 
         nlc = scipy.optimize.NonlinearConstraint(
             fun=scipy_loss,
@@ -2103,30 +2377,24 @@ class Fitter:
         params_values = np.full((len(signs), len(self.parms)), np.nan)
 
         xval = tf.identity(self.x)
-        xval_init = xval.numpy()
+        xval_np = xval.numpy()
 
         idx = np.where(self.parms.astype(str) == param)[0][0]
-        x0 = xval[idx]
+        x0 = xval_np[idx]
 
-        # initial guess from covariance
-        initial_fit = False
-
-        xup = xval[idx] + (self.cov[idx, idx] * q) ** 0.5
-        xdn = xval[idx] - (self.cov[idx, idx] * q) ** 0.5
+        # Gaussian-optimal warm start on the Delta(2NLL)=q contour:
+        # maximizing +/- dx[idx] subject to dx^T H dx = q (with H = cov^{-1})
+        # gives dx = sign * sqrt(q) * cov[:,idx] / sqrt(cov[idx,idx]).
+        # This lands all parameters on the contour in the Gaussian limit and
+        # is exact for nuisances with a near-quadratic likelihood, so the
+        # constrained minimization typically converges in just a few steps.
+        cov_col = self.cov[:, idx].numpy()
+        sigma_idx = float(self.cov[idx, idx].numpy()) ** 0.5
+        gauss_dx = (q**0.5) * cov_col / sigma_idx
 
         for i, sign in enumerate(signs):
-            # Objective function and its derivatives
-            if sign == -1:
-                xval_init[idx] = xdn
-            else:
-                xval_init[idx] = xup
-
-            if initial_fit:
-                # perform initial fit where contour is expected
-                self.x.assign(xval_init)
-                self.freeze_params(param)
-                self.minimize()
-                self.defreeze_params(param)
+            xval_init = xval_np + sign * gauss_dx
+            t_side0 = time.perf_counter()
 
             opt = {}
             if fun is None:
@@ -2189,20 +2457,27 @@ class Fitter:
                 jac=True,
                 constraints=[nlc],
                 options={
-                    "maxiter": 50000,
-                    "xtol": 1e-10,
-                    "gtol": 1e-10,
-                    # "barrier_tol": 1e-10,
+                    "maxiter": maxiter,
+                    "xtol": xtol,
+                    "gtol": gtol,
                 },
                 **opt,
             )
 
-            logger.info(f"Success: {res.success}")
+            t_side = time.perf_counter() - t_side0
+            logger.info(
+                f"Success: {res.success} sign={sign} time={t_side:.2f}s "
+                f"(nit={getattr(res, 'nit', '?')}, "
+                f"nfev={getattr(res, 'nfev', '?')}, "
+                f"njev={getattr(res, 'njev', '?')}, "
+                f"nhev={getattr(res, 'nhev', '?')})"
+            )
             logger.debug(f"Status: {res.status}")
             if not res.success:
                 logger.warning(f"Message: {res.message}")
                 logger.warning(f"Optimality (gtol): {res.optimality}")
                 logger.warning(f"Constraint Violation: {res.constr_violation}")
+                self.x.assign(xval)
                 continue
 
             params_values[i] = res["x"] - xval
