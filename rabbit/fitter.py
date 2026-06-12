@@ -1060,11 +1060,26 @@ class Fitter:
             f"(skip_symmetric={skip_symmetric})"
         )
 
+        # freeze-group grouped impacts are computed for the POIs and NOIs
+        npoi = self.param_model.npoi
+        targets = [
+            p.decode() if isinstance(p, bytes) else str(p)
+            for p in self.param_model.params[:npoi]
+        ] + [
+            (
+                self.indata.systs[i].decode()
+                if isinstance(self.indata.systs[i], bytes)
+                else str(self.indata.systs[i])
+            )
+            for i in self.indata.noiidxs
+        ]
+
         return asym_impacts.asym_impacts_parms(
             self,
             nll_min,
             selected_idxs,
             selected_names,
+            targets=targets,
             q=q,
             contour_xtol=contour_xtol,
             contour_gtol=contour_gtol,
@@ -2399,6 +2414,12 @@ class Fitter:
         cov_col = self.cov[:, idx].numpy()
         sigma_idx = float(self.cov[idx, idx].numpy()) ** 0.5
         gauss_dx = (q**0.5) * cov_col / sigma_idx
+        # Frozen parameters must stay at their current values: their gradients
+        # are masked, so the optimizer would never move them back, and a
+        # displaced frozen parameter shifts the NLL value and biases the
+        # contour. Zero their warm-start displacement.
+        if len(self.frozen_indices):
+            gauss_dx[self.frozen_indices] = 0.0
 
         for i, sign in enumerate(signs):
             xval_init = xval_np + sign * gauss_dx
