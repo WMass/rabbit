@@ -4,8 +4,10 @@ Traditional asymmetric impacts.
 For each selected nuisance, find the asymmetric +/- 1 sigma points on the
 Delta(2NLL)=q likelihood contour via constrained minimization (contour_scan).
 The shifts of every fitter parameter at those points are the asymmetric
-impacts. Group impacts are obtained by quadrature envelope of the contained
-nuisances, separately for the down and up sides.
+impacts. Group impacts follow the traditional grouped-impact convention,
+generalized to the asymmetric case: per side, sqrt(delta^T rho_GG^-1 delta)
+over the group's scanned nuisances, with rho_GG the postfit correlation
+submatrix (see _group_impact).
 
 All constrained nuisances are scanned by default (nonlinear effects can
 produce asymmetric impacts even for structurally symmetric templates);
@@ -48,23 +50,50 @@ def asymmetric_nuisance_mask(indata, atol=0.0):
     return np.any(np.abs(halfdiff) > atol, axis=axes)
 
 
-def _envelope(values):
-    """Quadrature envelope of asymmetric impacts within a group.
+def _group_impact(values, rho_inv):
+    """Correlation-aware group combination of asymmetric impacts.
+
+    Asymmetric analogue of the traditional grouped-impact convention
+    (sqrt(v^T C_GG^-1 v) in traditional_impacts._compute_impact_group):
+    per side s, the group impact on each parameter is
+
+        sqrt( delta_s^T rho_GG^-1 delta_s )
+
+    where delta_s is the vector of per-nuisance impacts on that parameter at
+    the side-s contour points and rho_GG is the postfit correlation submatrix
+    of the group's nuisances. In the symmetric Gaussian limit
+    (delta_j = cov[i, j] / sqrt(cov[j, j])) this reproduces the traditional
+    grouped impact exactly; for uncorrelated nuisances it reduces to a
+    quadrature sum.
 
     Args:
         values: numpy array of shape (n_in_group, 2, n_total_params), where
             axis 1 is [down, up].
+        rho_inv: numpy array of shape (n_in_group, n_in_group), the inverse
+            postfit correlation matrix of the group's nuisances.
 
     Returns:
-        Array of shape (2, n_total_params) with the envelope's lower (negative)
+        Array of shape (2, n_total_params) with the group's lower (negative)
         and upper (positive) sides.
     """
-    zeros = np.zeros((values.shape[0], values.shape[-1]), dtype=values.dtype)
-    vmin = np.min(values, axis=1)
-    vmax = np.max(values, axis=1)
-    lower = -np.sqrt(np.sum(np.minimum(zeros, vmin) ** 2, axis=0))
-    upper = np.sqrt(np.sum(np.maximum(zeros, vmax) ** 2, axis=0))
+    down = values[:, 0, :]
+    up = values[:, 1, :]
+    # rho_inv is positive-definite so the quadratic form is >= 0; the clip
+    # only guards against floating-point round-off.
+    q_down = np.einsum("jt,jk,kt->t", down, rho_inv, down)
+    q_up = np.einsum("jt,jk,kt->t", up, rho_inv, up)
+    lower = -np.sqrt(np.clip(q_down, 0.0, None))
+    upper = np.sqrt(np.clip(q_up, 0.0, None))
     return np.stack([lower, upper])
+
+
+def _rho_inv_for(cov, x_idxs):
+    """Inverse postfit correlation submatrix for the given full-x indices."""
+    sub = cov[np.ix_(x_idxs, x_idxs)]
+    sigma = np.sqrt(np.diag(sub))
+    rho = sub / np.outer(sigma, sigma)
+    # pinv for robustness against near-degenerate (highly correlated) groups.
+    return np.linalg.pinv(rho)
 
 
 def asym_impacts_parms(
@@ -136,25 +165,30 @@ def asym_impacts_parms(
             f"max {t_per.max():.2f}s per nuisance)"
         )
 
-    # Build grouped impacts via quadrature envelope, separately for down/up.
-    syst_names = np.array(fitter.indata.systs).astype(bytes)
+    # Build grouped impacts with the correlation-aware combination,
+    # separately for down/up (see _group_impact). Nuisance j (syst index)
+    # sits at full-x index nparams + j.
     selected_set = set(selected_idxs.tolist())
     pos_in_scanned = {int(idx): k for k, idx in enumerate(selected_idxs)}
+    cov = fitter.cov.numpy()
+    nparams = fitter.param_model.nparams
 
     group_names = []
     group_impacts = []
     for gname, gidxs in zip(fitter.indata.systgroups, fitter.indata.systgroupidxs):
         gidxs = np.asarray(gidxs).astype(int)
-        in_scanned = [pos_in_scanned[i] for i in gidxs if int(i) in selected_set]
-        if not in_scanned:
+        in_group = [int(i) for i in gidxs if int(i) in selected_set]
+        if not in_group:
             continue
-        sub = impacts[in_scanned]
+        in_scanned = [pos_in_scanned[i] for i in in_group]
+        rho_inv = _rho_inv_for(cov, [nparams + i for i in in_group])
         group_names.append(gname)
-        group_impacts.append(_envelope(sub))
+        group_impacts.append(_group_impact(impacts[in_scanned], rho_inv))
 
     if n_scanned > 0:
+        rho_inv = _rho_inv_for(cov, [nparams + int(i) for i in selected_idxs])
         group_names.append(b"Total")
-        group_impacts.append(_envelope(impacts))
+        group_impacts.append(_group_impact(impacts, rho_inv))
 
     if group_impacts:
         impacts_grouped = np.stack(group_impacts)
