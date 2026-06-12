@@ -328,10 +328,10 @@ class Fitter:
         # If the model declares priors they are applied; how to enable or
         # disable them (e.g. a token in the --paramModel spec) is up to the
         # model. The penalty 0.5 * (x - μ)^2 / σ^2 is added to _compute_lc.
+        # param_prior_sigmas / param_prior_means hold the priors as declared
+        # (NaN where no prior); the compute-safe forms are derived in
+        # _compute_lc.
         self.param_prior_active = False
-        self.param_prior_mask_np = None
-        self.param_prior_sigmas_np = None
-        self.param_prior_means_np = None
         pm = self.param_model
         sigmas = getattr(pm, "prior_sigmas", None)
         if sigmas is not None:
@@ -355,18 +355,12 @@ class Fitter:
             n_priored = int(mask.sum())
             if n_priored > 0:
                 self.param_prior_active = True
-                self.param_prior_mask_np = mask.copy()
-                self.param_prior_sigmas_np = np.where(mask, sigmas, np.nan)
-                self.param_prior_means_np = np.where(mask, means, np.nan)
-                inv2_np = np.where(mask, 1.0 / sigmas**2, 0.0)
                 self.param_prior_mask = tf.constant(mask, dtype=tf.bool)
-                self.param_prior_inv2 = tf.constant(inv2_np, dtype=self.indata.dtype)
-                self.param_prior_means = tf.constant(
-                    np.where(mask, means, 0.0), dtype=self.indata.dtype
+                self.param_prior_sigmas = tf.constant(
+                    np.where(mask, sigmas, np.nan), dtype=self.indata.dtype
                 )
-                self.param_prior_log_sigma2 = tf.constant(
-                    np.where(mask, np.log(np.where(mask, sigmas, 1.0) ** 2), 0.0),
-                    dtype=self.indata.dtype,
+                self.param_prior_means = tf.constant(
+                    np.where(mask, means, np.nan), dtype=self.indata.dtype
                 )
                 logger.info(
                     f"[paramPriors] applying Gaussian priors to "
@@ -1939,21 +1933,25 @@ class Fitter:
         total = tf.reduce_sum(lc)
 
         # ParamModel Gaussian priors (applied when the model declares them).
-        # Per-entry mask is baked into param_prior_inv2 (zero where mask is
-        # False), so this is a single elementwise op with no branching.
+        # param_prior_sigmas / param_prior_means are NaN where no prior is
+        # declared; derive compute-safe forms via the mask (tf.where, so the
+        # NaN entries never enter the sum).
         if self.param_prior_active:
-            pm_params = tf.concat([self.get_poi(), self.get_model_nui()], axis=0)
-            lc_pm = (
-                0.5
-                * self.param_prior_inv2
-                * tf.square(pm_params - self.param_prior_means)
+            mask = self.param_prior_mask
+            zeros = tf.zeros_like(self.param_prior_sigmas)
+            inv2 = tf.where(
+                mask, tf.math.reciprocal(tf.square(self.param_prior_sigmas)), zeros
             )
+            means = tf.where(mask, self.param_prior_means, zeros)
+            pm_params = tf.concat([self.get_poi(), self.get_model_nui()], axis=0)
+            lc_pm = 0.5 * inv2 * tf.square(pm_params - means)
             if full_nll:
-                # 0.5*log(2π σ²) on entries with a prior. The log(σ²) term is
-                # precomputed (zero where masked off).
-                mask_dtype = tf.cast(self.param_prior_mask, lc_pm.dtype)
-                lc_pm = lc_pm + mask_dtype * (
-                    0.9189385332046727 + 0.5 * self.param_prior_log_sigma2
+                # 0.5*log(2π σ²) on entries with a prior.
+                lc_pm = lc_pm + tf.where(
+                    mask,
+                    0.9189385332046727
+                    + tf.math.log(self.param_prior_sigmas),
+                    zeros,
                 )
             total = total + tf.reduce_sum(lc_pm)
 

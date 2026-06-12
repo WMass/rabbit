@@ -829,9 +829,9 @@ def main():
     if getattr(ifitter, "param_prior_active", False):
         meta["param_priors"] = {
             "params": ifitter.param_model.params,  # all nparams names
-            "mask": ifitter.param_prior_mask_np,  # bool array
-            "sigmas": ifitter.param_prior_sigmas_np,  # NaN where mask False
-            "means": ifitter.param_prior_means_np,  # NaN where mask False
+            "mask": ifitter.param_prior_mask.numpy(),  # bool array
+            "sigmas": ifitter.param_prior_sigmas.numpy(),  # NaN where mask False
+            "means": ifitter.param_prior_means.numpy(),  # NaN where mask False
         }
 
     with workspace.Workspace(
