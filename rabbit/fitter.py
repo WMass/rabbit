@@ -1949,8 +1949,7 @@ class Fitter:
                 # 0.5*log(2π σ²) on entries with a prior.
                 lc_pm = lc_pm + tf.where(
                     mask,
-                    0.9189385332046727
-                    + tf.math.log(self.param_prior_sigmas),
+                    0.9189385332046727 + tf.math.log(self.param_prior_sigmas),
                     zeros,
                 )
             total = total + tf.reduce_sum(lc_pm)
