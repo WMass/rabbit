@@ -53,10 +53,12 @@ def nonprofiled_impacts_parms(
 
     x0_tmp = tf.identity(x0.value())
 
+    # prefit sigma = 1/sqrt(cw); the distinction from the variance 1/cw
+    # matters since ParamModel priors introduce genuinely non-unit cw
     err_x0 = tf.where(
         cw == 0.0,
         unconstrained_err,
-        tf.math.reciprocal(cw),
+        tf.math.rsqrt(cw),
     )
 
     for i, idx in enumerate(frozen_indices):
