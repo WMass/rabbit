@@ -269,8 +269,10 @@ def common_parser():
         nargs="*",
         action=OptionalListAction,
         help="""
-        Specify list of regex to unblind matching parameters of interest.
-        E.g. use '--unblind ^signal$' to unblind a parameter named signal or '--unblind' to unblind all.
+        Specify list of expressions to unblind matching parameters of interest.
+        Each entry is an exact parameter name or a regex matched against the full parameter
+        name (use e.g. 'alphaS.*' to match a family of parameters).
+        E.g. use '--unblind signal' to unblind a parameter named signal or '--unblind' to unblind all.
         """,
     )
     parser.add_argument(
@@ -279,7 +281,8 @@ def common_parser():
         default=[],
         nargs="*",
         help="""
-        Specify list of regex defining groups of parameters that share a single deterministic
+        Specify list of regex (matched against the full parameter name) defining groups of
+        parameters that share a single deterministic
         blinding offset (seeded from the regex string itself). Useful to keep relative pulls /
         differences between matched parameters meaningful while still blinding their absolute
         values. E.g. '--blindingGroup ^alphaS_y\\d+$' applies the same offset to all alphaS
@@ -300,7 +303,8 @@ def common_parser():
         default=[],
         nargs="+",
         help="""
-        Specify list of regex to freeze matching parameters of interest.
+        Specify list of expressions to freeze matching parameters of interest
+        (exact names or regex matched against the full parameter name).
         """,
     )
     parser.add_argument(

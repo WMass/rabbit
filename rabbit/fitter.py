@@ -32,10 +32,14 @@ CONTOUR_HESS_MODES = ("exact", "hvp", "frozen", "bfgs", "sr1")
 
 def match_regexp_params(regular_expressions, parameter_names):
     # Match parameter names against a list of expressions where each entry may
-    # be either an exact parameter name or a regex (re.match, anchored to the
-    # start). Returns the union of exact and regex matches, preserving the
-    # parameter_names order and de-duplicating. Mixing exact and regex entries
-    # in the same call is supported.
+    # be either an exact parameter name or a regex matched against the FULL
+    # parameter name (re.fullmatch). Full anchoring means an expression that
+    # names one parameter exactly can never also match parameters whose names
+    # merely extend it (important for --unblind, where a prefix match would
+    # silently unblind more than intended); match a family of parameters with
+    # an explicit pattern, e.g. 'alphaS.*'. Returns the union of exact and
+    # regex matches, preserving the parameter_names order and de-duplicating.
+    # Mixing exact and regex entries in the same call is supported.
     if isinstance(regular_expressions, str):
         regular_expressions = [regular_expressions]
 
@@ -47,7 +51,7 @@ def match_regexp_params(regular_expressions, parameter_names):
     for s in parameter_names:
         decoded = s.decode() if hasattr(s, "decode") else s
         if decoded in exact_lookup or any(
-            r.match(decoded) for r in compiled_expressions
+            r.fullmatch(decoded) for r in compiled_expressions
         ):
             if decoded not in seen:
                 seen.add(decoded)
@@ -574,6 +578,14 @@ class Fitter:
         unblind_parameters = match_regexp_params(
             unblind_parameter_expressions, all_param_names
         )
+        # unblinding is sensitive: always report exactly which parameters the
+        # expressions resolved to, so an over-broad pattern is visible
+        if unblind_parameters:
+            unblind_names = [
+                p.decode() if isinstance(p, bytes) else str(p)
+                for p in unblind_parameters
+            ]
+            logger.info(f"Unblinding {len(unblind_names)} parameters: {unblind_names}")
 
         # check if dataset is an integer (i.e. if it is real data or not) and use this to choose the random seed
         is_dataobs_int = np.sum(
