@@ -458,8 +458,11 @@ def fit(args, fitter, ws, dofit=True):
                 f"[timing] minimizer: {len(cb.loss_history)} iterations recorded"
             )
 
-    # prefit variances as the default fallback for add_parms_hist below
-    parms_variances = None
+    # default for add_parms_hist below: NaN variances so the parms hist is
+    # always written with Weight storage, and entries whose uncertainty was
+    # not computed (e.g. --noHessian with --noEDM) read NaN downstream
+    # instead of a silently absent or plausible-looking value.
+    parms_variances = np.full(len(fitter.parms), np.nan)
 
     # take covariance from externalPostfit in case the fit was skipped.
     # If the external fitresult does not contain a covariance (e.g. it was
