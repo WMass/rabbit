@@ -21,7 +21,9 @@ class ParamModel:
         # # optional: Gaussian priors on the model's parameters.
         # # If declared, the Fitter applies them automatically; the model
         # # itself decides whether (and for which parameters) to declare
-        # # priors, e.g. via its own --paramModel spec tokens.
+        # # priors, e.g. via its own --paramModel spec tokens. Priors on
+        # # POIs require allowNegativeParam=True (with the squared storage
+        # # the penalty would apply to sqrt(poi), so the Fitter raises).
         # self.prior_sigmas = # np.ndarray, shape (nparams,). Entries that are
         #                     # finite and > 0 are Gaussian-constrained at that
         #                     # width; NaN / non-finite / 0 entries leave the

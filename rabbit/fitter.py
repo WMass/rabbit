@@ -281,6 +281,83 @@ class Fitter:
 
         self.x = tf.Variable(xdefault, trainable=True, name="x")
 
+        # ParamModel Gaussian priors. The ParamModel itself decides whether
+        # its parameters carry priors, by declaring two optional attributes:
+        #   - prior_sigmas: np.ndarray shape (nparams,). Entries that are
+        #     finite and > 0 are Gaussian-constrained at that width; NaN /
+        #     non-finite / 0 entries leave the corresponding parameter free.
+        #   - prior_means : np.ndarray shape (nparams,), optional.
+        #     Defaults to param_model.xparamdefault when not provided.
+        # If the model declares priors they are applied; how to enable or
+        # disable them (e.g. a token in the --paramModel spec) is up to the
+        # model.
+        #
+        # Priors use the same constraint structure as the nuisance
+        # constraints: param_cw is the per-parameter constraint weight
+        # (1/sigma^2; 0 = free) and param_x0 the constraint center (the
+        # prior mean) — the ParamModel-block analogues of
+        # indata.constraintweights and theta0. _compute_lc adds
+        # 0.5 * cw * (param - x0)^2, prefit variances are 1/cw, and the toy
+        # randomization treats the centers exactly like theta0.
+        self.param_prior_active = False
+        pm = self.param_model
+        param_cw_np = np.zeros(pm.nparams, dtype=np.float64)
+        param_x0_np = np.zeros(pm.nparams, dtype=np.float64)
+        sigmas = getattr(pm, "prior_sigmas", None)
+        if sigmas is not None:
+            sigmas = np.asarray(sigmas, dtype=np.float64)
+            if sigmas.shape != (pm.nparams,):
+                raise ValueError(
+                    f"param_model.prior_sigmas must have shape ({pm.nparams},); "
+                    f"got {sigmas.shape}"
+                )
+            means = getattr(pm, "prior_means", None)
+            if means is None:
+                means = pm.xparamdefault.numpy().astype(np.float64)
+            else:
+                means = np.asarray(means, dtype=np.float64)
+                if means.shape != (pm.nparams,):
+                    raise ValueError(
+                        f"param_model.prior_means must have shape ({pm.nparams},); "
+                        f"got {means.shape}"
+                    )
+            mask = np.isfinite(sigmas) & (sigmas > 0)
+            n_priored = int(mask.sum())
+            if n_priored > 0:
+                if mask[: pm.npoi].any() and not pm.allowNegativeParam:
+                    raise ValueError(
+                        "Gaussian priors on POIs require allowNegativeParam="
+                        "True: with allowNegativeParam=False the stored "
+                        "parameter is sqrt(poi), so the Gaussian penalty "
+                        "would apply to sqrt(poi) rather than to the POI "
+                        "itself."
+                    )
+                self.param_prior_active = True
+                self.param_prior_mask = tf.constant(mask, dtype=tf.bool)
+                self.param_prior_sigmas = tf.constant(
+                    np.where(mask, sigmas, np.nan), dtype=self.indata.dtype
+                )
+                self.param_prior_means = tf.constant(
+                    np.where(mask, means, np.nan), dtype=self.indata.dtype
+                )
+                param_cw_np = np.where(mask, 1.0 / sigmas**2, 0.0)
+                param_x0_np = np.where(mask, means, 0.0)
+                logger.info(
+                    f"[paramPriors] applying Gaussian priors to "
+                    f"{n_priored}/{pm.nparams} ParamModel params:"
+                )
+                for i, p in enumerate(pm.params):
+                    if mask[i]:
+                        name = p.decode() if isinstance(p, bytes) else str(p)
+                        logger.info(f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}")
+        self.param_cw = tf.constant(param_cw_np, dtype=self.indata.dtype)
+        self.param_x0default = tf.constant(param_x0_np, dtype=self.indata.dtype)
+        # constraint centers for the ParamModel block; fluctuated in toys
+        # together with theta0
+        self.param_x0 = tf.Variable(
+            self.param_x0default, trainable=False, name="param_x0"
+        )
+
         # Per-parameter prefit variance vector. Always allocated; the
         # prefit covariance is intrinsically diagonal so this is the
         # only form needed for prefit uncertainties.
@@ -317,59 +394,6 @@ class Fitter:
             self.parms,
             self.indata.dtype,
         )
-
-        # ParamModel Gaussian priors. The ParamModel itself decides whether
-        # its parameters carry priors, by declaring two optional attributes:
-        #   - prior_sigmas: np.ndarray shape (nparams,). Entries that are
-        #     finite and > 0 are Gaussian-constrained at that width; NaN /
-        #     non-finite / 0 entries leave the corresponding parameter free.
-        #   - prior_means : np.ndarray shape (nparams,), optional.
-        #     Defaults to param_model.xparamdefault when not provided.
-        # If the model declares priors they are applied; how to enable or
-        # disable them (e.g. a token in the --paramModel spec) is up to the
-        # model. The penalty 0.5 * (x - μ)^2 / σ^2 is added to _compute_lc.
-        # param_prior_sigmas / param_prior_means hold the priors as declared
-        # (NaN where no prior); the compute-safe forms are derived in
-        # _compute_lc.
-        self.param_prior_active = False
-        pm = self.param_model
-        sigmas = getattr(pm, "prior_sigmas", None)
-        if sigmas is not None:
-            sigmas = np.asarray(sigmas, dtype=np.float64)
-            if sigmas.shape != (pm.nparams,):
-                raise ValueError(
-                    f"param_model.prior_sigmas must have shape ({pm.nparams},); "
-                    f"got {sigmas.shape}"
-                )
-            means = getattr(pm, "prior_means", None)
-            if means is None:
-                means = pm.xparamdefault.numpy().astype(np.float64)
-            else:
-                means = np.asarray(means, dtype=np.float64)
-                if means.shape != (pm.nparams,):
-                    raise ValueError(
-                        f"param_model.prior_means must have shape ({pm.nparams},); "
-                        f"got {means.shape}"
-                    )
-            mask = np.isfinite(sigmas) & (sigmas > 0)
-            n_priored = int(mask.sum())
-            if n_priored > 0:
-                self.param_prior_active = True
-                self.param_prior_mask = tf.constant(mask, dtype=tf.bool)
-                self.param_prior_sigmas = tf.constant(
-                    np.where(mask, sigmas, np.nan), dtype=self.indata.dtype
-                )
-                self.param_prior_means = tf.constant(
-                    np.where(mask, means, np.nan), dtype=self.indata.dtype
-                )
-                logger.info(
-                    f"[paramPriors] applying Gaussian priors to "
-                    f"{n_priored}/{pm.nparams} ParamModel params:"
-                )
-                for i, p in enumerate(pm.params):
-                    if mask[i]:
-                        name = p.decode() if isinstance(p, bytes) else str(p)
-                        logger.info(f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}")
 
         # constraint minima for nuisance parameters
         self.theta0 = tf.Variable(
@@ -678,21 +702,25 @@ class Fitter:
     def prefit_variance(self, unconstrained_err=0.0):
         """Per-parameter prefit variance vector of length npar.
 
-        Free parameters (POIs and unconstrained nuisances) are assigned a
-        placeholder variance of unconstrained_err**2 (zero by default).
-        Constrained nuisances take their variance from the constraint
-        term (1 / constraintweight).
+        Free parameters (ParamModel params without a prior and unconstrained
+        nuisances) are assigned a placeholder variance of unconstrained_err**2
+        (zero by default). Constrained entries take their variance from the
+        constraint term (1 / constraint weight), uniformly for priored
+        ParamModel params (param_cw) and constrained nuisances
+        (indata.constraintweights).
         """
-        var_poi = (
-            tf.ones([self.param_model.nparams], dtype=self.indata.dtype)
-            * unconstrained_err**2
+        var_param = tf.where(
+            self.param_cw == 0.0,
+            unconstrained_err**2
+            * tf.ones([self.param_model.nparams], dtype=self.indata.dtype),
+            tf.math.reciprocal(self.param_cw),
         )
         var_theta = tf.where(
             self.indata.constraintweights == 0.0,
             unconstrained_err**2,
             tf.math.reciprocal(self.indata.constraintweights),
         )
-        return tf.concat([var_poi, var_theta], axis=0)
+        return tf.concat([var_param, var_theta], axis=0)
 
     def prefit_covariance(self, unconstrained_err=0.0):
         """Full prefit covariance as a tf.linalg.LinearOperatorDiag.
@@ -732,7 +760,10 @@ class Fitter:
         self.lognobs.assign(tf.math.log(nobssafe))
 
     def theta0defaultassign(self):
+        # reset all constraint centers: the nuisance block and the
+        # ParamModel-prior block
         self.theta0.assign(self.theta0default)
+        self.param_x0.assign(self.param_x0default)
 
     def xdefaultassign(self):
         if self.param_model.nparams == 0:
@@ -763,33 +794,55 @@ class Fitter:
             reg.set_expectations(xinit, nexp0)
 
     def bayesassign(self):
-        # FIXME use theta0 as the mean and constraintweight to scale the width
+        # Sample the parameter values from their priors: width sqrt(1/cw)
+        # around the constraint centers wherever cw > 0 (constrained
+        # nuisances and priored ParamModel params); free entries stay at
+        # their defaults.
+        theta_part = self.theta0 + tf.sqrt(self.var_theta0) * tf.random.normal(
+            shape=self.theta0.shape, dtype=self.theta0.dtype
+        )
         if self.param_model.nparams == 0:
-            self.x.assign(
-                self.theta0
-                + tf.random.normal(shape=self.theta0.shape, dtype=self.theta0.dtype)
-            )
+            self.x.assign(theta_part)
         else:
-            self.x.assign(
-                tf.concat(
-                    [
-                        self.param_model.xparamdefault,
-                        self.theta0
-                        + tf.random.normal(
-                            shape=self.theta0.shape, dtype=self.theta0.dtype
-                        ),
-                    ],
-                    axis=0,
-                )
+            param_sigma = tf.where(
+                self.param_cw > 0,
+                tf.math.rsqrt(self.param_cw),
+                tf.zeros_like(self.param_cw),
             )
+            param_part = tf.where(
+                self.param_cw > 0,
+                self.param_x0
+                + param_sigma
+                * tf.random.normal(
+                    shape=self.param_x0.shape, dtype=self.param_x0.dtype
+                ),
+                self.param_model.xparamdefault,
+            )
+            self.x.assign(tf.concat([param_part, theta_part], axis=0))
 
         self.bbstat.randomize_bayes()
 
     def frequentistassign(self):
-        # FIXME use theta as the mean and constraintweight to scale the width
+        # Fluctuate the constraint centers around their defaults with the
+        # prefit constraint widths, uniformly for the nuisance block
+        # (theta0) and the ParamModel-prior block (param_x0). Entries with
+        # cw = 0 (unconstrained) are not randomized.
         self.theta0.assign(
-            tf.random.normal(shape=self.theta0.shape, dtype=self.theta0.dtype)
+            self.theta0default
+            + tf.sqrt(self.var_theta0)
+            * tf.random.normal(shape=self.theta0.shape, dtype=self.theta0.dtype)
         )
+        if self.param_prior_active:
+            param_sigma = tf.where(
+                self.param_cw > 0,
+                tf.math.rsqrt(self.param_cw),
+                tf.zeros_like(self.param_cw),
+            )
+            self.param_x0.assign(
+                self.param_x0default
+                + param_sigma
+                * tf.random.normal(shape=self.param_x0.shape, dtype=self.param_x0.dtype)
+            )
         self.bbstat.randomize_frequentist()
 
     def toyassign(
@@ -1932,25 +1985,18 @@ class Fitter:
 
         total = tf.reduce_sum(lc)
 
-        # ParamModel Gaussian priors (applied when the model declares them).
-        # param_prior_sigmas / param_prior_means are NaN where no prior is
-        # declared; derive compute-safe forms via the mask (tf.where, so the
-        # NaN entries never enter the sum).
+        # ParamModel Gaussian priors (applied when the model declares them):
+        # same structure as the nuisance constraint above, with param_cw and
+        # param_x0 in the roles of constraintweights and theta0.
         if self.param_prior_active:
-            mask = self.param_prior_mask
-            zeros = tf.zeros_like(self.param_prior_sigmas)
-            inv2 = tf.where(
-                mask, tf.math.reciprocal(tf.square(self.param_prior_sigmas)), zeros
-            )
-            means = tf.where(mask, self.param_prior_means, zeros)
             pm_params = tf.concat([self.get_poi(), self.get_model_nui()], axis=0)
-            lc_pm = 0.5 * inv2 * tf.square(pm_params - means)
+            lc_pm = self.param_cw * 0.5 * tf.square(pm_params - self.param_x0)
             if full_nll:
                 # 0.5*log(2π σ²) on entries with a prior.
                 lc_pm = lc_pm + tf.where(
-                    mask,
+                    self.param_prior_mask,
                     0.9189385332046727 + tf.math.log(self.param_prior_sigmas),
-                    zeros,
+                    tf.zeros_like(lc_pm),
                 )
             total = total + tf.reduce_sum(lc_pm)
 
