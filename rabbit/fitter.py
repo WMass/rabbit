@@ -610,7 +610,7 @@ class Fitter:
             if param in unblind_parameters:
                 continue
             seed = param_to_seed.get(param, param)
-            logger.debug(f"Blind signal strength modifier for {param} (seed='{seed}')")
+            logger.debug(f"Blind parameter {param} (seed='{seed}')")
             value = deterministic_random_from_string(seed)
             self._blinding_values_poi[i] = np.exp(value)
 
