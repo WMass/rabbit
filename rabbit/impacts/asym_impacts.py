@@ -9,12 +9,13 @@ generalized to the asymmetric case: per side, sqrt(delta^T rho_GG^-1 delta)
 over the group's scanned nuisances, with rho_GG the postfit correlation
 submatrix (see _group_impact).
 
-All constrained nuisances are scanned by default (nonlinear effects can
-produce asymmetric impacts even for structurally symmetric templates);
-use include/exclude to restrict the selection. Unconstrained nuisances
-(constraintweight = 0) are skipped since they have no finite Delta(2NLL)
-contour. An optional structural-symmetry skip (logkhalfdiff identically
-zero) is available programmatically via skip_symmetric.
+All nuisances are scanned by default, including unconstrained ones — like
+the symmetric traditional impacts, the data still gives them a finite
+postfit uncertainty and hence a finite Delta(2NLL)=q contour (nonlinear
+effects can also produce asymmetric impacts even for structurally
+symmetric templates). Use include/exclude to restrict the selection. An
+optional structural-symmetry skip (logkhalfdiff identically zero) is
+available programmatically via skip_symmetric.
 """
 
 import time

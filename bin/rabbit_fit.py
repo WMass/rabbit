@@ -231,8 +231,8 @@ def make_parser():
         default=False,
         action="store_true",
         help="Compute traditional asymmetric impacts on POIs by running a "
-        "Delta(2NLL)=1 contour scan per nuisance. Skips structurally "
-        "symmetric and unconstrained nuisances by default.",
+        "Delta(2NLL)=1 contour scan per nuisance. All nuisances are scanned "
+        "by default; restrict with --asymImpactsInclude/--asymImpactsExclude.",
     )
     parser.add_argument(
         "--asymImpactsInclude",
@@ -249,7 +249,7 @@ def make_parser():
     parser.add_argument(
         "--asymImpactsHess",
         default="exact",
-        choices=["exact", "hvp", "frozen", "bfgs", "sr1"],
+        choices=fitter.CONTOUR_HESS_MODES,
         help="Constraint-Hessian mode for the contour-scan in --asymImpacts. "
         "'exact' rebuilds the full N x N NLL Hessian each iteration (slow, "
         "reference). 'hvp' uses Hessian-vector products via a LinearOperator "

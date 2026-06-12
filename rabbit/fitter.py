@@ -24,6 +24,11 @@ from rabbit.tfhelpers import edmval_cov
 
 logger = logging.child_logger(__name__)
 
+# Supported constraint-Hessian modes for contour_scan (see its docstring for
+# what each mode does). Single source of truth for the CLI choices and the
+# contour_scan validation.
+CONTOUR_HESS_MODES = ("exact", "hvp", "frozen", "bfgs", "sr1")
+
 
 def match_regexp_params(regular_expressions, parameter_names):
     if isinstance(regular_expressions, str):
@@ -1006,7 +1011,6 @@ class Fitter:
         include=None,
         exclude=None,
         skip_symmetric=False,
-        skip_unconstrained=True,
         contour_xtol=1e-6,
         contour_gtol=1e-6,
         contour_maxiter=5000,
@@ -1014,8 +1018,10 @@ class Fitter:
     ):
         """Traditional asymmetric impacts via per-nuisance contour scan.
 
-        All constrained nuisances are scanned by default; use include/exclude
-        to restrict the selection.
+        All nuisances are scanned by default, including unconstrained ones —
+        like the symmetric traditional impacts, the data still gives them a
+        finite postfit uncertainty and hence a finite Delta(2NLL)=q contour.
+        Use include/exclude to restrict the selection.
 
         Args:
             nll_min: postfit reduced NLL. Computed from the current fit state
@@ -1027,19 +1033,14 @@ class Fitter:
                 structurally symmetric (logkhalfdiff identically zero). Off by
                 default since nonlinear effects can produce asymmetric impacts
                 even for symmetric templates.
-            skip_unconstrained: skip nuisances with constraintweight=0 (no
-                finite Delta(2NLL)=q contour).
         """
         if nll_min is None:
             nll_min = float(self.reduced_nll().numpy())
 
         nsyst = self.indata.nsyst
-        cw = self.indata.constraintweights.numpy()
         syst_names = np.array(self.indata.systs).astype(bytes)
 
         selected = np.ones(nsyst, dtype=bool)
-        if skip_unconstrained:
-            selected &= cw > 0
         if skip_symmetric:
             selected &= self.asymmetric_nuisance_mask()
         if include is not None:
@@ -1056,7 +1057,7 @@ class Fitter:
 
         logger.info(
             f"asym_impacts_parms: selected {len(selected_idxs)}/{nsyst} nuisances "
-            f"(skip_symmetric={skip_symmetric}, skip_unconstrained={skip_unconstrained})"
+            f"(skip_symmetric={skip_symmetric})"
         )
 
         return asym_impacts.asym_impacts_parms(
@@ -1075,7 +1076,6 @@ class Fitter:
         self,
         include=None,
         exclude=None,
-        skip_unconstrained=True,
         sigma=1.0,
         linear_warmstart=False,
     ):
@@ -1085,11 +1085,14 @@ class Fitter:
         the prefit constraint width) and re-run the full fit. POI shifts at
         each sign are the asymmetric global impacts.
 
+        Unconstrained nuisances (constraintweight = 0) are always skipped:
+        they have no prefit sigma, and their theta0 does not enter the NLL,
+        so the shifted refit would reproduce the nominal minimum exactly
+        (zero impact at the cost of two full fits).
+
         Args:
             include: optional regex(es) restricting which nuisances to scan.
             exclude: optional regex(es) excluding nuisances from the scan.
-            skip_unconstrained: skip nuisances with constraintweight=0; their
-                "1 prefit sigma" is undefined.
             sigma: shift magnitude in prefit-sigma units.
             linear_warmstart: experimental, see
                 global_asym_impacts.global_asym_impacts_parms.
@@ -1098,9 +1101,9 @@ class Fitter:
         cw = self.indata.constraintweights.numpy()
         syst_names = np.array(self.indata.systs).astype(bytes)
 
-        selected = np.ones(nsyst, dtype=bool)
-        if skip_unconstrained:
-            selected &= cw > 0
+        # theta0 of an unconstrained nuisance does not enter the NLL: no
+        # finite prefit sigma to shift by, and the refit would be a no-op.
+        selected = cw > 0
         if include is not None:
             keep = match_regexp_params(include, syst_names)
             keep_set = set(keep)
@@ -1115,7 +1118,7 @@ class Fitter:
 
         logger.info(
             f"global_asym_impacts_parms: selected {len(selected_idxs)}/{nsyst} "
-            f"nuisances (skip_unconstrained={skip_unconstrained})"
+            f"nuisances (unconstrained nuisances always excluded)"
         )
 
         return global_asym_impacts.global_asym_impacts_parms(
@@ -2359,7 +2362,7 @@ class Fitter:
         else:
             raise ValueError(
                 f"contour_scan: unknown hess_mode={hess_mode!r}; "
-                "expected one of 'exact', 'hvp', 'frozen', 'bfgs', 'sr1'."
+                f"expected one of {CONTOUR_HESS_MODES}."
             )
 
         def scipy_loss(x):
