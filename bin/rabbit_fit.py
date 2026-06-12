@@ -410,7 +410,13 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
 
                 fitter_saturated = copy.deepcopy(fitter)
 
-                toy_theta0 = tf.identity(fitter_saturated.theta0)
+                # preserve the (possibly toy-randomized) nuisance constraint
+                # centers across the re-init; the ParamModel block of x0 is
+                # rebuilt by init_fit_parms since the composite model has its
+                # own params
+                toy_theta0 = tf.identity(
+                    fitter_saturated.x0[fitter_saturated.param_model.nparams :]
+                )
                 saved_regularizers = fitter_saturated.regularizers
                 saved_tau = float(fitter_saturated.tau.numpy())
                 fitter_saturated.init_fit_parms(
@@ -419,7 +425,7 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                     unblind=args.unblind,
                     freeze_parameters=args.freezeParameters,
                 )
-                fitter_saturated.theta0.assign(toy_theta0)
+                fitter_saturated.x0[composite_model.nparams :].assign(toy_theta0)
                 fitter_saturated.regularizers = saved_regularizers
                 fitter_saturated.tau.assign(saved_tau)
 

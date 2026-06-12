@@ -89,8 +89,8 @@ def global_asym_impacts_parms(
 
     # Snapshot postfit nominal state to restore between iterations.
     x_nom = tf.identity(fitter.x.value())
-    theta0_nom = tf.identity(fitter.theta0.value())
-    theta0_nom_np = theta0_nom.numpy()
+    x0_nom = tf.identity(fitter.x0.value())
+    x0_nom_np = x0_nom.numpy()
     x_nom_np = x_nom.numpy()
 
     logger.info(
@@ -100,11 +100,11 @@ def global_asym_impacts_parms(
     )
 
     # Optional Gaussian-approximation warm-start.
-    # dxdtheta0 has shape [npar, nsyst]; column i gives the linearised
+    # dxdx0 has shape [npar, npar]; column nparams + i gives the linearised
     # response of the postfit minimum to a unit shift of theta0[i]. Computing
     # it once before the loop is the same cost as one --gaussianGlobalImpacts
     # call.
-    dxdtheta0_np = None
+    dxdx0_np = None
     if linear_warmstart:
         if fitter.cov is None:
             raise RuntimeError(
@@ -112,10 +112,10 @@ def global_asym_impacts_parms(
                 "(incompatible with --noHessian)."
             )
         t_lws = time.perf_counter()
-        dxdtheta0_tf, _, _ = fitter._dxdvars()
-        dxdtheta0_np = dxdtheta0_tf.numpy()
+        dxdx0_tf, _, _ = fitter._dxdvars()
+        dxdx0_np = dxdx0_tf.numpy()
         logger.info(
-            f"global_asym_impacts: dxdtheta0 prepared in "
+            f"global_asym_impacts: dxdx0 prepared in "
             f"{time.perf_counter() - t_lws:.2f}s"
         )
 
@@ -133,21 +133,21 @@ def global_asym_impacts_parms(
             shift = float(sign) * float(sigma)
 
             # Always shift the constraint center for nuisance i by `shift`.
-            theta0_shifted = theta0_nom_np.copy()
-            theta0_shifted[i] += shift
+            x0_shifted = x0_nom_np.copy()
+            x0_shifted[nparams + i] += shift
 
             # Warm-start x. With linear_warmstart, use the Gaussian-approx new
-            # minimum x_nom + dxdtheta0[:, i] * shift -- on near-Gaussian
+            # minimum x_nom + dxdx0[:, nparams+i] * shift -- on near-Gaussian
             # nuisances this lands at the new minimum to within roundoff.
             # Without it, just shift x[nparams+i] by `shift` so the nuisance
             # itself starts at the new constraint center.
             if linear_warmstart:
-                x_shifted = x_nom_np + dxdtheta0_np[:, i] * shift
+                x_shifted = x_nom_np + dxdx0_np[:, nparams + i] * shift
             else:
                 x_shifted = x_nom_np.copy()
                 x_shifted[nparams + i] += shift
 
-            fitter.theta0.assign(theta0_shifted)
+            fitter.x0.assign(x0_shifted)
             fitter.x.assign(x_shifted)
 
             try:
@@ -165,7 +165,7 @@ def global_asym_impacts_parms(
         logger.info(f"    took {t_per[k]:.2f}s")
 
     # Restore the fit state so downstream postfit computations see the nominal.
-    fitter.theta0.assign(theta0_nom)
+    fitter.x0.assign(x0_nom)
     fitter.x.assign(x_nom)
     if fitter.bbstat.enabled:
         fitter._profile_beta()
