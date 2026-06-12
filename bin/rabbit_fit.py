@@ -410,22 +410,34 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
 
                 fitter_saturated = copy.deepcopy(fitter)
 
-                # preserve the (possibly toy-randomized) nuisance constraint
-                # centers across the re-init; the ParamModel block of x0 is
-                # rebuilt by init_fit_parms since the composite model has its
-                # own params
-                toy_theta0 = tf.identity(
-                    fitter_saturated.x0[fitter_saturated.param_model.nparams :]
-                )
+                # preserve the (possibly toy-randomized) constraint centers
+                # across the re-init: the theta block maps 1:1, and the
+                # original model's prior centers land at [0:npoi] and
+                # [composite.npoi : composite.npoi+npou] in the composite
+                # [POIs | POUs] layout; the saturated model's own params keep
+                # the freshly initialized centers
+                orig_model = fitter_saturated.param_model
+                toy_x0 = tf.identity(fitter_saturated.x0.value())
                 saved_regularizers = fitter_saturated.regularizers
                 saved_tau = float(fitter_saturated.tau.numpy())
                 fitter_saturated.init_fit_parms(
                     composite_model,
                     args.setConstraintMinimum,
                     unblind=args.unblind,
+                    blinding_group=args.blindingGroup,
                     freeze_parameters=args.freezeParameters,
                 )
-                fitter_saturated.x0[composite_model.nparams :].assign(toy_theta0)
+                fitter_saturated.x0[composite_model.nparams :].assign(
+                    toy_x0[orig_model.nparams :]
+                )
+                if orig_model.npoi > 0:
+                    fitter_saturated.x0[: orig_model.npoi].assign(
+                        toy_x0[: orig_model.npoi]
+                    )
+                if orig_model.npou > 0:
+                    fitter_saturated.x0[
+                        composite_model.npoi : composite_model.npoi + orig_model.npou
+                    ].assign(toy_x0[orig_model.npoi : orig_model.nparams])
                 fitter_saturated.regularizers = saved_regularizers
                 fitter_saturated.tau.assign(saved_tau)
 
