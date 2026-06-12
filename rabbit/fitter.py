@@ -352,6 +352,11 @@ class Fitter:
                         logger.info(f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}")
         self.param_cw = tf.constant(param_cw_np, dtype=self.indata.dtype)
         self.param_x0default = tf.constant(param_x0_np, dtype=self.indata.dtype)
+        # indices (into the ParamModel block) of the priored params; impact
+        # sources in the global-impacts calculations
+        self.param_prior_idxs = tf.constant(
+            np.where(param_cw_np > 0)[0], dtype=tf.int64
+        )
         # constraint centers for the ParamModel block; fluctuated in toys
         # together with theta0
         self.param_x0 = tf.Variable(
@@ -1118,11 +1123,21 @@ class Fitter:
             self.bbstat.binByBinStatMode,
             self.globalImpactsFromJVP,
             self.cov,
+            param_prior_idxs=(
+                self.param_prior_idxs if self.param_prior_active else None
+            ),
         )
 
     @tf.function
     def gaussian_global_impacts_parms(self):
-        dxdtheta0, dxdnobs, dxdbeta0 = self._dxdvars()
+        dxdtheta0, dxdnobs, dxdbeta0, dxdparam_x0 = self._dxdvars()
+
+        if self.param_prior_active:
+            dxdparam0 = tf.gather(dxdparam_x0, self.param_prior_idxs, axis=1)
+            varparam0 = tf.gather(self._var_param_x0(), self.param_prior_idxs)
+        else:
+            dxdparam0 = None
+            varparam0 = None
 
         impacts, impacts_grouped = global_impacts.gaussian_global_impacts_parms(
             dxdtheta0,
@@ -1144,6 +1159,8 @@ class Fitter:
             self.bbstat.beta_shape,
             self.indata.systgroupidxs,
             self.data_cov_inv,
+            dxdparam0=dxdparam0,
+            varparam0=varparam0,
         )
 
         return impacts, impacts_grouped
@@ -1340,14 +1357,14 @@ class Fitter:
 
     def _dxdvars(self):
         with tf.GradientTape() as t2:
-            t2.watch([self.theta0, self.nobs, self.bbstat.beta0])
+            t2.watch([self.theta0, self.nobs, self.bbstat.beta0, self.param_x0])
             with tf.GradientTape() as t1:
-                t1.watch([self.theta0, self.nobs, self.bbstat.beta0])
+                t1.watch([self.theta0, self.nobs, self.bbstat.beta0, self.param_x0])
                 val = self._compute_loss()
             grad = t1.gradient(val, self.x)
-        pd2ldxdtheta0, pd2ldxdnobs, pd2ldxdbeta0 = t2.jacobian(
+        pd2ldxdtheta0, pd2ldxdnobs, pd2ldxdbeta0, pd2ldxdparam_x0 = t2.jacobian(
             grad,
-            [self.theta0, self.nobs, self.bbstat.beta0],
+            [self.theta0, self.nobs, self.bbstat.beta0, self.param_x0],
             unconnected_gradients="zero",
         )
 
@@ -1355,8 +1372,9 @@ class Fitter:
         dxdtheta0 = -self.cov @ pd2ldxdtheta0
         dxdnobs = -self.cov @ pd2ldxdnobs
         dxdbeta0 = -self.cov @ tf.reshape(pd2ldxdbeta0, [pd2ldxdbeta0.shape[0], -1])
+        dxdparam_x0 = -self.cov @ pd2ldxdparam_x0
 
-        return dxdtheta0, dxdnobs, dxdbeta0
+        return dxdtheta0, dxdnobs, dxdbeta0, dxdparam_x0
 
     def _dndvars(self, fun):
         with tf.GradientTape() as t:
@@ -1371,13 +1389,27 @@ class Fitter:
         )
 
         # apply chain rule to take into account correlations with the fit parameters
-        dxdtheta0, dxdnobs, dxdbeta0 = self._dxdvars()
+        dxdtheta0, dxdnobs, dxdbeta0, dxdparam_x0 = self._dxdvars()
 
         dndtheta0 = pdndtheta0 + pdndx @ dxdtheta0
         dndnobs = pdndnobs + pdndx @ dxdnobs
         dndbeta0 = tf.reshape(pdndbeta0, [pdndbeta0.shape[0], -1]) + pdndx @ dxdbeta0
+        # the yields depend on param_x0 only through the fit parameters, so
+        # there is no partial term
+        dndparam_x0 = pdndx @ dxdparam_x0
 
-        return n, dndtheta0, dndnobs, dndbeta0
+        return n, dndtheta0, dndnobs, dndbeta0, dndparam_x0
+
+    def _var_param_x0(self):
+        """Prefit variance of the ParamModel constraint centers (1/cw for
+        priored params, 0 for free ones)."""
+        return tf.where(
+            self.param_cw > 0,
+            tf.math.reciprocal(
+                tf.where(self.param_cw > 0, self.param_cw, tf.ones_like(self.param_cw))
+            ),
+            tf.zeros_like(self.param_cw),
+        )
 
     def _compute_expected(
         self, fun_exp, inclusive=True, profile=False, full=True, need_observables=True
@@ -1494,6 +1526,9 @@ class Fitter:
                 pdexpdbeta,
                 pd2ldbeta2_pdexpdbeta if pdexpdbeta is not None else None,
                 self.prefit_unconstrained_nuisance_uncertainty,
+                param_prior_idxs=(
+                    self.param_prior_idxs if self.param_prior_active else None
+                ),
             )
         else:
             impacts = None
@@ -1510,7 +1545,13 @@ class Fitter:
                     need_observables=need_observables,
                 )
 
-            _, dndtheta0, dndnobs, dndbeta0 = self._dndvars(fun_n)
+            _, dndtheta0, dndnobs, dndbeta0, dndparam_x0 = self._dndvars(fun_n)
+            if self.param_prior_active:
+                dndparam0 = tf.gather(dndparam_x0, self.param_prior_idxs, axis=1)
+                varparam0 = tf.gather(self._var_param_x0(), self.param_prior_idxs)
+            else:
+                dndparam0 = None
+                varparam0 = None
             impacts_gaussian, impacts_gaussian_grouped = (
                 global_impacts.gaussian_global_impacts_obs(
                     dndtheta0,
@@ -1529,6 +1570,8 @@ class Fitter:
                     self.bbstat.beta_shape,
                     self.indata.systgroupidxs,
                     self.data_cov_inv,
+                    dxdparam0=dndparam0,
+                    varparam0=varparam0,
                 )
             )
         else:
@@ -1809,9 +1852,18 @@ class Fitter:
             observed = fun(None, self.nobs)
             return expected - observed
 
-        residuals, dresdtheta0, dresdnobs, dresdbeta0 = self._dndvars(fun_res)
+        residuals, dresdtheta0, dresdnobs, dresdbeta0, dresdparam_x0 = self._dndvars(
+            fun_res
+        )
 
         res_cov = dresdtheta0 @ (self.var_theta0[:, None] * tf.transpose(dresdtheta0))
+
+        if self.param_prior_active:
+            # ParamModel prior centers contribute like additional auxiliary
+            # observables with variance 1/cw
+            res_cov += dresdparam_x0 @ (
+                self._var_param_x0()[:, None] * tf.transpose(dresdparam_x0)
+            )
 
         if self.covarianceFit:
             res_cov_stat = dresdnobs @ tf.linalg.solve(

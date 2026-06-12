@@ -22,8 +22,9 @@ def getGroupedImpactsAxes(
         impact_names.append("binByBinStat")
         if per_process:
             impact_names.extend([f"binByBinStat{p}" for p in indata.procs.astype(str)])
-    # ParamModel parameter groups are appended at the end, matching the column
-    # order produced by traditional_impacts.impacts_parms.
+    # ParamModel-related columns (parameter groups for the traditional
+    # impacts, prior sources for the global impacts) are appended at the
+    # end, matching the column order produced by the impact calculations.
     if extra_groups:
         impact_names.extend(extra_groups)
     return hist.axis.StrCategory(impact_names, name="impacts")
@@ -63,10 +64,20 @@ class Workspace:
         # some information for the impact histograms
         systs = list(fitter.indata.systs.astype(str))
         parms = list(fitter.parms.astype(str))
+        # ParamModel prior centers act as additional global-impact sources;
+        # their columns are appended after the systs / syst groups.
+        if fitter.param_prior_active:
+            prior_idxs = fitter.param_prior_idxs.numpy()
+            prior_names = [f"{parms[int(i)]}_prior" for i in prior_idxs]
+        else:
+            prior_names = []
         self.impact_axis = hist.axis.StrCategory(parms, name="impacts")
-        self.global_impact_axis = hist.axis.StrCategory(systs, name="impacts")
+        self.global_impact_axis = hist.axis.StrCategory(
+            systs + prior_names, name="impacts"
+        )
         # ParamModel impact groups (e.g. SCETlib NP gamma_nu / F_eff) are only
-        # computed by the traditional impacts, so extend that axis only.
+        # computed by the traditional impacts, so they extend that axis only;
+        # the prior sources extend the global axes only.
         param_impact_group_names = [
             name for name, _ in fitter._resolved_param_impact_groups()
         ]
@@ -80,6 +91,7 @@ class Workspace:
             fitter.indata,
             bin_by_bin_stat=fitter.bbstat.enabled,
             per_process=fitter.bbstat.binByBinStatMode == "full",
+            extra_groups=prior_names,
         )
 
         self.extension = "hdf5"
