@@ -362,6 +362,13 @@ class Fitter:
         self.param_x0 = tf.Variable(
             self.param_x0default, trainable=False, name="param_x0"
         )
+        # prefit variance of the ParamModel constraint centers (1/cw for
+        # priored params, 0 for free ones); the analogue of var_theta0
+        self.var_param_x0 = tf.where(
+            self.param_cw == 0.0,
+            tf.zeros_like(self.param_cw),
+            tf.math.reciprocal(self.param_cw),
+        )
 
         # Per-parameter prefit variance vector. Always allocated; the
         # prefit covariance is intrinsically diagonal so this is the
@@ -809,15 +816,10 @@ class Fitter:
         if self.param_model.nparams == 0:
             self.x.assign(theta_part)
         else:
-            param_sigma = tf.where(
-                self.param_cw > 0,
-                tf.math.rsqrt(self.param_cw),
-                tf.zeros_like(self.param_cw),
-            )
             param_part = tf.where(
                 self.param_cw > 0,
                 self.param_x0
-                + param_sigma
+                + tf.sqrt(self.var_param_x0)
                 * tf.random.normal(
                     shape=self.param_x0.shape, dtype=self.param_x0.dtype
                 ),
@@ -837,17 +839,11 @@ class Fitter:
             + tf.sqrt(self.var_theta0)
             * tf.random.normal(shape=self.theta0.shape, dtype=self.theta0.dtype)
         )
-        if self.param_prior_active:
-            param_sigma = tf.where(
-                self.param_cw > 0,
-                tf.math.rsqrt(self.param_cw),
-                tf.zeros_like(self.param_cw),
-            )
-            self.param_x0.assign(
-                self.param_x0default
-                + param_sigma
-                * tf.random.normal(shape=self.param_x0.shape, dtype=self.param_x0.dtype)
-            )
+        self.param_x0.assign(
+            self.param_x0default
+            + tf.sqrt(self.var_param_x0)
+            * tf.random.normal(shape=self.param_x0.shape, dtype=self.param_x0.dtype)
+        )
         self.bbstat.randomize_frequentist()
 
     def toyassign(
@@ -1134,7 +1130,7 @@ class Fitter:
 
         if self.param_prior_active:
             dxdparam0 = tf.gather(dxdparam_x0, self.param_prior_idxs, axis=1)
-            varparam0 = tf.gather(self._var_param_x0(), self.param_prior_idxs)
+            varparam0 = tf.gather(self.var_param_x0, self.param_prior_idxs)
         else:
             dxdparam0 = None
             varparam0 = None
@@ -1400,17 +1396,6 @@ class Fitter:
 
         return n, dndtheta0, dndnobs, dndbeta0, dndparam_x0
 
-    def _var_param_x0(self):
-        """Prefit variance of the ParamModel constraint centers (1/cw for
-        priored params, 0 for free ones)."""
-        return tf.where(
-            self.param_cw > 0,
-            tf.math.reciprocal(
-                tf.where(self.param_cw > 0, self.param_cw, tf.ones_like(self.param_cw))
-            ),
-            tf.zeros_like(self.param_cw),
-        )
-
     def _compute_expected(
         self, fun_exp, inclusive=True, profile=False, full=True, need_observables=True
     ):
@@ -1548,7 +1533,7 @@ class Fitter:
             _, dndtheta0, dndnobs, dndbeta0, dndparam_x0 = self._dndvars(fun_n)
             if self.param_prior_active:
                 dndparam0 = tf.gather(dndparam_x0, self.param_prior_idxs, axis=1)
-                varparam0 = tf.gather(self._var_param_x0(), self.param_prior_idxs)
+                varparam0 = tf.gather(self.var_param_x0, self.param_prior_idxs)
             else:
                 dndparam0 = None
                 varparam0 = None
@@ -1862,7 +1847,7 @@ class Fitter:
             # ParamModel prior centers contribute like additional auxiliary
             # observables with variance 1/cw
             res_cov += dresdparam_x0 @ (
-                self._var_param_x0()[:, None] * tf.transpose(dresdparam_x0)
+                self.var_param_x0[:, None] * tf.transpose(dresdparam_x0)
             )
 
         if self.covarianceFit:
@@ -2028,31 +2013,26 @@ class Fitter:
         return self._compute_nll(full_nll=False)
 
     def _compute_lc(self, full_nll=False):
-        # constraints
-        theta = self.get_theta()
-        lc = self.indata.constraintweights * 0.5 * tf.square(theta - self.theta0)
+        # One constraint term over the full effective parameter vector
+        # [poi, model_nui, theta]: the ParamModel block is constrained by
+        # param_cw / param_x0 (declared priors; cw = 0 -> free) and the
+        # nuisance block by indata.constraintweights / theta0.
+        xeff = self.get_x()
+        cw = tf.concat([self.param_cw, self.indata.constraintweights], axis=0)
+        x0 = tf.concat([self.param_x0, self.theta0], axis=0)
+        lc = cw * 0.5 * tf.square(xeff - x0)
         if full_nll:
-            # normalization factor for normal distribution: log(1/sqrt(2*pi)) = -0.9189385332046727
-            lc = lc + 0.9189385332046727 * self.indata.constraintweights
+            # normalization factor 0.5*log(2*pi*sigma^2) for constrained
+            # entries, with sigma^2 = 1/cw and
+            # log(1/sqrt(2*pi)) = -0.9189385332046727
+            lc = lc + tf.where(
+                cw > 0,
+                0.9189385332046727
+                - 0.5 * tf.math.log(tf.where(cw > 0, cw, tf.ones_like(cw))),
+                tf.zeros_like(lc),
+            )
 
-        total = tf.reduce_sum(lc)
-
-        # ParamModel Gaussian priors (applied when the model declares them):
-        # same structure as the nuisance constraint above, with param_cw and
-        # param_x0 in the roles of constraintweights and theta0.
-        if self.param_prior_active:
-            pm_params = tf.concat([self.get_poi(), self.get_model_nui()], axis=0)
-            lc_pm = self.param_cw * 0.5 * tf.square(pm_params - self.param_x0)
-            if full_nll:
-                # 0.5*log(2π σ²) on entries with a prior.
-                lc_pm = lc_pm + tf.where(
-                    self.param_prior_mask,
-                    0.9189385332046727 + tf.math.log(self.param_prior_sigmas),
-                    tf.zeros_like(lc_pm),
-                )
-            total = total + tf.reduce_sum(lc_pm)
-
-        return total
+        return tf.reduce_sum(lc)
 
     def _compute_lbeta(self, beta, full_nll=False):
         return self.bbstat.lbeta(beta, full_nll=full_nll)
