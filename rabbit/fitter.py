@@ -399,6 +399,10 @@ class Fitter:
 
     def load_fitresult(self, fitresult_file, fitresult_key, profile=True):
         # load results from external fit and set postfit value and covariance elements for common parameters
+        # external_cov_loaded records whether the loaded fitresult carried a
+        # covariance (it does not when it was produced with --noHessian), so
+        # callers can decide to recompute the Hessian at the loaded point.
+        self.external_cov_loaded = False
         cov_ext = None
         with h5py.File(fitresult_file, "r") as fext:
             if "x" in fext.keys():
@@ -439,6 +443,7 @@ class Fitter:
             covval = self.cov.numpy()
             covval[np.ix_(idxs, idxs)] = cov_ext[np.ix_(idxs_ext, idxs_ext)]
             self.cov.assign(tf.constant(covval))
+            self.external_cov_loaded = True
 
         if profile:
             self._profile_beta()
