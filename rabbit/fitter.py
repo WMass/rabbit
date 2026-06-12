@@ -214,7 +214,6 @@ class Fitter:
             unblind=options.unblind,
             blinding_group=getattr(options, "blindingGroup", []),
             freeze_parameters=options.freezeParameters,
-            options=options,
         )
 
         self.nexpnom = tf.Variable(
@@ -228,7 +227,6 @@ class Fitter:
         unblind=False,
         blinding_group=[],
         freeze_parameters=[],
-        options=None,
     ):
         self.param_model = param_model
 
@@ -320,78 +318,64 @@ class Fitter:
             self.indata.dtype,
         )
 
-        # ParamModel Gaussian priors (opt-in via --paramModelPriors).
-        # When enabled, the Fitter reads two optional attributes from the
-        # ParamModel:
+        # ParamModel Gaussian priors. The ParamModel itself decides whether
+        # its parameters carry priors, by declaring two optional attributes:
         #   - prior_sigmas: np.ndarray shape (nparams,). Entries that are
         #     finite and > 0 are Gaussian-constrained at that width; NaN /
         #     non-finite / 0 entries leave the corresponding parameter free.
         #   - prior_means : np.ndarray shape (nparams,), optional.
         #     Defaults to param_model.xparamdefault when not provided.
-        # The penalty 0.5 * (x - μ)^2 / σ^2 is added to _compute_lc.
+        # If the model declares priors they are applied; how to enable or
+        # disable them (e.g. a token in the --paramModel spec) is up to the
+        # model. The penalty 0.5 * (x - μ)^2 / σ^2 is added to _compute_lc.
         self.param_prior_active = False
         self.param_prior_mask_np = None
         self.param_prior_sigmas_np = None
         self.param_prior_means_np = None
-        if getattr(options, "paramModelPriors", False):
-            pm = self.param_model
-            sigmas = getattr(pm, "prior_sigmas", None)
-            if sigmas is not None:
-                sigmas = np.asarray(sigmas, dtype=np.float64)
-                if sigmas.shape != (pm.nparams,):
-                    raise ValueError(
-                        f"param_model.prior_sigmas must have shape ({pm.nparams},); "
-                        f"got {sigmas.shape}"
-                    )
-                means = getattr(pm, "prior_means", None)
-                if means is None:
-                    means = pm.xparamdefault.numpy().astype(np.float64)
-                else:
-                    means = np.asarray(means, dtype=np.float64)
-                    if means.shape != (pm.nparams,):
-                        raise ValueError(
-                            f"param_model.prior_means must have shape ({pm.nparams},); "
-                            f"got {means.shape}"
-                        )
-                mask = np.isfinite(sigmas) & (sigmas > 0)
-                n_priored = int(mask.sum())
-                if n_priored > 0:
-                    self.param_prior_active = True
-                    self.param_prior_mask_np = mask.copy()
-                    self.param_prior_sigmas_np = np.where(mask, sigmas, np.nan)
-                    self.param_prior_means_np = np.where(mask, means, np.nan)
-                    inv2_np = np.where(mask, 1.0 / sigmas**2, 0.0)
-                    self.param_prior_mask = tf.constant(mask, dtype=tf.bool)
-                    self.param_prior_inv2 = tf.constant(
-                        inv2_np, dtype=self.indata.dtype
-                    )
-                    self.param_prior_means = tf.constant(
-                        np.where(mask, means, 0.0), dtype=self.indata.dtype
-                    )
-                    self.param_prior_log_sigma2 = tf.constant(
-                        np.where(mask, np.log(np.where(mask, sigmas, 1.0) ** 2), 0.0),
-                        dtype=self.indata.dtype,
-                    )
-                    logger.info(
-                        f"[paramPriors] applying Gaussian priors to "
-                        f"{n_priored}/{pm.nparams} ParamModel params:"
-                    )
-                    for i, p in enumerate(pm.params):
-                        if mask[i]:
-                            name = p.decode() if isinstance(p, bytes) else str(p)
-                            logger.info(
-                                f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}"
-                            )
-                else:
-                    logger.info(
-                        "[paramPriors] --paramModelPriors set but prior_sigmas "
-                        "has no finite entries; no priors applied."
-                    )
-            else:
-                logger.info(
-                    "[paramPriors] --paramModelPriors set but ParamModel does "
-                    "not declare prior_sigmas; no priors applied."
+        pm = self.param_model
+        sigmas = getattr(pm, "prior_sigmas", None)
+        if sigmas is not None:
+            sigmas = np.asarray(sigmas, dtype=np.float64)
+            if sigmas.shape != (pm.nparams,):
+                raise ValueError(
+                    f"param_model.prior_sigmas must have shape ({pm.nparams},); "
+                    f"got {sigmas.shape}"
                 )
+            means = getattr(pm, "prior_means", None)
+            if means is None:
+                means = pm.xparamdefault.numpy().astype(np.float64)
+            else:
+                means = np.asarray(means, dtype=np.float64)
+                if means.shape != (pm.nparams,):
+                    raise ValueError(
+                        f"param_model.prior_means must have shape ({pm.nparams},); "
+                        f"got {means.shape}"
+                    )
+            mask = np.isfinite(sigmas) & (sigmas > 0)
+            n_priored = int(mask.sum())
+            if n_priored > 0:
+                self.param_prior_active = True
+                self.param_prior_mask_np = mask.copy()
+                self.param_prior_sigmas_np = np.where(mask, sigmas, np.nan)
+                self.param_prior_means_np = np.where(mask, means, np.nan)
+                inv2_np = np.where(mask, 1.0 / sigmas**2, 0.0)
+                self.param_prior_mask = tf.constant(mask, dtype=tf.bool)
+                self.param_prior_inv2 = tf.constant(inv2_np, dtype=self.indata.dtype)
+                self.param_prior_means = tf.constant(
+                    np.where(mask, means, 0.0), dtype=self.indata.dtype
+                )
+                self.param_prior_log_sigma2 = tf.constant(
+                    np.where(mask, np.log(np.where(mask, sigmas, 1.0) ** 2), 0.0),
+                    dtype=self.indata.dtype,
+                )
+                logger.info(
+                    f"[paramPriors] applying Gaussian priors to "
+                    f"{n_priored}/{pm.nparams} ParamModel params:"
+                )
+                for i, p in enumerate(pm.params):
+                    if mask[i]:
+                        name = p.decode() if isinstance(p, bytes) else str(p)
+                        logger.info(f"    {name}: μ={means[i]:.4g} σ={sigmas[i]:.4g}")
 
         # constraint minima for nuisance parameters
         self.theta0 = tf.Variable(
@@ -1954,7 +1938,7 @@ class Fitter:
 
         total = tf.reduce_sum(lc)
 
-        # ParamModel Gaussian priors (opt-in via --paramModelPriors).
+        # ParamModel Gaussian priors (applied when the model declares them).
         # Per-entry mask is baked into param_prior_inv2 (zero where mask is
         # False), so this is a single elementwise op with no branching.
         if self.param_prior_active:

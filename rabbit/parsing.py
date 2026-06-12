@@ -247,17 +247,6 @@ def common_parser():
         help="Don't compute the estimated distance to minimum as fit quality evaluation",
     )
     parser.add_argument(
-        "--paramModelPriors",
-        default=False,
-        action="store_true",
-        help="Opt in to Gaussian priors on ParamModel parameters. When set, "
-        "the Fitter reads param_model.prior_sigmas (np.ndarray of shape "
-        "(nparams,), entries finite > 0 → prior of that width, NaN → free) "
-        "and param_model.prior_means (defaults to param_model.xparamdefault) "
-        "and adds the corresponding penalty to the NLL constraint term. By "
-        "default the feature is off and ParamModel params float free.",
-    )
-    parser.add_argument(
         "--forceLinear",
         default=False,
         action="store_true",

@@ -18,8 +18,10 @@ class ParamModel:
         # self.is_linear = # define if the model is linear in the parameters
         # self.allowNegativeParam = # define if the POI parameters can be negative or not
         #
-        # # optional: Gaussian priors on the model's parameters
-        # # consumed by Fitter when --paramModelPriors is set (otherwise ignored).
+        # # optional: Gaussian priors on the model's parameters.
+        # # If declared, the Fitter applies them automatically; the model
+        # # itself decides whether (and for which parameters) to declare
+        # # priors, e.g. via its own --paramModel spec tokens.
         # self.prior_sigmas = # np.ndarray, shape (nparams,). Entries that are
         #                     # finite and > 0 are Gaussian-constrained at that
         #                     # width; NaN / non-finite / 0 entries leave the
