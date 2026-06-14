@@ -241,6 +241,37 @@ class Fitter:
             scale = tf.constant(k / half, dtype=self.indata.dtype)  # = 2
             self.norm_A = scale * tf.reduce_sum(norm_folds[:half], axis=0)
             self.norm_B = scale * tf.reduce_sum(norm_folds[half:], axis=0)
+
+        # Split-logk halves (optional): when systematics were written with a
+        # fold_axis (hlogk_folds present) each half uses its own logk so the
+        # systematic-template noise is de-biased too; otherwise both halves share
+        # self.logk (the dominant nominal noise is already de-biased via norm^A/B).
+        # Per-fold logk == per-half logk only for k=2 (log-ratio, not additive),
+        # and the x2 norm rescale leaves the ratio unchanged.
+        self.logk_A = self.logk
+        self.logk_B = self.logk
+        logk_folds = getattr(self.indata, "logk_folds", None)
+        if logk_folds is not None:
+            if int(logk_folds.shape[0]) != 2:
+                raise NotImplementedError(
+                    "split-logk (hlogk_folds) is currently supported only for k=2 "
+                    "folds (per-fold logk == per-half logk only when k=2)."
+                )
+            if not self.indata.symmetric_tensor:
+                raise NotImplementedError("split-logk requires a symmetric tensor.")
+            # apply the same constant rnorm_init scaling as _init_logk_scaled
+            if self.indata.systematic_type == "normal" and self.param_model.nparams > 0:
+                rnorm_init = tf.broadcast_to(
+                    self.param_model.compute(
+                        self.param_model.xparamdefault, full=True
+                    ),
+                    [self.indata.nbinsfull, self.indata.nproc],
+                )
+                self.logk_A = logk_folds[0] * rnorm_init[..., None]
+                self.logk_B = logk_folds[1] * rnorm_init[..., None]
+            else:
+                self.logk_A = logk_folds[0]
+                self.logk_B = logk_folds[1]
         if self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is None:
             logger.warning(
                 f"--mcStatDebias {self.mcStatDebias} requested but no fold "
@@ -1846,18 +1877,21 @@ class Fitter:
         else:
             if templates == "A":
                 norm_src = self.norm_A
+                logk_src = self.logk_A
             elif templates == "B":
                 norm_src = self.norm_B
+                logk_src = self.logk_B
             else:
                 norm_src = self.indata.norm
+                logk_src = self.logk
 
             if full or self.indata.nbinsmasked == 0:
                 nbins = self.indata.nbinsfull
-                logk = self.logk
+                logk = logk_src
                 norm = norm_src
             else:
                 nbins = self.indata.nbins
-                logk = self.logk[:nbins]
+                logk = logk_src[:nbins]
                 norm = norm_src[:nbins]
 
             if self.indata.symmetric_tensor:

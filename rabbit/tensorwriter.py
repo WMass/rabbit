@@ -58,6 +58,9 @@ class TensorWriter:
         # Populated only when add_process is called with fold_axis != None.
         self.dict_norm_folds = {}  # [channel][process] -> [k, nbinschan]
         self.fold_k = {}  # [channel][process] -> k
+        # Split-logk fold templates (only for systematics added with fold_axis):
+        # dict_logkavg_folds[channel][process][syst] = [k, nbinschan].
+        self.dict_logkavg_folds = {}  # [channel][process][syst] -> [k, nbinschan]
         self.dict_logkavg = {}  # [channel][proc][syst]
         self.dict_logkhalfdiff = {}  # [channel][proc][syst]
         self.dict_logkavg_indices = {}
@@ -370,6 +373,7 @@ class TensorWriter:
         self.dict_sumw2[name] = {}
         self.dict_norm_folds[name] = {}
         self.fold_k[name] = {}
+        self.dict_logkavg_folds[name] = {}
         self.dict_beta_variations[name] = {}
 
         # add masked channels last
@@ -1234,17 +1238,33 @@ class TensorWriter:
         add_to_data_covariance=False,
         as_difference=False,
         syst_axes=None,
+        fold_axis=None,
         **kargs,
     ):
         """
         h: either a single histogram with the systematic variation if mirror=True or a list of two histograms with the up and down variation
         as_difference: if True, interpret the histogram values as the difference with respect to the nominal (i.e. the absolute variation is norm + h)
+        fold_axis: optional name of an MC-stat fold axis carried by `h` (the SAME
+                   axis used for add_process). When given, the systematic's logk is
+                   SPLIT per fold (stored as hlogk_folds) so its template noise is
+                   also de-biased by the two-half cross-fit; the full systematic is
+                   registered by projecting the fold axis out. Omit (default) to
+                   share one logk across folds (recommended; the dominant
+                   nominal-template noise is already de-biased via norm^A.norm^B).
+                   Minimal support: dense, single-hist (mirror=True), no other
+                   extra syst axes.
         syst_axes: optional list of axis names in h that represent independent systematics.
                    If None (default) and h is a hist-like object with axes beyond the channel,
                    the extra axes are auto-detected and each bin combination becomes a separate
                    systematic with name "{name}_{label_0}_{label_1}_...". Pass an empty list
                    to disable auto-detection.
         """
+
+        if fold_axis is not None:
+            return self._add_systematic_folded(
+                h, name, process, channel, kfactor, mirror, symmetrize,
+                add_to_data_covariance, as_difference, syst_axes, fold_axis, **kargs
+            )
 
         # Fast batched path for SparseHist multi-systematic input. Conditions:
         #   - extra (systematic) axes are present
@@ -1367,6 +1387,73 @@ class TensorWriter:
         self.book_systematic(
             var_name_out, add_to_data_covariance=add_to_data_covariance, **kargs
         )
+
+    def _add_systematic_folded(
+        self, h, name, process, channel, kfactor, mirror, symmetrize,
+        add_to_data_covariance, as_difference, syst_axes, fold_axis, **kargs
+    ):
+        """Add a systematic whose variation histogram carries an MC-stat fold
+        axis, SPLITTING logk per fold (RABBIT_MCSTAT_DESIGN.md §2a). The full
+        systematic is registered by projecting the fold axis out; per-fold
+        logkavg [k, nbinschan] is stored for the two-half cross-fit so the
+        systematic's own template noise is de-biased.
+
+        Minimal support: dense histogram, single variation (mirror=True), and the
+        fold axis the only extra axis beyond the channel. The process must have
+        been added with the SAME fold_axis (so per-fold nominals exist)."""
+        if self.sparse and self._issparse(h):
+            raise NotImplementedError("fold_axis systematics: sparse not supported.")
+        if isinstance(h, (list, tuple)) or not mirror:
+            raise NotImplementedError(
+                "fold_axis systematics: only the symmetric single-histogram "
+                "(mirror=True) case is supported."
+            )
+        if process not in self.dict_norm_folds[channel]:
+            raise RuntimeError(
+                f"add_systematic(fold_axis=...): process '{process}' has no fold "
+                f"templates; add it with the same fold_axis first."
+            )
+        norm_folds = self.dict_norm_folds[channel][process]   # [k, nbinschan]
+        k = norm_folds.shape[0]
+        ax_names = [a.name for a in h.axes]
+        if isinstance(fold_axis, str):
+            if fold_axis not in ax_names:
+                raise ValueError(
+                    f"fold_axis '{fold_axis}' not found in axes {ax_names}"
+                )
+            fold_idx = ax_names.index(fold_axis)
+        else:
+            fold_idx = int(fold_axis)
+        if h.axes[fold_idx].size != k:
+            raise ValueError(
+                f"systematic fold axis size {h.axes[fold_idx].size} != process k={k}"
+            )
+
+        flow = self.channels[channel]["flow"]
+        systematic_type = "normal" if add_to_data_covariance else self.systematic_type
+
+        # per-fold logkavg vs the per-fold nominal
+        logk_folds = np.zeros_like(norm_folds)
+        for f in range(k):
+            syst_f = self.get_flat_values(h[{fold_idx: f}], flow=flow)
+            norm_f = norm_folds[f]
+            if as_difference:
+                syst_f = norm_f + syst_f
+            logk_folds[f] = self.get_logk(
+                syst_f, norm_f, kfactor, systematic_type=systematic_type
+            )
+
+        # register the FULL systematic by projecting the fold axis out
+        h_full = h[{fold_idx: sum}]
+        self.add_systematic(
+            h_full, name, process, channel, kfactor=kfactor, mirror=mirror,
+            symmetrize=symmetrize, add_to_data_covariance=add_to_data_covariance,
+            as_difference=as_difference, syst_axes=syst_axes, **kargs
+        )
+        # store the per-fold logk under the resolved (full) systematic name(s)
+        if process not in self.dict_logkavg_folds[channel]:
+            self.dict_logkavg_folds[channel][process] = {}
+        self.dict_logkavg_folds[channel][process][name] = logk_folds.astype(self.dtype)
 
     def add_beta_variations(
         self,
@@ -2056,6 +2143,26 @@ class TensorWriter:
             if self.has_beta_variations:
                 beta_variations = np.zeros([nbinsfull, nbins, nproc], self.dtype)
 
+            # Split-logk fold tensor [k, nbinsfull, nproc, nsyst]: built only when
+            # at least one systematic was added with a fold_axis. Folded systs get
+            # their per-fold logk; all other (bin,proc,syst) entries replicate the
+            # full logk/k-equivalent so logk_A == logk_B for them (shared, no extra
+            # de-bias). Requires a symmetric tensor.
+            any_folded_syst = any(
+                len(self.dict_logkavg_folds[c].get(p, {}))
+                for c in self.channels
+                for p in self.dict_logkavg_folds[c]
+            )
+            logk_folds = None
+            if any_folded_syst:
+                if not self.symmetric_tensor:
+                    raise NotImplementedError(
+                        "fold_axis systematics require a symmetric tensor."
+                    )
+                kset = {k for c in self.channels for k in self.fold_k[c].values()}
+                kfold = kset.pop()
+                logk_folds = np.zeros([kfold, nbinsfull, nproc, nsyst], self.dtype)
+
             for chan in self.channels.keys():
                 nbinschan = self.nbinschan[chan]
                 dict_norm_chan = self.dict_norm[chan]
@@ -2070,9 +2177,25 @@ class TensorWriter:
 
                     dict_logkavg_proc = self.dict_logkavg[chan][proc]
                     dict_logkhalfdiff_proc = self.dict_logkhalfdiff[chan][proc]
+                    logkavg_folds_proc = (
+                        self.dict_logkavg_folds[chan].get(proc, {})
+                        if logk_folds is not None
+                        else {}
+                    )
                     for isyst, syst in enumerate(systs):
                         if syst not in dict_logkavg_proc.keys():
                             continue
+
+                        if logk_folds is not None:
+                            if syst in logkavg_folds_proc:
+                                logk_folds[:, ibin : ibin + nbinschan, iproc, isyst] = (
+                                    logkavg_folds_proc[syst]
+                                )
+                            else:
+                                # shared across folds: replicate the full logk
+                                logk_folds[:, ibin : ibin + nbinschan, iproc, isyst] = (
+                                    dict_logkavg_proc[syst][None, :]
+                                )
 
                         if self.symmetric_tensor:
                             logk[ibin : ibin + nbinschan, iproc, isyst] = (
@@ -2296,6 +2419,12 @@ class TensorWriter:
                 logk, f, "hlogk", maxChunkBytes=self.chunkSize
             )
             logk = None
+
+            if logk_folds is not None:
+                nbytes += h5pyutils_write.writeFlatInChunks(
+                    logk_folds, f, "hlogk_folds", maxChunkBytes=self.chunkSize
+                )
+                logk_folds = None
 
             if self.has_beta_variations:
                 nbytes += h5pyutils_write.writeFlatInChunks(
