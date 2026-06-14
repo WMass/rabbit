@@ -303,6 +303,15 @@ class Fitter:
                     "(RESULTS.md S9a). Use a linear parametrization for the de-biased "
                     "parameters, or the two-half method (--mcStatDebias twoHalf)."
                 )
+            if self.mcstat_M is not None and self.bbstat.enabled:
+                logger.warning(
+                    "--mcStatDebias continuousM with bin-by-bin stat (BB-lite) ON: "
+                    "M must be computed with the BB-lite-inflated variance "
+                    "(mu_b + sum_proc sumw2) in its denominator, NOT the bare data "
+                    "variance. Otherwise M over-subtracts the (already BB-inflated) "
+                    "curvature and H - M becomes non-positive-definite (the fit will "
+                    "diverge / Cholesky will fail). See RABBIT_MCSTAT_DESIGN.md §1b."
+                )
 
     def init_fit_parms(
         self,
@@ -2196,21 +2205,39 @@ class Fitter:
 
         nexp = nexpfullcentral[: self.indata.nbins]
 
-        if (
-            self.mcStatDebias in ("twoHalf", "kfold")
-            and self.norm_A is not None
-        ):
+        debiased = (
+            self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is not None
+        )
+        if debiased:
             # Cross-fit jackknife combination L_cf = 2 L_full - 1/2 L_A - 1/2 L_B.
             # Since mu_bar = 1/2(n_A + n_B) = n_full exactly, this de-biases the
             # point (gradient = cross-fit score) and curvature (cross-half
             # Fisher) regardless of nonlinearity. Shared logk; full templates
-            # carry the BB-lite beta profiling (unchanged).
+            # carry the BB-lite beta profiling.
             nexp_A = self._compute_yields_noBBB(
                 full=False, compute_norm=False, templates="A"
             )[0][: self.indata.nbins]
             nexp_B = self._compute_yields_noBBB(
                 full=False, compute_norm=False, templates="B"
             )[0][: self.indata.nbins]
+            if self.bbstat.enabled:
+                # Apply the FULL-sample profiled beta (per-bin multiplicative
+                # factor beta = nexp / nexp_full_raw) to the half predictions too.
+                # Without this the BB-lite profiling flattens L_full's curvature
+                # while the -1/2 L_A - 1/2 L_B terms keep full curvature, making
+                # the jackknife A = 2 H_full,bb - 1/2 H_A - 1/2 H_B indefinite
+                # (unbounded objective). Sharing beta keeps H_A,bb ~ H_B,bb ~
+                # H_full,bb so A ~ H_full,bb > 0.
+                nexp_full_raw = self._compute_yields_noBBB(
+                    full=False, compute_norm=False, templates="full"
+                )[0][: self.indata.nbins]
+                beta_factor = nexp / tf.where(
+                    nexp_full_raw == 0.0,
+                    tf.ones_like(nexp_full_raw),
+                    nexp_full_raw,
+                )
+                nexp_A = nexp_A * beta_factor
+                nexp_B = nexp_B * beta_factor
             ln = (
                 2.0 * self._compute_ln(nexp, full_nll)
                 - 0.5 * self._compute_ln(nexp_A, full_nll)
@@ -2221,6 +2248,9 @@ class Fitter:
 
         lc = self._compute_lc(full_nll)
 
+        # lbeta (BB-lite MC-stat constraint) and lc (theta priors) are counted
+        # once. With two-half the same profiled beta is shared across the full
+        # and half terms (see above), so its constraint enters with weight 1.
         lbeta = self._compute_lbeta(beta, full_nll)
 
         if len(self.regularizers):

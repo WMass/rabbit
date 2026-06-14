@@ -331,6 +331,16 @@ class TensorWriter:
         ``H_data - M``. ``param_names`` label the rows/cols of ``M`` and are
         resolved against the fit parameter list at fit time.
 
+        IMPORTANT — denominator / BB-lite: ``mu_b`` is the per-bin variance used
+        to weight the score outer products, i.e. the SAME variance the fit's
+        per-bin term uses. With bin-by-bin stat (BB-lite) ON, that effective
+        variance is the INFLATED ``mu_b + sum_proc sumw2_b`` (data stat + MC
+        stat), so ``M`` must use that denominator. Using the bare data variance
+        while BB-lite is on makes ``M`` roughly a factor ~2 too large, so
+        ``H_data - M`` goes non-positive-definite and the fit diverges
+        (RABBIT_MCSTAT_DESIGN.md §1b). With BB-lite OFF use ``mu_b`` = the data
+        (chisq) or expected (Poisson) variance.
+
         Parameters
         ----------
         M : (n, n) array_like
