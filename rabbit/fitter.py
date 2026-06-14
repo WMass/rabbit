@@ -214,6 +214,31 @@ class Fitter:
             self.expected_yield(), trainable=False, name="nexpnom"
         )
 
+        # --- limited-MC-statistics de-biasing options
+        self.mcStatDebias = getattr(options, "mcStatDebias", "none")
+        self.mcStatDebiasCov = getattr(options, "mcStatDebiasCov", "sandwich")
+        self.mcStatKfold = getattr(options, "mcStatKfold", 2)
+        self.covMode = getattr(options, "covMode", "observed")
+        # Frozen noise-floor matrix M (nparams x nparams), reconstructed from any
+        # external term named "mcstat*" (TensorWriter.add_mc_stat_moment stores
+        # hess = -M, so M = -scatter(hess_dense)). Used for the continuous-M
+        # sandwich covariance Sigma = A^-1 + A^-1 M A^-1 (H - A = M).
+        self.mcstat_M = self._build_mcstat_M()
+        if self.mcStatDebias == "continuousM" and self.mcstat_M is None:
+            logger.warning(
+                "--mcStatDebias continuousM requested but no 'mcstat' external "
+                "moment term found in the input; continuous-M is inactive. Supply "
+                "M via TensorWriter.add_mc_stat_moment(M, param_names)."
+            )
+        if self.mcStatDebias == "continuousM" and not self.param_model.is_linear:
+            logger.warning(
+                "--mcStatDebias continuousM: the param model is NONLINEAR "
+                "(e.g. the default rabbit x^2 POI transform). The -1/2 theta^T M theta "
+                "penalty is cancelled by Fisher growth at the shifted minimum and will "
+                "NOT de-bias the point or covariance (RESULTS.md S9a). Use "
+                "--allowNegativeParam (linear POI) or the two-half method instead."
+            )
+
     def init_fit_parms(
         self,
         param_model,
@@ -788,6 +813,67 @@ class Fitter:
                 )
                 self.x.assign(pparms.sample())
             self.bbstat.randomize_postfit()
+
+    def _build_mcstat_M(self):
+        """Reconstruct the frozen noise-floor matrix M (nparams x nparams) from
+        external terms whose name starts with 'mcstat'.
+
+        TensorWriter.add_mc_stat_moment stores the term Hessian as hess = -M
+        (so the objective contribution 0.5 x^T hess x = -1/2 x^T M x de-biases
+        the curvature). Here we scatter each term's (-hess_dense) block back into
+        the full nparams x nparams space, indexed by the term's parameter indices.
+        Returns None if no such term is present (continuous-M inactive).
+        """
+        mcstat = [t for t in self.external_terms if str(t["name"]).startswith("mcstat")]
+        if not mcstat:
+            return None
+        n = int(self.x.shape[0])
+        M = tf.zeros([n, n], dtype=self.indata.dtype)
+        for t in mcstat:
+            if t["hess_dense"] is None:
+                raise NotImplementedError(
+                    "mcstat moment term must use a dense Hessian (sparse M not "
+                    "yet supported for the sandwich covariance)."
+                )
+            idx = t["indices"]
+            coords = tf.reshape(
+                tf.stack(tf.meshgrid(idx, idx, indexing="ij"), axis=-1), [-1, 2]
+            )
+            # objective uses hess = -M, so M = -hess_dense
+            updates = tf.reshape(-t["hess_dense"], [-1])
+            M = tf.tensor_scatter_nd_add(M, coords, updates)
+        return M
+
+    def cov_mcstat_sandwich(self, A):
+        """Continuous-M robust (sandwich) covariance.
+
+        Sigma = A^-1 H A^-1 with bread A = de-biased curvature (grad^2 of the
+        objective WITH the -1/2 theta^T M theta penalty) and meat H = the
+        same-sample curvature WITHOUT the penalty. Because the penalty is the
+        frozen quadratic -1/2 theta^T M theta, H = A + M exactly, so
+
+            Sigma = A^-1 (A + M) A^-1 = A^-1 + A^-1 M A^-1.
+
+        No second Hessian pass is needed. Frozen support only (the M-penalty
+        treats M as constant; valid in the linear-Gaussian regime where
+        continuous-M de-biases, RESULTS.md S1c/S9a).
+
+        Parameters
+        ----------
+        A : tf.Tensor, shape [npar, npar]
+            The de-biased objective Hessian (e.g. from loss_val_grad_hess()).
+
+        Returns
+        -------
+        tf.Tensor, shape [npar, npar]
+            The sandwich covariance.
+        """
+        if self.mcstat_M is None:
+            raise RuntimeError(
+                "cov_mcstat_sandwich requires an mcstat moment term (none found)."
+            )
+        Ainv = tf.linalg.inv(A)
+        return Ainv + Ainv @ self.mcstat_M @ Ainv
 
     def edmval_cov(self, grad, hess):
         if len(self.frozen_params) > 0:

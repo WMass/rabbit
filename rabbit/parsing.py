@@ -378,6 +378,43 @@ def common_parser():
         "(e.g. mixed-sign-weight cancellations).",
     )
     parser.add_argument(
+        "--mcStatDebias",
+        default="none",
+        choices=["none", "continuousM", "twoHalf", "kfold"],
+        help="Limited-MC-statistics de-biasing of the POI point/curvature. "
+        "'continuousM' subtracts the frozen noise-floor matrix M (supplied via "
+        "TensorWriter.add_mc_stat_moment) from the curvature: -1/2 theta^T M theta in "
+        "the objective. NOTE: only de-biases parameters that enter the prediction "
+        "LINEARLY (use --allowNegativeParam for POIs; rabbit's default x^2 transform "
+        "cancels the correction). 'twoHalf'/'kfold' use cross-fit fold templates "
+        "(general / nonlinear-safe). Default 'none'.",
+    )
+    parser.add_argument(
+        "--mcStatDebiasCov",
+        default="sandwich",
+        choices=["curvature", "sandwich"],
+        help="Covariance reported when --mcStatDebias != none. 'curvature' = inverse "
+        "de-biased Hessian A^-1 (undercovers). 'sandwich' = A^-1 H A^-1 = "
+        "A^-1 + A^-1 M A^-1 (covering robust covariance). Default 'sandwich'.",
+    )
+    parser.add_argument(
+        "--mcStatKfold",
+        default=2,
+        type=int,
+        help="Number of folds R re-grouped into halves for --mcStatDebias kfold "
+        "(2 = the two-half case).",
+    )
+    parser.add_argument(
+        "--covMode",
+        default="observed",
+        choices=["observed", "fisher"],
+        help="Curvature primitive used for ALL covariances (the standard inverse-Hessian "
+        "cov AND the de-biased sandwich bread+meat, consistently). 'observed' = the "
+        "autograd Hessian grad^2 L (Efron-Hinkley, data-conditional). 'fisher' = the "
+        "Gauss-Newton expected information J^T D J (lower-variance, finite-MC-cleaner, "
+        "drops the residual.d2mu term). Default 'observed' (current rabbit behaviour).",
+    )
+    parser.add_argument(
         "--paramModel",
         default=None,
         nargs="+",

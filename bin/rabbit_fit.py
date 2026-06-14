@@ -543,6 +543,18 @@ def fit(args, fitter, ws, dofit=True):
             edmval, cov = fitter.edmval_cov(grad, hess)
             logger.info(f"edmval: {edmval}")
 
+            # Continuous-M robust (sandwich) covariance: replace the inverse
+            # de-biased Hessian A^-1 with Sigma = A^-1 + A^-1 M A^-1 (the bread
+            # A = the de-biased objective Hessian just computed = `hess`).
+            if (
+                getattr(fitter, "mcStatDebias", "none") == "continuousM"
+                and getattr(fitter, "mcStatDebiasCov", "sandwich") == "sandwich"
+                and getattr(fitter, "mcstat_M", None) is not None
+            ):
+                cov = fitter.cov_mcstat_sandwich(hess)
+                logger.info("Reporting continuous-M sandwich covariance "
+                            "(A^-1 + A^-1 M A^-1)")
+
             ws.add_cov_hist(cov)
 
             fitter.cov.assign(cov)

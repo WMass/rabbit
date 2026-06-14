@@ -246,6 +246,46 @@ class TensorWriter:
         self.dict_norm[channel][name] = norm
         self.dict_sumw2[channel][name] = sumw2
 
+    def add_mc_stat_moment(self, M, param_names, name="mcstat_M"):
+        """Frozen MC-stat noise-floor matrix for the continuous-M de-biasing.
+
+        ``M`` is the ``nparams x nparams`` noise floor
+        ``M_ij = sum_b (sum_{e in b} w_e^2 s_i(e) s_j(e)) / mu_b`` accumulated in
+        the event loop at the expansion point (see RABBIT_MCSTAT_DESIGN.md §1).
+        It is added to the NLL as the de-attenuation penalty
+        ``-1/2 theta^T M theta`` (i.e. an external quadratic term with Hessian
+        ``-M``), which de-biases the central value and gives curvature
+        ``H_data - M``. ``param_names`` label the rows/cols of ``M`` and are
+        resolved against the fit parameter list at fit time.
+
+        Parameters
+        ----------
+        M : (n, n) array_like
+            Symmetric frozen noise-floor matrix (the user is responsible for
+            symmetry; only the de-attenuation penalty is formed here).
+        param_names : sequence of str
+            Length-``n`` parameter names indexing ``M``.
+        name : str
+            External-term label (default ``"mcstat_M"``); also flags the term as
+            the MC-stat moment so the fitter can build the sandwich covariance.
+        """
+        import hist as _hist
+
+        M = np.asarray(M, dtype=self.dtype)
+        names = list(param_names)
+        if M.shape != (len(names), len(names)):
+            raise ValueError(
+                f"add_mc_stat_moment: M shape {M.shape} incompatible with "
+                f"{len(names)} param_names"
+            )
+        ax0 = _hist.axis.StrCategory(names, name="mcstat_params0")
+        ax1 = _hist.axis.StrCategory(names, name="mcstat_params1")
+        h = _hist.Hist(ax0, ax1, storage=_hist.storage.Double())
+        h.view(flow=False)[...] = -M  # hess = -M  ->  +1/2 x^T H x = -1/2 theta^T M theta
+        self.add_external_likelihood_term(hess=h, name=name)
+        # tag for the fitter's sandwich covariance
+        self.mcstat_moment_term = name
+
     def add_channel(self, axes, name=None, masked=False, flow=False):
         if flow and masked is False:
             raise NotImplementedError(
