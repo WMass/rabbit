@@ -296,6 +296,20 @@ class Fitter:
                     "template noise is de-biased in the k-fold U-statistic "
                     "curvature (--covMode fisher)."
                 )
+        # Sparse split-logk: per-fold logk delta for folded systs (applied as a
+        # exp(delta . theta) correction to the shared sparse systematic factor in
+        # the per-fold curvature yields). log_normal only.
+        self.logk_folds_delta = getattr(self.indata, "logk_folds_delta", None)
+        self.mcstat_folded_syst_idx = getattr(
+            self.indata, "mcstat_folded_syst_idx", None
+        )
+        if (
+            self.logk_folds_delta is not None
+            and self.indata.systematic_type != "log_normal"
+        ):
+            raise NotImplementedError(
+                "sparse split-logk is supported only for log_normal systematics."
+            )
         if self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is None:
             logger.warning(
                 f"--mcStatDebias {self.mcStatDebias} requested but no fold "
@@ -1971,17 +1985,27 @@ class Fitter:
                     norm_dense = self.norm_B
                 else:
                     norm_dense = self.indata.norm_folds[fold_index]
-                if self.logk_folds_scaled is not None:
-                    raise NotImplementedError(
-                        "split-logk (per-fold logk) is not supported in sparse "
-                        "mode; use shared logk (no fold_axis on systematics)."
-                    )
                 idx = self.indata.norm.indices  # [nnz, 2] = (bin, proc)
                 shape = [self.indata.nbinsfull, self.indata.nproc]
+                # split-logk (sparse): multiply the shared log_normal factor by
+                # exp(delta . theta) over the folded systs for THIS fold, so the
+                # systematic-template noise is de-biased. Curvature path only
+                # (templates='fold'); halves use the shared logk.
+                split_corr = None
+                if (
+                    self.logk_folds_delta is not None
+                    and templates == "fold"
+                ):
+                    theta_folded = tf.gather(theta, self.mcstat_folded_syst_idx)
+                    split_corr = tf.einsum(
+                        "bpj,j->bp", self.logk_folds_delta[fold_index], theta_folded
+                    )
                 if self.indata.systematic_type == "log_normal":
                     factor = tf.tensor_scatter_nd_update(
                         tf.ones(shape, dtype=norm_dense.dtype), idx, tf.exp(logsnorm)
                     )
+                    if split_corr is not None:
+                        factor = factor * tf.exp(split_corr)
                     normcentral = norm_dense * rnorm * factor
                 else:  # "normal": additive variation (norm-independent)
                     add = tf.tensor_scatter_nd_update(

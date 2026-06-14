@@ -191,6 +191,17 @@ class FitInputData:
             else:
                 self.logk_folds = None
 
+            # Sparse split-logk: per-fold logk delta for folded systs (dense,
+            # reduced syst dim) + the folded global syst indices.
+            if "hlogk_folds_delta" in f.keys():
+                self.logk_folds_delta = maketensor(f["hlogk_folds_delta"])
+                self.mcstat_folded_syst_idx = maketensor(
+                    f["hmcstat_folded_syst_idx"]
+                )
+            else:
+                self.logk_folds_delta = None
+                self.mcstat_folded_syst_idx = None
+
             # compute indices for channels
             ibin = 0
             for channel, info in self.channel_info.items():

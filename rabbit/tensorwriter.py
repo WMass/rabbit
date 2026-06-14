@@ -64,6 +64,10 @@ class TensorWriter:
         # half-difference (same shape).
         self.dict_logkavg_folds = {}  # [channel][process][syst] -> [k, nbinschan]
         self.dict_logkhalfdiff_folds = {}  # [channel][process][syst] -> [k, nbinschan]
+        # Per-fold logk delta vs the FULL logk (= logkavg_fold - logkavg_full),
+        # used by the SPARSE split-logk path (multiply the shared systematic factor
+        # by exp(delta . theta)). [channel][process][syst] -> [k, nbinschan].
+        self.dict_logk_folds_delta = {}
         self.dict_logkavg = {}  # [channel][proc][syst]
         self.dict_logkhalfdiff = {}  # [channel][proc][syst]
         self.dict_logkavg_indices = {}
@@ -386,6 +390,7 @@ class TensorWriter:
         self.fold_k[name] = {}
         self.dict_logkavg_folds[name] = {}
         self.dict_logkhalfdiff_folds[name] = {}
+        self.dict_logk_folds_delta[name] = {}
         self.dict_beta_variations[name] = {}
 
         # add masked channels last
@@ -1454,6 +1459,32 @@ class TensorWriter:
         flow = self.channels[channel]["flow"]
         systematic_type = "normal" if add_to_data_covariance else self.systematic_type
 
+        # full logkavg (vs the full nominal) for the sparse split-logk delta
+        norm_full = self.dict_norm[channel][process]
+        if self._issparse(norm_full):
+            _dense = np.zeros([norm_folds.shape[1]], self.dtype)
+            _dense[norm_full.indices] = norm_full.data
+            norm_full = _dense
+        if is_pair:
+            up_full = self.get_flat_values(h[0][{fold_idx: sum}], flow=flow)
+            down_full = self.get_flat_values(h[1][{fold_idx: sum}], flow=flow)
+            if as_difference:
+                up_full = norm_full + up_full
+                down_full = norm_full + down_full
+            lu_full = self.get_logk(up_full, norm_full, kfactor, systematic_type=systematic_type)
+            ld_full = -self.get_logk(down_full, norm_full, kfactor, systematic_type=systematic_type)
+            if symmetrize == "conservative":
+                logkavg_full = np.where(np.abs(lu_full) > np.abs(ld_full), lu_full, ld_full)
+            else:
+                logkavg_full = 0.5 * (lu_full + ld_full)
+        else:
+            syst_full = self.get_flat_values(h[{fold_idx: sum}], flow=flow)
+            if as_difference:
+                syst_full = norm_full + syst_full
+            logkavg_full = self.get_logk(
+                syst_full, norm_full, kfactor, systematic_type=systematic_type
+            )
+
         # per-fold logkavg (+ logkhalfdiff for asymmetric) vs the per-fold nominal
         logkavg_folds = np.zeros_like(norm_folds)
         logkhalfdiff_folds = np.zeros_like(norm_folds)
@@ -1494,9 +1525,20 @@ class TensorWriter:
             symmetrize=symmetrize, add_to_data_covariance=add_to_data_covariance,
             as_difference=as_difference, syst_axes=syst_axes, **kargs
         )
+        if is_asym and self.sparse:
+            raise NotImplementedError(
+                "sparse split-logk does not support asymmetric folded systematics "
+                "(symmetric symmetrize modes only)."
+            )
+
         # store the per-fold logk under the resolved (full) systematic name
         self.dict_logkavg_folds[channel].setdefault(process, {})
         self.dict_logkavg_folds[channel][process][name] = logkavg_folds.astype(self.dtype)
+        # per-fold delta vs the full logk (for the sparse split-logk path)
+        self.dict_logk_folds_delta[channel].setdefault(process, {})
+        self.dict_logk_folds_delta[channel][process][name] = (
+            (logkavg_folds - logkavg_full[None, :]).astype(self.dtype)
+        )
         if is_asym:
             self.dict_logkhalfdiff_folds[channel].setdefault(process, {})
             self.dict_logkhalfdiff_folds[channel][process][name] = (
@@ -1943,6 +1985,43 @@ class TensorWriter:
 
         systs = self.get_systs()
         nsyst = len(systs)
+
+        # SPARSE split-logk: assemble the per-fold logk DELTA for folded systs
+        # [k, nbinsfull, nproc, n_folded] + the folded global syst indices, so the
+        # sparse fold-yield path can multiply the shared factor by exp(delta.theta).
+        logk_folds_delta = None
+        mcstat_folded_syst_idx = None
+        if norm_folds is not None and self.sparse:
+            folded_systs = sorted(
+                {
+                    s
+                    for c in self.channels
+                    for p in self.dict_logk_folds_delta[c]
+                    for s in self.dict_logk_folds_delta[c][p]
+                },
+                key=lambda s: systs.index(s),
+            )
+            if folded_systs:
+                kfold = norm_folds.shape[0]
+                mcstat_folded_syst_idx = np.array(
+                    [systs.index(s) for s in folded_systs], dtype=np.int64
+                )
+                logk_folds_delta = np.zeros(
+                    [kfold, nbinsfull, nproc, len(folded_systs)], self.dtype
+                )
+                ibin = 0
+                for chan in self.channels.keys():
+                    nbinschan = self.nbinschan[chan]
+                    for iproc, proc in enumerate(procs):
+                        if proc not in self.dict_norm[chan]:
+                            continue
+                        deltas = self.dict_logk_folds_delta[chan].get(proc, {})
+                        for j, s in enumerate(folded_systs):
+                            if s in deltas:
+                                logk_folds_delta[
+                                    :, ibin : ibin + nbinschan, iproc, j
+                                ] = deltas[s]
+                        ibin += nbinschan
 
         if self.symmetric_tensor:
             logger.info("No asymmetric systematics - write fully symmetric tensor")
@@ -2454,6 +2533,17 @@ class TensorWriter:
             )
             f.attrs["mcstat_fold_k"] = int(norm_folds.shape[0])
             norm_folds = None
+
+        # SPARSE split-logk: per-fold logk delta for folded systs + their indices.
+        if logk_folds_delta is not None:
+            nbytes += h5pyutils_write.writeFlatInChunks(
+                logk_folds_delta, f, "hlogk_folds_delta", maxChunkBytes=self.chunkSize
+            )
+            nbytes += h5pyutils_write.writeFlatInChunks(
+                mcstat_folded_syst_idx, f, "hmcstat_folded_syst_idx",
+                maxChunkBytes=self.chunkSize,
+            )
+            logk_folds_delta = None
 
         if self.sparse:
             nbytes += h5pyutils_write.writeSparse(
