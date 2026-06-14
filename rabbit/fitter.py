@@ -1959,6 +1959,42 @@ class Fitter:
                 axis=-1,
             )
 
+            if templates != "full":
+                # De-bias fold/half yields in sparse mode: the per-fold/half norm
+                # templates are stored DENSE, so scatter the (shared) systematic
+                # factor from the sparse logk into a dense [nbinsfull, nproc] grid
+                # and contract with the dense norm. Split-logk (per-fold logk) is
+                # not supported in sparse mode.
+                if templates == "A":
+                    norm_dense = self.norm_A
+                elif templates == "B":
+                    norm_dense = self.norm_B
+                else:
+                    norm_dense = self.indata.norm_folds[fold_index]
+                if self.logk_folds_scaled is not None:
+                    raise NotImplementedError(
+                        "split-logk (per-fold logk) is not supported in sparse "
+                        "mode; use shared logk (no fold_axis on systematics)."
+                    )
+                idx = self.indata.norm.indices  # [nnz, 2] = (bin, proc)
+                shape = [self.indata.nbinsfull, self.indata.nproc]
+                if self.indata.systematic_type == "log_normal":
+                    factor = tf.tensor_scatter_nd_update(
+                        tf.ones(shape, dtype=norm_dense.dtype), idx, tf.exp(logsnorm)
+                    )
+                    normcentral = norm_dense * rnorm * factor
+                else:  # "normal": additive variation (norm-independent)
+                    add = tf.tensor_scatter_nd_update(
+                        tf.zeros(shape, dtype=norm_dense.dtype), idx, logsnorm
+                    )
+                    normcentral = norm_dense * rnorm + add
+                if not (full or self.indata.nbinsmasked == 0):
+                    normcentral = normcentral[: self.indata.nbins]
+                nexpcentral = tf.reduce_sum(normcentral, axis=-1)
+                if not compute_norm:
+                    normcentral = None
+                return nexpcentral, normcentral
+
             # Build a sparse [nbinsfull, nproc] tensor whose values absorb
             # the per-entry syst variation and the per-(bin, proc) POI
             # scaling rnorm. The sparsity pattern is unchanged from

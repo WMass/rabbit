@@ -277,14 +277,12 @@ class TensorWriter:
             add_process path (so sumw / sumw2 / systematics are unchanged), and
           * stores the per-fold dense templates `[k, nbinschan]` for the
             cross-fit (two-half / k-fold) de-biasing in the fitter.
-        `k` is inferred from the size of `fold_axis`. Sparse storage is not
-        supported for folded processes.
+        `k` is inferred from the size of `fold_axis`. In sparse mode the FULL
+        template is still stored sparse (CSR); the per-fold fold templates are
+        densified ([k, nbinschan]) — the O(k*nparams*nbins) de-bias cost — and the
+        fitter uses a dense per-fold yield path.
         """
         self._check_hist_and_channel(h, channel)
-        if self.sparse and self._issparse(h):
-            raise NotImplementedError(
-                "fold_axis is not supported for sparse histograms."
-            )
         # resolve the fold axis (by name or index) and its size k
         ax_names = [a.name for a in h.axes]
         if isinstance(fold_axis, str):
