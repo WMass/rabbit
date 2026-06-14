@@ -259,9 +259,11 @@ class Fitter:
         self.logk_folds_scaled = None
         logk_folds = getattr(self.indata, "logk_folds", None)
         if logk_folds is not None:
-            if not self.indata.symmetric_tensor:
-                raise NotImplementedError("split-logk requires a symmetric tensor.")
-            # apply the same constant rnorm_init scaling as _init_logk_scaled
+            # apply the same constant rnorm_init scaling as _init_logk_scaled.
+            # logk_folds is [k, nbinsfull, nproc, nsyst] (symmetric) or
+            # [k, nbinsfull, nproc, 2, nsyst] (asymmetric); broadcast rnorm_init
+            # ([nbinsfull, nproc]) over the leading fold axis and trailing
+            # syst (and asym) axes.
             if self.indata.systematic_type == "normal" and self.param_model.nparams > 0:
                 rnorm_init = tf.broadcast_to(
                     self.param_model.compute(
@@ -269,7 +271,12 @@ class Fitter:
                     ),
                     [self.indata.nbinsfull, self.indata.nproc],
                 )
-                self.logk_folds_scaled = logk_folds * rnorm_init[None, ..., None]
+                ntrail = len(logk_folds.shape) - 3  # 1 (sym) or 2 (asym)
+                scale = tf.reshape(
+                    rnorm_init,
+                    [1, self.indata.nbinsfull, self.indata.nproc] + [1] * ntrail,
+                )
+                self.logk_folds_scaled = logk_folds * scale
             else:
                 self.logk_folds_scaled = logk_folds
             # The CURVATURE (U-statistic) uses the per-fold logk for any k. The
