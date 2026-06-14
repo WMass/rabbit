@@ -401,8 +401,10 @@ def common_parser():
         "--mcStatKfold",
         default=2,
         type=int,
-        help="Number of folds R re-grouped into halves for --mcStatDebias kfold "
-        "(2 = the two-half case).",
+        help="DEPRECATED / unused: the number of folds k is inferred from the "
+        "fold-axis size in the input, and the k-fold averaging uses the COMPLETE "
+        "pairwise U-statistic (all C(k,k/2)/2 groupings, O(k), parameter-free) in "
+        "--covMode fisher. No fold/regrouping count needs to be chosen here.",
     )
     parser.add_argument(
         "--covMode",

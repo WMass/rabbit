@@ -230,6 +230,9 @@ class Fitter:
         # rescaled by k/(k/2)=2 so <norm_A>=<norm_B>=norm_full). Shared logk.
         self.norm_A = None
         self.norm_B = None
+        # n_folds and the raw per-fold templates are kept for the complete
+        # k-fold U-statistic curvature (k-fold averaging, see _ln_terms_for_fisher).
+        self.n_folds = None
         norm_folds = getattr(self.indata, "norm_folds", None)
         if norm_folds is not None:
             k = int(norm_folds.shape[0])
@@ -237,6 +240,7 @@ class Fitter:
                 raise NotImplementedError(
                     f"two-half de-biasing needs an even number of folds; got k={k}."
                 )
+            self.n_folds = k
             half = k // 2
             scale = tf.constant(k / half, dtype=self.indata.dtype)  # = 2
             self.norm_A = scale * tf.reduce_sum(norm_folds[:half], axis=0)
@@ -250,6 +254,9 @@ class Fitter:
         # and the x2 norm rescale leaves the ratio unchanged.
         self.logk_A = self.logk
         self.logk_B = self.logk
+        # Per-fold scaled logk [k, ...] for the U-statistic curvature; None means
+        # use the shared self.logk for every fold (the common case).
+        self.logk_folds_scaled = None
         logk_folds = getattr(self.indata, "logk_folds", None)
         if logk_folds is not None:
             if int(logk_folds.shape[0]) != 2:
@@ -272,11 +279,26 @@ class Fitter:
             else:
                 self.logk_A = logk_folds[0]
                 self.logk_B = logk_folds[1]
+            # k=2: per-fold logk == per-half logk, so the U-statistic per-fold
+            # yields reuse the half logk directly.
+            self.logk_folds_scaled = tf.stack([self.logk_A, self.logk_B], axis=0)
         if self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is None:
             logger.warning(
                 f"--mcStatDebias {self.mcStatDebias} requested but no fold "
                 "templates (hnorm_folds) found in the input; two-half de-biasing "
                 "is inactive. Add processes with a fold_axis in the TensorWriter."
+            )
+        if (
+            self.n_folds is not None
+            and self.n_folds >= 3
+            and self.covMode != "fisher"
+        ):
+            logger.info(
+                f"k-fold de-biasing with k={self.n_folds} folds: the k-fold "
+                "AVERAGING (complete U-statistic, lower curvature-estimate "
+                "variance) is realized only in --covMode fisher. In observed mode "
+                "the curvature uses the single 2-half split (no averaging); pass "
+                "--covMode fisher to use all C(k,k/2)/2 groupings."
             )
         if self.mcStatDebias == "continuousM":
             if self.mcstat_M is None:
@@ -1009,28 +1031,66 @@ class Fitter:
             return [(nexp_full, 2.0), (nexp_A, -0.5), (nexp_B, -0.5)]
         return [(nexp_full, 1.0)]
 
+    def _fisher_data_terms(self, debiased):
+        """Terms (nexp, coeff) whose Gauss-Newton sum sum_i coeff_i J_i^T D J_i is
+        the de-biased data Fisher F_data used as the GN curvature.
+
+        For a fold-based debias this is the COMPLETE k-fold U-statistic (k-fold
+        AVERAGING): using J_full = sum_i J_i^raw (raw, unrescaled folds),
+
+            F_ch = k/(k-1) [ J_full^T D J_full - sum_i J_i^raw^T D J_i^raw ]
+                 = k/(k-1) sum_{i!=j} J_i^raw^T D J_j^raw
+
+        i.e. the average over ALL fold pairs, computed in O(k) via the
+        full-minus-self identity (no enumeration of partitions). For k=2 it
+        equals the single 2-half cross-half Fisher exactly; for k>=3 it averages
+        the C(k,k/2)/2 half-groupings, reducing the curvature-estimate variance
+        toward the continuous-M floor as k grows. The RAW folds (~n_full/k) are
+        used only here (the GN form is residual-independent), never in the
+        objective ln (which keeps the rescaled halves for a sensible point)."""
+        nbins = self.indata.nbins
+        nexp_full = self._compute_yields_with_beta(
+            profile=True, compute_norm=False, full=len(self.regularizers)
+        )[0][:nbins]
+        if (
+            debiased
+            and self.mcStatDebias in ("twoHalf", "kfold")
+            and self.n_folds is not None
+        ):
+            k = self.n_folds
+            coeff = k / (k - 1.0)
+            terms = [(nexp_full, coeff)]
+            for i in range(k):
+                n_i = self._compute_yields_noBBB(
+                    full=False, compute_norm=False, templates="fold", fold_index=i
+                )[0][:nbins]
+                terms.append((n_i, -coeff))
+            return terms
+        return [(nexp_full, 1.0)]
+
     def _fisher_core(self, hess_obj, debiased):
         """Gauss-Newton (expected-information) curvature corresponding to the
         observed-Hessian `hess_obj`:
 
             F = hess_obj - H_ln_obs + F_data
 
-        where H_ln_obs is the observed Hessian of the (active) data term and
-        F_data = sum_i coeff_i J_i^T D J_i is its Gauss-Newton replacement
-        (J_i = d nexp_i / d x, D = ell''(nexp_i): 1/V for chisq, data_cov_inv
-        for covarianceFit, 1/nexp for Poisson expected info). This drops the
-        residual * d2nexp piece (the only data-term difference) while leaving
-        the constraint / external / BB-lite curvature in hess_obj untouched, so
-        the two modes stay consistent (RABBIT_MCSTAT_DESIGN.md §2c/§2d)."""
+        H_ln_obs is the observed Hessian of the OBJECTIVE's data term (rescaled
+        halves), so `hess_obj - H_ln_obs` is the non-data curvature (constraints,
+        external M, BB-lite). F_data is the de-biased data Gauss-Newton Fisher
+        from _fisher_data_terms (the complete k-fold U-statistic for the bread;
+        the full J^T D J for the meat). D = ell''(nexp): 1/V chisq, data_cov_inv
+        covFit, 1/nexp Poisson. Drops the residual * d2nexp piece while keeping
+        the non-data curvature (RABBIT_MCSTAT_DESIGN.md §2c/§2d)."""
         with tf.GradientTape(persistent=True) as t2:
             with tf.GradientTape(persistent=True) as t1:
-                terms = self._ln_terms_for_fisher(debiased)
-                ln = tf.add_n([c * self._compute_ln(n) for n, c in terms])
+                obj_terms = self._ln_terms_for_fisher(debiased)
+                fisher_terms = self._fisher_data_terms(debiased)
+                ln = tf.add_n([c * self._compute_ln(n) for n, c in obj_terms])
             g = t1.gradient(ln, self.x)
         H_ln = t2.jacobian(g, self.x)
 
         F = tf.zeros_like(hess_obj)
-        for n, c in terms:
+        for n, c in fisher_terms:
             J = t1.jacobian(n, self.x)  # [nbins, nparams]
             if self.covarianceFit:
                 JT_Cinv = tf.matmul(J, self.data_cov_inv, transpose_a=True)
@@ -1815,10 +1875,14 @@ class Fitter:
             else:
                 self.logk = self.indata.logk * rnorm_init[..., None, None]
 
-    def _compute_yields_noBBB(self, full=True, compute_norm=True, templates="full"):
+    def _compute_yields_noBBB(
+        self, full=True, compute_norm=True, templates="full", fold_index=None
+    ):
         # templates: "full" uses indata.norm; "A"/"B" use the precomputed
         # half-sample fold templates norm_A/norm_B (two-half de-biasing, shared
-        # logk). Only supported in the dense path.
+        # logk); "fold" uses the RAW per-fold template norm_folds[fold_index]
+        # (for the complete k-fold U-statistic curvature). Only supported in the
+        # dense path.
         # full: compute yields inclduing masked channels
         # compute_norm: also build the dense [nbins, nproc] normcentral tensor.
         # In sparse mode this is expensive (forward + backward) and is only
@@ -1904,6 +1968,14 @@ class Fitter:
             elif templates == "B":
                 norm_src = self.norm_B
                 logk_src = self.logk_B
+            elif templates == "fold":
+                # raw per-fold template (unrescaled); shared logk unless split-logk
+                norm_src = self.indata.norm_folds[fold_index]
+                logk_src = (
+                    self.logk
+                    if self.logk_folds_scaled is None
+                    else self.logk_folds_scaled[fold_index]
+                )
             else:
                 norm_src = self.indata.norm
                 logk_src = self.logk
