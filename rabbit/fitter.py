@@ -247,20 +247,31 @@ class Fitter:
                 "templates (hnorm_folds) found in the input; two-half de-biasing "
                 "is inactive. Add processes with a fold_axis in the TensorWriter."
             )
-        if self.mcStatDebias == "continuousM" and self.mcstat_M is None:
-            logger.warning(
-                "--mcStatDebias continuousM requested but no 'mcstat' external "
-                "moment term found in the input; continuous-M is inactive. Supply "
-                "M via TensorWriter.add_mc_stat_moment(M, param_names)."
-            )
-        if self.mcStatDebias == "continuousM" and not self.param_model.is_linear:
-            logger.warning(
-                "--mcStatDebias continuousM: the param model is NONLINEAR "
-                "(e.g. the default rabbit x^2 POI transform). The -1/2 theta^T M theta "
-                "penalty is cancelled by Fisher growth at the shifted minimum and will "
-                "NOT de-bias the point or covariance (RESULTS.md S9a). Use "
-                "--allowNegativeParam (linear POI) or the two-half method instead."
-            )
+        if self.mcStatDebias == "continuousM":
+            if self.mcstat_M is None:
+                logger.warning(
+                    "--mcStatDebias continuousM requested but no 'mcstat' external "
+                    "moment term found in the input; continuous-M is inactive. Supply "
+                    "M via TensorWriter.add_mc_stat_moment(M, param_names)."
+                )
+            elif not self._mcstat_M_params_linear():
+                # The -1/2 theta^T M theta penalty only de-biases parameters that
+                # enter the prediction LINEARLY. If any parameter that M touches
+                # is nonlinear (e.g. the default x^2 POI transform, or log-normal
+                # systematics), the data Fisher grows as the -M theta gradient
+                # shifts the minimum and cancels the -M curvature subtraction
+                # (RESULTS.md S9a) -> no de-bias of the point or covariance for
+                # those parameters. Two-half de-biasing has no such restriction.
+                logger.warning(
+                    "--mcStatDebias continuousM: the supplied M acts on parameters "
+                    "that enter the prediction NONLINEARLY (e.g. the default rabbit "
+                    "x^2 POI transform [use --allowNegativeParam for a linear POI], "
+                    "or log_normal systematics). The -1/2 theta^T M theta penalty is "
+                    "cancelled by Fisher growth at the shifted minimum and will NOT "
+                    "de-bias the point or covariance for those parameters "
+                    "(RESULTS.md S9a). Use a linear parametrization for the de-biased "
+                    "parameters, or the two-half method (--mcStatDebias twoHalf)."
+                )
 
     def init_fit_parms(
         self,
@@ -837,6 +848,45 @@ class Fitter:
                 self.x.assign(pparms.sample())
             self.bbstat.randomize_postfit()
 
+    def _mcstat_M_params_linear(self):
+        """True iff every parameter the mcstat moment M touches enters the
+        prediction/NLL linearly, so that -1/2 theta^T M theta de-biases exactly
+        (constant curvature, no minimum-shift cancellation; RESULTS.md §9a).
+
+        A parameter is "linear" here when:
+          * POI (index < npoi): the param model is linear (allowNegativeParam,
+            i.e. rnorm = x rather than the default rnorm = x^2), and
+          * systematic: the systematics enter additively (systematic_type
+            'normal') with a symmetric tensor (the asymmetric interpolation is
+            nonlinear), and
+        the per-bin NLL is Gaussian (chisqFit) so its curvature does not depend
+        on the fit point (a Poisson l'' = nobs/nexp^2 varies with nexp(theta)
+        even for a linear nexp). Returns True only if ALL touched parameters meet
+        the relevant condition.
+        """
+        if self.mcstat_M is None:
+            return True
+        if not self.chisqFit:
+            return False  # Poisson/other: curvature is theta-dependent
+        npoi = self.param_model.npoi
+        mcstat_terms = [
+            t for t in self.external_terms if str(t["name"]).startswith("mcstat")
+        ]
+        touched = set()
+        for t in mcstat_terms:
+            touched.update(int(i) for i in t["indices"].numpy())
+        for i in touched:
+            if i < npoi:
+                if not self.param_model.is_linear:
+                    return False
+            else:
+                if not (
+                    self.indata.systematic_type == "normal"
+                    and self.indata.symmetric_tensor
+                ):
+                    return False
+        return True
+
     def _build_mcstat_M(self):
         """Reconstruct the frozen noise-floor matrix M (nparams x nparams) from
         external terms whose name starts with 'mcstat'.
@@ -893,14 +943,92 @@ class Fitter:
         hess = t2.jacobian(grad, self.x)
         return val, grad, hess
 
-    def cov_twohalf_sandwich(self, A):
+    def _ln_terms_for_fisher(self, debiased):
+        """List of (nexp[:nbins], coeff) summed in the active ln term.
+
+        debiased=True and a two-half/k-fold debias active -> the jackknife
+        combination [(full,2),(A,-1/2),(B,-1/2)] (its Gauss-Newton data part is
+        exactly the cross-half Fisher F_ch). Otherwise the plain full term
+        [(full,1)]. Yields are taken through the BB-lite profiling (full) so the
+        Fisher is consistent with the observed Hessian it replaces."""
+        nbins = self.indata.nbins
+        nexp_full = self._compute_yields_with_beta(
+            profile=True, compute_norm=False, full=len(self.regularizers)
+        )[0][:nbins]
+        if (
+            debiased
+            and self.mcStatDebias in ("twoHalf", "kfold")
+            and self.norm_A is not None
+        ):
+            nexp_A = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="A"
+            )[0][:nbins]
+            nexp_B = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="B"
+            )[0][:nbins]
+            return [(nexp_full, 2.0), (nexp_A, -0.5), (nexp_B, -0.5)]
+        return [(nexp_full, 1.0)]
+
+    def _fisher_core(self, hess_obj, debiased):
+        """Gauss-Newton (expected-information) curvature corresponding to the
+        observed-Hessian `hess_obj`:
+
+            F = hess_obj - H_ln_obs + F_data
+
+        where H_ln_obs is the observed Hessian of the (active) data term and
+        F_data = sum_i coeff_i J_i^T D J_i is its Gauss-Newton replacement
+        (J_i = d nexp_i / d x, D = ell''(nexp_i): 1/V for chisq, data_cov_inv
+        for covarianceFit, 1/nexp for Poisson expected info). This drops the
+        residual * d2nexp piece (the only data-term difference) while leaving
+        the constraint / external / BB-lite curvature in hess_obj untouched, so
+        the two modes stay consistent (RABBIT_MCSTAT_DESIGN.md §2c/§2d)."""
+        with tf.GradientTape(persistent=True) as t2:
+            with tf.GradientTape(persistent=True) as t1:
+                terms = self._ln_terms_for_fisher(debiased)
+                ln = tf.add_n([c * self._compute_ln(n) for n, c in terms])
+            g = t1.gradient(ln, self.x)
+        H_ln = t2.jacobian(g, self.x)
+
+        F = tf.zeros_like(hess_obj)
+        for n, c in terms:
+            J = t1.jacobian(n, self.x)  # [nbins, nparams]
+            if self.covarianceFit:
+                JT_Cinv = tf.matmul(J, self.data_cov_inv, transpose_a=True)
+                Fterm = tf.matmul(JT_Cinv, J)
+            else:
+                D = (1.0 / self.varnobs) if self.chisqFit else (1.0 / n)
+                Fterm = tf.einsum("bi,b,bj->ij", J, D, J)
+            F = F + c * Fterm
+        del t1, t2
+        return hess_obj - H_ln + F
+
+    @tf.function
+    def fisher_curvature(self, hess_obj):
+        """Gauss-Newton curvature of the ACTIVE objective (jackknife if a
+        two-half debias is on; else the full term). Used as the sandwich bread
+        and as the standard-covariance curvature under --covMode fisher."""
+        return self._fisher_core(hess_obj, True)
+
+    @tf.function
+    def fisher_curvature_full(self, hess_meat):
+        """Gauss-Newton curvature of the FULL (undebiased) objective. Used as the
+        sandwich meat under --covMode fisher."""
+        return self._fisher_core(hess_meat, False)
+
+    def cov_twohalf_sandwich(self, A, covMode="observed"):
         """Two-half / k-fold robust (sandwich) covariance Sigma = A^-1 H A^-1.
 
-        Bread A = the de-biased (jackknife) objective Hessian; meat H = the
-        full-sample NLL Hessian (loss_val_grad_hess_meat). covMode='observed'
-        (autograd Hessians). See RABBIT_MCSTAT_DESIGN.md §2c.
+        Bread A = the de-biased (jackknife) curvature; meat H = the full-sample
+        curvature. Both follow `covMode` (don't mix): 'observed' = autograd
+        Hessians (A = grad^2 L_cf, H = grad^2 L_full); 'fisher' = Gauss-Newton
+        (A = F_ch + nondata, H = F_full + nondata). See RABBIT_MCSTAT_DESIGN.md
+        §2c. The passed `A` must already be in the requested mode.
         """
-        _, _, H = self.loss_val_grad_hess_meat()
+        _, _, H_obs = self.loss_val_grad_hess_meat()
+        if covMode == "fisher":
+            H = self.fisher_curvature_full(H_obs)
+        else:
+            H = H_obs
         Ainv = tf.linalg.inv(A)
         return Ainv @ tf.cast(H, Ainv.dtype) @ Ainv
 

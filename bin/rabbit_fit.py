@@ -540,23 +540,32 @@ def fit(args, fitter, ws, dofit=True):
         if not args.noEDM and not args.noHessian:
             # compute the covariance matrix and estimated distance to minimum
             _, grad, hess = fitter.loss_val_grad_hess()
-            edmval, cov = fitter.edmval_cov(grad, hess)
+
+            # --covMode fisher: replace the observed-Hessian curvature with the
+            # Gauss-Newton expected information (J^T D J + nondata), used as the
+            # bread for the (de-biased) covariance everywhere. Applies to the
+            # standard cov and the sandwich bread consistently.
+            _covmode = getattr(fitter, "covMode", "observed")
+            bread = fitter.fisher_curvature(hess) if _covmode == "fisher" else hess
+
+            edmval, cov = fitter.edmval_cov(grad, bread)
             logger.info(f"edmval: {edmval}")
 
-            # Continuous-M robust (sandwich) covariance: replace the inverse
-            # de-biased Hessian A^-1 with Sigma = A^-1 + A^-1 M A^-1 (the bread
-            # A = the de-biased objective Hessian just computed = `hess`).
+            # Robust (sandwich) covariance for the de-biased fit. Bread = the
+            # (fisher- or observed-) curvature `bread`; continuous-M uses the
+            # analytic meat H = A + M (Sigma = A^-1 + A^-1 M A^-1), two-half uses
+            # the full-sample meat (both in --covMode).
             _debias = getattr(fitter, "mcStatDebias", "none")
             _debiascov = getattr(fitter, "mcStatDebiasCov", "sandwich")
             if _debiascov == "sandwich":
                 if _debias == "continuousM" and getattr(fitter, "mcstat_M", None) is not None:
-                    cov = fitter.cov_mcstat_sandwich(hess)
+                    cov = fitter.cov_mcstat_sandwich(bread)
                     logger.info("Reporting continuous-M sandwich covariance "
-                                "(A^-1 + A^-1 M A^-1)")
+                                f"(A^-1 + A^-1 M A^-1, covMode={_covmode})")
                 elif _debias in ("twoHalf", "kfold") and getattr(fitter, "norm_A", None) is not None:
-                    cov = fitter.cov_twohalf_sandwich(hess)
+                    cov = fitter.cov_twohalf_sandwich(bread, covMode=_covmode)
                     logger.info("Reporting two-half sandwich covariance "
-                                "(A^-1 H A^-1)")
+                                f"(A^-1 H A^-1, covMode={_covmode})")
 
             ws.add_cov_hist(cov)
 
