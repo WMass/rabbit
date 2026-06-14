@@ -43,6 +43,7 @@ def impacts_parms(
     systgroupidxs=[],
     nmodel_params=None,
     param_groupidxs=None,
+    extra_group_vars=None,
 ):
     """
     Gaussian approximation.
@@ -113,5 +114,16 @@ def impacts_parms(
             for g in param_groupidxs
         ]
         impacts_grouped = tf.concat([impacts_grouped, *param_cols], axis=1)
+
+    if extra_group_vars:
+        # Extra diagonal-variance impact groups (e.g. the MC-stat de-bias term
+        # diag(sandwich - curvature)), appended LAST. Each is a full-x variance
+        # vector; the per-POI/NOI sqrt is gathered like the stat group.
+        extra_cols = []
+        for var in extra_group_vars:
+            col = tf.sqrt(tf.nn.relu(var))
+            col = _gather_poi_noi_vector(col, noiidxs, nsignal_params, nmodel_params)
+            extra_cols.append(tf.reshape(col, (-1, 1)))
+        impacts_grouped = tf.concat([impacts_grouped, *extra_cols], axis=1)
 
     return impacts, impacts_grouped

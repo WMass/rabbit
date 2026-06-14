@@ -1235,7 +1235,15 @@ class Fitter:
         )
 
     @tf.function
-    def impacts_parms(self, hess):
+    def impacts_parms(self, hess, cov=None, extra_group_vars=None):
+        # cov: the covariance matrix to DECOMPOSE (per-nuisance + grouped syst
+        # impacts). Defaults to self.cov. For a de-biased fit pass the de-biased
+        # CURVATURE covariance (A^-1, in the selected --covMode) and `hess` = the
+        # matching de-biased curvature, so the whole decomposition (total / syst /
+        # stat) is internally consistent; the sandwich's extra coverage term is
+        # then reported as the `mcStatDebias` extra group via extra_group_vars.
+        if cov is None:
+            cov = self.cov
 
         nstat = (
             self.param_model.npoi
@@ -1254,7 +1262,7 @@ class Fitter:
 
         param_groups = self._resolved_param_impact_groups()
         impacts, impacts_grouped = traditional_impacts.impacts_parms(
-            self.cov,
+            cov,
             cov_stat,
             cov_stat_no_bbb,
             self.param_model.npoi,
@@ -1262,12 +1270,18 @@ class Fitter:
             self.indata.systgroupidxs,
             nmodel_params=self.param_model.npoi + self.param_model.npou,
             param_groupidxs=[idxs for _, idxs in param_groups],
+            extra_group_vars=extra_group_vars,
         )
 
         return impacts, impacts_grouped
 
     @tf.function
-    def global_impacts_parms(self):
+    def global_impacts_parms(self, cov=None):
+        # cov: covariance to decompose (default self.cov). For a de-biased fit
+        # pass the de-biased CURVATURE covariance so the global-impact groups
+        # (theta0 / nobs / beta0 / syst) decompose it consistently.
+        if cov is None:
+            cov = self.cov
         return global_impacts.global_impacts_parms(
             self.x,
             self.bbstat.ubeta,
@@ -1282,7 +1296,7 @@ class Fitter:
             self.bbstat.enabled,
             self.bbstat.binByBinStatMode,
             self.globalImpactsFromJVP,
-            self.cov,
+            cov,
         )
 
     @tf.function
