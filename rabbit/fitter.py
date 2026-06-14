@@ -259,11 +259,6 @@ class Fitter:
         self.logk_folds_scaled = None
         logk_folds = getattr(self.indata, "logk_folds", None)
         if logk_folds is not None:
-            if int(logk_folds.shape[0]) != 2:
-                raise NotImplementedError(
-                    "split-logk (hlogk_folds) is currently supported only for k=2 "
-                    "folds (per-fold logk == per-half logk only when k=2)."
-                )
             if not self.indata.symmetric_tensor:
                 raise NotImplementedError("split-logk requires a symmetric tensor.")
             # apply the same constant rnorm_init scaling as _init_logk_scaled
@@ -274,14 +269,26 @@ class Fitter:
                     ),
                     [self.indata.nbinsfull, self.indata.nproc],
                 )
-                self.logk_A = logk_folds[0] * rnorm_init[..., None]
-                self.logk_B = logk_folds[1] * rnorm_init[..., None]
+                self.logk_folds_scaled = logk_folds * rnorm_init[None, ..., None]
             else:
-                self.logk_A = logk_folds[0]
-                self.logk_B = logk_folds[1]
-            # k=2: per-fold logk == per-half logk, so the U-statistic per-fold
-            # yields reuse the half logk directly.
-            self.logk_folds_scaled = tf.stack([self.logk_A, self.logk_B], axis=0)
+                self.logk_folds_scaled = logk_folds
+            # The CURVATURE (U-statistic) uses the per-fold logk for any k. The
+            # OBJECTIVE (point) needs the per-HALF logk, which equals the per-fold
+            # logk only for k=2 (log of a sum != sum of logs). So for k=2 the
+            # objective uses the split half logk (full treatment); for k>2 the
+            # objective falls back to the shared logk (the point still de-biases
+            # the dominant nominal-template noise via norm^A/norm^B; the
+            # systematic-template noise is de-biased in the curvature).
+            if int(logk_folds.shape[0]) == 2:
+                self.logk_A = self.logk_folds_scaled[0]
+                self.logk_B = self.logk_folds_scaled[1]
+            else:
+                logger.info(
+                    "split-logk with k>2: the objective uses shared logk (the "
+                    "point de-biases nominal-template noise); the systematic-"
+                    "template noise is de-biased in the k-fold U-statistic "
+                    "curvature (--covMode fisher)."
+                )
         if self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is None:
             logger.warning(
                 f"--mcStatDebias {self.mcStatDebias} requested but no fold "
@@ -1052,21 +1059,41 @@ class Fitter:
         nexp_full = self._compute_yields_with_beta(
             profile=True, compute_norm=False, full=len(self.regularizers)
         )[0][:nbins]
-        if (
-            debiased
-            and self.mcStatDebias in ("twoHalf", "kfold")
-            and self.n_folds is not None
-        ):
-            k = self.n_folds
-            coeff = k / (k - 1.0)
-            terms = [(nexp_full, coeff)]
-            for i in range(k):
-                n_i = self._compute_yields_noBBB(
-                    full=False, compute_norm=False, templates="fold", fold_index=i
-                )[0][:nbins]
-                terms.append((n_i, -coeff))
-            return terms
-        return [(nexp_full, 1.0)]
+        fold_active = (
+            self.mcStatDebias in ("twoHalf", "kfold") and self.n_folds is not None
+        )
+        if not fold_active:
+            return [(nexp_full, 1.0)]
+
+        # Per-fold raw predictions n_i (each with its own logk for split-logk),
+        # times the full-sample BB-lite beta so all terms are consistently
+        # profiled (beta_factor=1 without BB-lite). The "full" term is the SUM of
+        # the per-fold predictions, J_sumfold = sum_i J_i, so the full-minus-self
+        # identity F_sumfold - sum_i F_i = sum_{i!=j} cross holds EXACTLY for both
+        # shared logk (where sum_i n_i == nexp_full) and split logk (where it does
+        # not). Using n_sumfold for the meat too keeps bread/meat consistent
+        # (H - A = M) under split-logk.
+        if self.bbstat.enabled:
+            nexp_full_raw = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="full"
+            )[0][:nbins]
+            beta_factor = nexp_full / tf.where(
+                nexp_full_raw == 0.0, tf.ones_like(nexp_full_raw), nexp_full_raw
+            )
+        else:
+            beta_factor = tf.ones_like(nexp_full)
+        per_fold = [
+            beta_factor
+            * self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="fold", fold_index=i
+            )[0][:nbins]
+            for i in range(self.n_folds)
+        ]
+        n_sumfold = tf.add_n(per_fold)
+        if debiased:
+            coeff = self.n_folds / (self.n_folds - 1.0)
+            return [(n_sumfold, coeff)] + [(n_i, -coeff) for n_i in per_fold]
+        return [(n_sumfold, 1.0)]
 
     def _fisher_core(self, hess_obj, debiased):
         """Gauss-Newton (expected-information) curvature corresponding to the
