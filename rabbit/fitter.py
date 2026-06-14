@@ -224,6 +224,29 @@ class Fitter:
         # hess = -M, so M = -scatter(hess_dense)). Used for the continuous-M
         # sandwich covariance Sigma = A^-1 + A^-1 M A^-1 (H - A = M).
         self.mcstat_M = self._build_mcstat_M()
+        # Two-half / k-fold cross-fit templates: precompute the half-sample
+        # norm tensors norm_A, norm_B [nbinsfull, nproc] from the fold
+        # templates (default groups = first/second half of the k folds, each
+        # rescaled by k/(k/2)=2 so <norm_A>=<norm_B>=norm_full). Shared logk.
+        self.norm_A = None
+        self.norm_B = None
+        norm_folds = getattr(self.indata, "norm_folds", None)
+        if norm_folds is not None:
+            k = int(norm_folds.shape[0])
+            if k % 2 != 0:
+                raise NotImplementedError(
+                    f"two-half de-biasing needs an even number of folds; got k={k}."
+                )
+            half = k // 2
+            scale = tf.constant(k / half, dtype=self.indata.dtype)  # = 2
+            self.norm_A = scale * tf.reduce_sum(norm_folds[:half], axis=0)
+            self.norm_B = scale * tf.reduce_sum(norm_folds[half:], axis=0)
+        if self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is None:
+            logger.warning(
+                f"--mcStatDebias {self.mcStatDebias} requested but no fold "
+                "templates (hnorm_folds) found in the input; two-half de-biasing "
+                "is inactive. Add processes with a fold_axis in the TensorWriter."
+            )
         if self.mcStatDebias == "continuousM" and self.mcstat_M is None:
             logger.warning(
                 "--mcStatDebias continuousM requested but no 'mcstat' external "
@@ -843,6 +866,43 @@ class Fitter:
             updates = tf.reshape(-t["hess_dense"], [-1])
             M = tf.tensor_scatter_nd_add(M, coords, updates)
         return M
+
+    def _compute_nll_meat(self):
+        """Plain full-sample NLL (no jackknife de-bias), used as the two-half
+        sandwich meat H = grad^2 L_full. Mirrors _compute_nll but always uses the
+        full templates and the ordinary per-bin ln."""
+        nexpfullcentral, _, beta = self._compute_yields_with_beta(
+            profile=True, compute_norm=False, full=len(self.regularizers)
+        )
+        nexp = nexpfullcentral[: self.indata.nbins]
+        l = self._compute_ln(nexp) + self._compute_lc()
+        lbeta = self._compute_lbeta(beta)
+        if lbeta is not None:
+            l = l + lbeta
+        lext = self._compute_external_nll()
+        if lext is not None:
+            l = l + lext
+        return l
+
+    @tf.function
+    def loss_val_grad_hess_meat(self):
+        with tf.GradientTape() as t2:
+            with tf.GradientTape() as t1:
+                val = self._compute_nll_meat()
+            grad = t1.gradient(val, self.x)
+        hess = t2.jacobian(grad, self.x)
+        return val, grad, hess
+
+    def cov_twohalf_sandwich(self, A):
+        """Two-half / k-fold robust (sandwich) covariance Sigma = A^-1 H A^-1.
+
+        Bread A = the de-biased (jackknife) objective Hessian; meat H = the
+        full-sample NLL Hessian (loss_val_grad_hess_meat). covMode='observed'
+        (autograd Hessians). See RABBIT_MCSTAT_DESIGN.md §2c.
+        """
+        _, _, H = self.loss_val_grad_hess_meat()
+        Ainv = tf.linalg.inv(A)
+        return Ainv @ tf.cast(H, Ainv.dtype) @ Ainv
 
     def cov_mcstat_sandwich(self, A):
         """Continuous-M robust (sandwich) covariance.
@@ -1573,7 +1633,10 @@ class Fitter:
             else:
                 self.logk = self.indata.logk * rnorm_init[..., None, None]
 
-    def _compute_yields_noBBB(self, full=True, compute_norm=True):
+    def _compute_yields_noBBB(self, full=True, compute_norm=True, templates="full"):
+        # templates: "full" uses indata.norm; "A"/"B" use the precomputed
+        # half-sample fold templates norm_A/norm_B (two-half de-biasing, shared
+        # logk). Only supported in the dense path.
         # full: compute yields inclduing masked channels
         # compute_norm: also build the dense [nbins, nproc] normcentral tensor.
         # In sparse mode this is expensive (forward + backward) and is only
@@ -1653,14 +1716,21 @@ class Fitter:
             if compute_norm:
                 normcentral = tf.sparse.to_dense(snormnorm_sparse)
         else:
+            if templates == "A":
+                norm_src = self.norm_A
+            elif templates == "B":
+                norm_src = self.norm_B
+            else:
+                norm_src = self.indata.norm
+
             if full or self.indata.nbinsmasked == 0:
                 nbins = self.indata.nbinsfull
                 logk = self.logk
-                norm = self.indata.norm
+                norm = norm_src
             else:
                 nbins = self.indata.nbins
                 logk = self.logk[:nbins]
-                norm = self.indata.norm[:nbins]
+                norm = norm_src[:nbins]
 
             if self.indata.symmetric_tensor:
                 mlogk = tf.reshape(
@@ -1964,7 +2034,28 @@ class Fitter:
 
         nexp = nexpfullcentral[: self.indata.nbins]
 
-        ln = self._compute_ln(nexp, full_nll)
+        if (
+            self.mcStatDebias in ("twoHalf", "kfold")
+            and self.norm_A is not None
+        ):
+            # Cross-fit jackknife combination L_cf = 2 L_full - 1/2 L_A - 1/2 L_B.
+            # Since mu_bar = 1/2(n_A + n_B) = n_full exactly, this de-biases the
+            # point (gradient = cross-fit score) and curvature (cross-half
+            # Fisher) regardless of nonlinearity. Shared logk; full templates
+            # carry the BB-lite beta profiling (unchanged).
+            nexp_A = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="A"
+            )[0][: self.indata.nbins]
+            nexp_B = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="B"
+            )[0][: self.indata.nbins]
+            ln = (
+                2.0 * self._compute_ln(nexp, full_nll)
+                - 0.5 * self._compute_ln(nexp_A, full_nll)
+                - 0.5 * self._compute_ln(nexp_B, full_nll)
+            )
+        else:
+            ln = self._compute_ln(nexp, full_nll)
 
         lc = self._compute_lc(full_nll)
 

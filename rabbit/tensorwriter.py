@@ -52,6 +52,12 @@ class TensorWriter:
         self.dict_pseudodata = {}  # [channel][pseudodata]
         self.dict_norm = {}  # [channel][process]
         self.dict_sumw2 = {}  # [channel][process]
+        # MC-stat cross-fit fold templates (two-half / k-fold de-biasing).
+        # dict_norm_folds[channel][process] = ndarray [k, nbinschan] (dense);
+        # fold_k[channel][process] = k (number of folds for that process).
+        # Populated only when add_process is called with fold_axis != None.
+        self.dict_norm_folds = {}  # [channel][process] -> [k, nbinschan]
+        self.fold_k = {}  # [channel][process] -> k
         self.dict_logkavg = {}  # [channel][proc][syst]
         self.dict_logkhalfdiff = {}  # [channel][proc][syst]
         self.dict_logkavg_indices = {}
@@ -187,7 +193,13 @@ class TensorWriter:
             )
         self.dict_pseudodata[channel][name] = self.get_flat_values(h)
 
-    def add_process(self, h, name, channel="ch0", signal=False, variances=None):
+    def add_process(
+        self, h, name, channel="ch0", signal=False, variances=None, fold_axis=None
+    ):
+        if fold_axis is not None:
+            return self._add_process_folded(
+                h, name, channel, signal, variances, fold_axis
+            )
         self._check_hist_and_channel(h, channel)
 
         if name in self.dict_norm[channel].keys():
@@ -246,6 +258,64 @@ class TensorWriter:
         self.dict_norm[channel][name] = norm
         self.dict_sumw2[channel][name] = sumw2
 
+    def _add_process_folded(self, h, name, channel, signal, variances, fold_axis):
+        """Add a process whose histogram carries an extra MC-stat fold axis.
+
+        The user fills `h` with an extra categorical/integer axis (named
+        `fold_axis`) assigning each *generated* event to one of `k` folds (all
+        oversampled copies of a generated event in the SAME fold; assignment
+        independent of the fitted observables — RABBIT_MCSTAT_DESIGN.md §2a).
+        The writer:
+          * derives the FULL template by projecting the fold axis out
+            (`h_full = sum_f h[fold=f]`) and registers it via the ordinary
+            add_process path (so sumw / sumw2 / systematics are unchanged), and
+          * stores the per-fold dense templates `[k, nbinschan]` for the
+            cross-fit (two-half / k-fold) de-biasing in the fitter.
+        `k` is inferred from the size of `fold_axis`. Sparse storage is not
+        supported for folded processes.
+        """
+        self._check_hist_and_channel(h, channel)
+        if self.sparse and self._issparse(h):
+            raise NotImplementedError(
+                "fold_axis is not supported for sparse histograms."
+            )
+        # resolve the fold axis (by name or index) and its size k
+        ax_names = [a.name for a in h.axes]
+        if isinstance(fold_axis, str):
+            if fold_axis not in ax_names:
+                raise ValueError(
+                    f"fold_axis '{fold_axis}' not found in histogram axes {ax_names}"
+                )
+            fold_idx = ax_names.index(fold_axis)
+        else:
+            fold_idx = int(fold_axis)
+        k = h.axes[fold_idx].size
+        if k < 2:
+            raise ValueError(f"fold_axis must have size >= 2, got {k}")
+
+        flow = self.channels[channel]["flow"]
+        # per-fold flat templates and the projected-out full template
+        folds = []
+        for f in range(k):
+            hf = h[{fold_idx: f}]
+            folds.append(self.get_flat_values(hf, flow))
+        norm_folds = np.stack(folds, axis=0)  # [k, nbinschan]
+        if not np.all(np.isfinite(norm_folds)):
+            raise RuntimeError(
+                f"NaN or Inf values encountered in fold templates for {name}!"
+            )
+        h_full = h[{fold_idx: sum}]
+
+        # register the full template through the ordinary (unfolded) path so
+        # sumw / sumw2 and all downstream machinery are identical to a normal
+        # process. variances default to the full hist's variances (= sum of
+        # fold variances), which is what BB-lite needs.
+        self.add_process(
+            h_full, name, channel=channel, signal=signal, variances=variances
+        )
+        self.dict_norm_folds[channel][name] = norm_folds.astype(self.dtype)
+        self.fold_k[channel][name] = k
+
     def add_mc_stat_moment(self, M, param_names, name="mcstat_M"):
         """Frozen MC-stat noise-floor matrix for the continuous-M de-biasing.
 
@@ -298,6 +368,8 @@ class TensorWriter:
         self.nbinschan[name] = ibins
         self.dict_norm[name] = {}
         self.dict_sumw2[name] = {}
+        self.dict_norm_folds[name] = {}
+        self.fold_k[name] = {}
         self.dict_beta_variations[name] = {}
 
         # add masked channels last
@@ -1693,6 +1765,47 @@ class TensorWriter:
 
             ibin += nbinschan
 
+        # --- MC-stat cross-fit fold templates (two-half / k-fold de-biasing).
+        # Assemble [k, nbinsfull, nproc] if any process was added with fold_axis.
+        # Folded processes store their k fold templates; non-folded processes
+        # store norm_full/k in each fold so they are identical across folds
+        # (MC-stat-exempt -> drop out of the de-bias). A common k across all
+        # folded processes is required.
+        any_folded = any(len(self.fold_k[c]) for c in self.channels)
+        norm_folds = None
+        if any_folded:
+            kset = {
+                k for c in self.channels for k in self.fold_k[c].values()
+            }
+            if len(kset) != 1:
+                raise NotImplementedError(
+                    f"All folded processes must share a common number of folds k; "
+                    f"got {sorted(kset)}."
+                )
+            kfold = kset.pop()
+            norm_folds = np.zeros([kfold, nbinsfull, nproc], self.dtype)
+            ibin = 0
+            for chan, chan_info in self.channels.items():
+                nbinschan = self.nbinschan[chan]
+                for iproc, proc in enumerate(procs):
+                    if proc not in self.dict_norm[chan]:
+                        continue
+                    if proc in self.dict_norm_folds[chan]:
+                        norm_folds[:, ibin : ibin + nbinschan, iproc] = (
+                            self.dict_norm_folds[chan][proc]
+                        )
+                    else:
+                        # MC-stat-exempt: spread the full template evenly
+                        full = self.dict_norm[chan][proc]
+                        if self._issparse(full):
+                            dense = np.zeros([nbinschan], self.dtype)
+                            dense[full.indices] = full.data
+                            full = dense
+                        norm_folds[:, ibin : ibin + nbinschan, iproc] = (
+                            full[None, :] / kfold
+                        )
+                ibin += nbinschan
+
         systs = self.get_systs()
         nsyst = len(systs)
 
@@ -2143,6 +2256,15 @@ class TensorWriter:
         nbytes += h5pyutils_write.writeFlatInChunks(
             sumw2, f, "hsumw2", maxChunkBytes=self.chunkSize
         )
+
+        # MC-stat cross-fit fold templates [k, nbinsfull, nproc] (dense), only
+        # written when at least one process was added with a fold_axis.
+        if norm_folds is not None:
+            nbytes += h5pyutils_write.writeFlatInChunks(
+                norm_folds, f, "hnorm_folds", maxChunkBytes=self.chunkSize
+            )
+            f.attrs["mcstat_fold_k"] = int(norm_folds.shape[0])
+            norm_folds = None
 
         if self.sparse:
             nbytes += h5pyutils_write.writeSparse(
