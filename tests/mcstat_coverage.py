@@ -101,7 +101,9 @@ def _fit(fn, debias, covMode, debiasCov, bbb, poisson):
     _, grad, hess = f.loss_val_grad_hess()
     bread = f.fisher_curvature(hess) if covMode == "fisher" else hess
     _, cov_curv = f.edmval_cov(grad, bread)
-    if debiasCov == "sandwich" and debias == "continuousM":
+    if debiasCov == "dataPropagated" and debias != "none":
+        C = np.asarray(f.cov_dataprop_sandwich(cov_curv))
+    elif debiasCov == "sandwich" and debias == "continuousM":
         C = np.asarray(f.cov_mcstat_sandwich(bread))
     elif debiasCov == "sandwich" and debias in ("twoHalf", "kfold"):
         C = np.asarray(f.cov_twohalf_sandwich(bread, covMode))

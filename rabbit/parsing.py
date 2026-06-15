@@ -392,10 +392,14 @@ def common_parser():
     parser.add_argument(
         "--mcStatDebiasCov",
         default="sandwich",
-        choices=["curvature", "sandwich"],
+        choices=["curvature", "sandwich", "dataPropagated"],
         help="Covariance reported when --mcStatDebias != none. 'curvature' = inverse "
         "de-biased Hessian A^-1 (undercovers). 'sandwich' = A^-1 H A^-1 = "
-        "A^-1 + A^-1 M A^-1 (covering robust covariance). Default 'sandwich'.",
+        "A^-1 + A^-1 M A^-1 (analytic meat; calibration-free ~0.68 with BB-lite, "
+        "undercovers without). 'dataPropagated' = Huber-White delta-method sandwich "
+        "propagating the data AND template (sumw2) variances through theta_hat "
+        "(continuous-M, dense): CONSERVATIVE, over-covers (~0.81, needs a downward "
+        "calibration; RESULTS §7d). Default 'sandwich'.",
     )
     parser.add_argument(
         "--mcStatKfold",

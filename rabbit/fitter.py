@@ -1180,6 +1180,49 @@ class Fitter:
         Ainv = tf.linalg.inv(A)
         return Ainv @ tf.cast(H, Ainv.dtype) @ Ainv
 
+    def cov_dataprop_sandwich(self, Ainv):
+        """Data-propagated Var(score) sandwich (Huber-White / delta-method).
+
+        Propagates the per-bin DATA variance and the per-(bin,proc) TEMPLATE
+        variance (sumw2 = the MC-stat variance) through the de-biased estimator
+        theta_hat(nobs, norm) by implicit differentiation:
+
+            Sigma = dx/dnobs . diag(Var[nobs]) . (dx/dnobs)^T
+                  + dx/dnorm . diag(sumw2)     . (dx/dnorm)^T
+
+        with dx/dv = -A^-1 d^2L/dx dv (A = de-biased bread; `Ainv` = A^-1). The
+        FIRST term equals the analytic A^-1 H A^-1 (data Fisher meat); the SECOND
+        adds the template-noise propagation. This is the conservative route: it
+        OVER-covers (~0.81 in the numpy tests, RESULTS §7d) and needs a downward
+        calibration k~0.81, vs the calibration-free analytic/BB-lite meat (~0.67).
+        Dense only (watches indata.norm); the de-biased POINT (M in the
+        minimization) is still required for an unbiased centre (§7d)."""
+        if self.indata.sparse:
+            raise NotImplementedError(
+                "data-propagated sandwich is dense-only (it differentiates the "
+                "loss w.r.t. indata.norm)."
+            )
+        Ainv = tf.cast(Ainv, self.indata.dtype)
+        norm = self.indata.norm
+        with tf.GradientTape() as t2:
+            t2.watch([self.nobs, norm])
+            with tf.GradientTape() as t1:
+                t1.watch([self.nobs, norm])
+                val = self._compute_loss()
+            grad = t1.gradient(val, self.x)
+        pd2ldxdnobs, pd2ldxdnorm = t2.jacobian(
+            grad, [self.nobs, norm], unconnected_gradients="zero"
+        )
+        dxdnobs = -Ainv @ pd2ldxdnobs                              # [npar, nbins]
+        dxdnorm = -Ainv @ tf.reshape(
+            pd2ldxdnorm, [tf.shape(pd2ldxdnorm)[0], -1]
+        )                                                          # [npar, nbinsfull*nproc]
+        var_nobs = self.varnobs if self.varnobs is not None else self.nobs
+        sumw2_flat = tf.reshape(self.indata.sumw2, [-1])
+        return (dxdnobs * var_nobs[None, :]) @ tf.transpose(dxdnobs) + (
+            dxdnorm * sumw2_flat[None, :]
+        ) @ tf.transpose(dxdnorm)
+
     def cov_mcstat_sandwich(self, A):
         """Continuous-M robust (sandwich) covariance.
 
