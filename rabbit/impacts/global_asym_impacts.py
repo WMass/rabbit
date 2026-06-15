@@ -54,11 +54,11 @@ def global_asym_impacts_parms(
     signs=(-1, 1),
     linear_warmstart=False,
 ):
-    """Run a per-nuisance theta0-shift + re-fit and assemble the asymmetric
+    """Run a per-nuisance x0-shift + re-fit and assemble the asymmetric
     global impact tensor.
 
     Args:
-        fitter: the Fitter instance (used for x, theta0 and minimize).
+        fitter: the Fitter instance (used for x, x0 and minimize).
         selected_idxs: indices into the syst axis (0..nsyst-1) of nuisances to
             scan.
         selected_names: names of those nuisances (bytes), used as impact-axis

@@ -305,11 +305,18 @@ class Fitter:
         # randomization fluctuates the centers wherever cw > 0.
         self.param_prior_active = False
         pm = self.param_model
-        param_cw_np = np.zeros(pm.nparams, dtype=np.float64)
-        param_x0_np = np.zeros(pm.nparams, dtype=np.float64)
+        np_dtype = self.indata.dtype.as_numpy_dtype
+        param_cw_np = np.zeros(pm.nparams, dtype=np_dtype)
+        # Constraint centers default to each parameter's own default; declared
+        # priors override the masked entries with their prior mean below.
+        # Keeping the default (rather than 0) for the free entries matters for
+        # consumers that read x0 as a parameter's natural center (e.g.
+        # nonprofiled impacts), even though cw = 0 makes it irrelevant to the
+        # likelihood itself.
+        param_x0_np = pm.xparamdefault.numpy().astype(np_dtype)
         sigmas = getattr(pm, "prior_sigmas", None)
         if sigmas is not None:
-            sigmas = np.asarray(sigmas, dtype=np.float64)
+            sigmas = np.asarray(sigmas, dtype=np_dtype)
             if sigmas.shape != (pm.nparams,):
                 raise ValueError(
                     f"param_model.prior_sigmas must have shape ({pm.nparams},); "
@@ -317,9 +324,9 @@ class Fitter:
                 )
             means = getattr(pm, "prior_means", None)
             if means is None:
-                means = pm.xparamdefault.numpy().astype(np.float64)
+                means = pm.xparamdefault.numpy().astype(np_dtype)
             else:
-                means = np.asarray(means, dtype=np.float64)
+                means = np.asarray(means, dtype=np_dtype)
                 if means.shape != (pm.nparams,):
                     raise ValueError(
                         f"param_model.prior_means must have shape ({pm.nparams},); "
@@ -345,7 +352,8 @@ class Fitter:
                     np.where(mask, means, np.nan), dtype=self.indata.dtype
                 )
                 param_cw_np = np.where(mask, 1.0 / sigmas**2, 0.0)
-                param_x0_np = np.where(mask, means, 0.0)
+                # priored entries -> prior mean; free entries keep their default
+                param_x0_np = np.where(mask, means, param_x0_np)
                 logger.info(
                     f"[paramPriors] applying Gaussian priors to "
                     f"{n_priored}/{pm.nparams} ParamModel params:"
