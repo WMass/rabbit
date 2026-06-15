@@ -497,25 +497,13 @@ def _gaussian_global_impacts(
     return impacts, impacts_grouped
 
 
-def _split_x0_sources(dxdx0, varx0, nmodel_params, param_prior_idxs):
-    """Split full-x0 derivatives into the nuisance block and the optional
-    ParamModel-prior source columns."""
-    dxdtheta0 = dxdx0[:, nmodel_params:]
-    vartheta0 = varx0[nmodel_params:]
-    if param_prior_idxs is not None:
-        dxdparam0 = tf.gather(dxdx0, param_prior_idxs, axis=1)
-        varparam0 = tf.gather(varx0, param_prior_idxs)
-    else:
-        dxdparam0 = None
-        varparam0 = None
-    return dxdtheta0, vartheta0, dxdparam0, varparam0
-
-
 def gaussian_global_impacts_parms(
-    dxdx0,
+    dxdtheta0,
+    dxdparam0,
     dxdnobs,
     dxdbeta0,
-    varx0,
+    vartheta0,
+    varparam0,
     varnobs,
     varbeta0,
     nsignal_params,
@@ -526,16 +514,20 @@ def gaussian_global_impacts_parms(
     beta_shape,
     systgroupidxs,
     data_cov_inv=None,
-    param_prior_idxs=None,
 ):
-    # compute impacts for pois and nois
-    dxdx0 = _gather_poi_noi_vector(dxdx0, noiidxs, nsignal_params, nmodel_params)
+    # The derivative columns come pre-split from the Fitter as
+    # [nuisance/theta block] and [priored params]; here we only gather the
+    # poi/noi rows whose impacts are reported (dxdparam0 is None when no
+    # priors are declared).
+    dxdtheta0 = _gather_poi_noi_vector(
+        dxdtheta0, noiidxs, nsignal_params, nmodel_params
+    )
     dxdnobs = _gather_poi_noi_vector(dxdnobs, noiidxs, nsignal_params, nmodel_params)
     dxdbeta0 = _gather_poi_noi_vector(dxdbeta0, noiidxs, nsignal_params, nmodel_params)
-
-    dxdtheta0, vartheta0, dxdparam0, varparam0 = _split_x0_sources(
-        dxdx0, varx0, nmodel_params, param_prior_idxs
-    )
+    if dxdparam0 is not None:
+        dxdparam0 = _gather_poi_noi_vector(
+            dxdparam0, noiidxs, nsignal_params, nmodel_params
+        )
 
     return _gaussian_global_impacts(
         dxdtheta0,
@@ -555,24 +547,20 @@ def gaussian_global_impacts_parms(
 
 
 def gaussian_global_impacts_obs(
-    dndx0,
+    dndtheta0,
+    dndparam0,
     dndnobs,
     dndbeta0,
-    varx0,
+    vartheta0,
+    varparam0,
     varnobs,
     varbeta0,
-    nmodel_params,
     bin_by_bin_stat,
     bin_by_bin_stat_mode,
     beta_shape,
     systgroupidxs,
     data_cov_inv=None,
-    param_prior_idxs=None,
 ):
-    dndtheta0, vartheta0, dndparam0, varparam0 = _split_x0_sources(
-        dndx0, varx0, nmodel_params, param_prior_idxs
-    )
-
     return _gaussian_global_impacts(
         dndtheta0,
         dndnobs,

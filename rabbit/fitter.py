@@ -1134,13 +1134,16 @@ class Fitter:
 
     @tf.function
     def gaussian_global_impacts_parms(self):
-        dxdx0, dxdnobs, dxdbeta0 = self._dxdvars()
+        dxdtheta0, dxdparam0, dxdnobs, dxdbeta0 = self._dxdvars()
+        vartheta0, varparam0 = self._x0_source_vars()
 
         impacts, impacts_grouped = global_impacts.gaussian_global_impacts_parms(
-            dxdx0,
+            dxdtheta0,
+            dxdparam0,
             dxdnobs,
             dxdbeta0,
-            self.var_x0,
+            vartheta0,
+            varparam0,
             self.nobs if self.varnobs is None else self.varnobs,
             (
                 1.0
@@ -1156,9 +1159,6 @@ class Fitter:
             self.bbstat.beta_shape,
             self.indata.systgroupidxs,
             self.data_cov_inv,
-            param_prior_idxs=(
-                self.param_prior_idxs if self.param_prior_active else None
-            ),
         )
 
         return impacts, impacts_grouped
@@ -1260,9 +1260,12 @@ class Fitter:
     ):
         """Fully likelihood-based asymmetric global impacts.
 
-        For each selected nuisance i, shift theta0[i] by +/- sigma (in units of
-        the prefit constraint width) and re-run the full fit. POI shifts at
-        each sign are the asymmetric global impacts.
+        For each selected source, shift its constraint center x0[idx] by +/-
+        sigma (in units of the prefit constraint width) and re-run the full
+        fit. POI/NOI shifts at each sign are the asymmetric global impacts.
+        Sources are the constrained nuisances and any priored ParamModel
+        params (exposed as <param>_prior, matching the source set of
+        gaussian_global_impacts_parms so the two agree in the Gaussian limit).
 
         Unconstrained nuisances (constraintweight = 0) are always skipped:
         they have no prefit sigma, and their theta0 does not enter the NLL,
@@ -1270,13 +1273,14 @@ class Fitter:
         (zero impact at the cost of two full fits).
 
         Args:
-            include: optional regex(es) restricting which nuisances to scan.
-            exclude: optional regex(es) excluding nuisances from the scan.
+            include: optional regex(es) restricting which sources to scan
+                (matched against nuisance names and bare priored-param names).
+            exclude: optional regex(es) excluding sources from the scan.
             sigma: shift magnitude in prefit-sigma units.
             linear_warmstart: experimental, see
                 global_asym_impacts.global_asym_impacts_parms.
         """
-        nsyst = self.indata.nsyst
+        nparams = self.param_model.nparams
         cw = self.indata.constraintweights.numpy()
         syst_names = np.array(self.indata.systs).astype(bytes)
 
@@ -1284,26 +1288,59 @@ class Fitter:
         # finite prefit sigma to shift by, and the refit would be a no-op.
         selected = cw > 0
         if include is not None:
-            keep = match_regexp_params(include, syst_names)
-            keep_set = set(keep)
+            keep_set = set(match_regexp_params(include, syst_names))
             selected &= np.array([n in keep_set for n in syst_names])
         if exclude is not None:
-            drop = match_regexp_params(exclude, syst_names)
-            drop_set = set(drop)
+            drop_set = set(match_regexp_params(exclude, syst_names))
             selected &= np.array([n not in drop_set for n in syst_names])
 
-        selected_idxs = np.where(selected)[0]
-        selected_names = syst_names[selected_idxs]
+        syst_sel = np.where(selected)[0]
+        # nuisance sources, in full-x coordinates (nparams + syst index)
+        src_x_idxs = [nparams + int(i) for i in syst_sel]
+        src_names = [syst_names[int(i)] for i in syst_sel]
+        n_nuis = len(src_x_idxs)
+
+        # priored ParamModel params are sources too, labelled <param>_prior to
+        # match the gaussian/likelihood global impacts; same include/exclude,
+        # matched against the bare param name. param_prior_idxs are already
+        # full-x indices (the param block leads x).
+        if self.param_prior_active:
+            parms = np.array(self.parms).astype(bytes)
+            prior_idxs = self.param_prior_idxs.numpy().astype(int)
+            prior_names = parms[prior_idxs]
+            psel = np.ones(len(prior_idxs), dtype=bool)
+            if include is not None:
+                keep_set = set(match_regexp_params(include, prior_names))
+                psel &= np.array([n in keep_set for n in prior_names])
+            if exclude is not None:
+                drop_set = set(match_regexp_params(exclude, prior_names))
+                psel &= np.array([n not in drop_set for n in prior_names])
+            for p, nm, ok in zip(prior_idxs, prior_names, psel):
+                if ok:
+                    src_x_idxs.append(int(p))
+                    src_names.append(nm + b"_prior")
+
+        # group membership in full-x indices: syst groups + ParamModel impact
+        # groups (the module function keeps only the scanned members).
+        group_members = {}
+        for gname, gidxs in zip(self.indata.systgroups, self.indata.systgroupidxs):
+            group_members[gname] = [nparams + int(i) for i in np.asarray(gidxs)]
+        for label, idxs in self._resolved_param_impact_groups():
+            key = label.encode() if isinstance(label, str) else label
+            group_members.setdefault(key, [])
+            group_members[key].extend(int(i) for i in idxs)
 
         logger.info(
-            f"global_asym_impacts_parms: selected {len(selected_idxs)}/{nsyst} "
-            f"nuisances (unconstrained nuisances always excluded)"
+            f"global_asym_impacts_parms: selected {len(src_x_idxs)} sources "
+            f"({n_nuis} nuisances + {len(src_x_idxs) - n_nuis} priored params; "
+            f"unconstrained nuisances always excluded)"
         )
 
         return global_asym_impacts.global_asym_impacts_parms(
             self,
-            selected_idxs,
-            selected_names,
+            src_x_idxs,
+            src_names,
+            group_members=group_members,
             sigma=sigma,
             linear_warmstart=linear_warmstart,
         )
@@ -1352,46 +1389,91 @@ class Fitter:
             pd2ldbeta2 = t2.gradient(pdldbeta, self.bbstat.ubeta)
         return pd2ldbeta2
 
+    def _x0_constraint_source_idxs(self):
+        # Full-x indices of the constraint sources reported by the global
+        # impacts, in column order [nuisance/theta block | priored params].
+        # x0 enters the NLL only through cw * (x - x0)^2, so the derivative
+        # w.r.t. any center with cw = 0 is identically zero; dropping those
+        # columns is exact, not an approximation, and keeps the Jacobian at
+        # [npar, nsyst (+ n_prior)] instead of [npar, npar]. The param block
+        # sits first in x, so param_prior_idxs are already full-x indices.
+        nparams = self.param_model.nparams
+        theta_idxs = tf.range(nparams, nparams + self.indata.nsyst, dtype=tf.int64)
+        if self.param_prior_active:
+            return tf.concat([theta_idxs, self.param_prior_idxs], axis=0)
+        return theta_idxs
+
+    def _x0_source_vars(self):
+        # Prefit variances of the constraint sources, in the same column
+        # order / split as _dxdvars / _dndvars: (vartheta0, varparam0).
+        vartheta0 = self.var_x0[self.param_model.nparams :]
+        if self.param_prior_active:
+            varparam0 = tf.gather(self.var_x0, self.param_prior_idxs)
+        else:
+            varparam0 = None
+        return vartheta0, varparam0
+
     def _dxdvars(self):
+        # Differentiate the loss only w.r.t. the constraint sources (the
+        # nuisance block plus any priored params) by perturbing those x0
+        # entries with `ds` and scattering back into the full vector; see
+        # _x0_constraint_source_idxs. The resulting columns are ordered
+        # [theta block | priored params] and split below.
+        src_idxs = self._x0_constraint_source_idxs()
+        n_src = self.indata.nsyst + (
+            int(self.param_prior_idxs.shape[0]) if self.param_prior_active else 0
+        )
+        scatter_idx = src_idxs[:, None]
         with tf.GradientTape() as t2:
-            t2.watch([self.x0, self.nobs, self.bbstat.beta0])
+            ds = tf.zeros([n_src], dtype=self.indata.dtype)
+            t2.watch([ds, self.nobs, self.bbstat.beta0])
             with tf.GradientTape() as t1:
-                t1.watch([self.x0, self.nobs, self.bbstat.beta0])
-                val = self._compute_loss()
+                t1.watch([ds, self.nobs, self.bbstat.beta0])
+                x0 = self.x0 + tf.scatter_nd(scatter_idx, ds, self.x0.shape)
+                val = self._compute_loss(x0=x0)
             grad = t1.gradient(val, self.x)
-        pd2ldxdx0, pd2ldxdnobs, pd2ldxdbeta0 = t2.jacobian(
+        pd2ldxds, pd2ldxdnobs, pd2ldxdbeta0 = t2.jacobian(
             grad,
-            [self.x0, self.nobs, self.bbstat.beta0],
+            [ds, self.nobs, self.bbstat.beta0],
             unconnected_gradients="zero",
         )
 
         # cov is inverse hesse, thus cov ~ d2xd2l
-        dxdx0 = -self.cov @ pd2ldxdx0
+        dxds = -self.cov @ pd2ldxds
         dxdnobs = -self.cov @ pd2ldxdnobs
         dxdbeta0 = -self.cov @ tf.reshape(pd2ldxdbeta0, [pd2ldxdbeta0.shape[0], -1])
 
-        return dxdx0, dxdnobs, dxdbeta0
+        nsyst = self.indata.nsyst
+        dxdtheta0 = dxds[:, :nsyst]
+        dxdparam0 = dxds[:, nsyst:] if self.param_prior_active else None
+
+        return dxdtheta0, dxdparam0, dxdnobs, dxdbeta0
 
     def _dndvars(self, fun):
+        # The forward model n depends on the parameters x but not on the
+        # constraint centers x0, so dn/dx0 = (dn/dx)(dx/dx0): differentiate n
+        # only w.r.t. x / nobs / beta0 here and pick up the x0 dependence
+        # through _dxdvars below.
         with tf.GradientTape() as t:
-            t.watch([self.x0, self.nobs, self.bbstat.beta0])
+            t.watch([self.nobs, self.bbstat.beta0])
             n = fun()
             n_flat = tf.reshape(n, (-1,))
 
-        pdndx, pdndx0, pdndnobs, pdndbeta0 = t.jacobian(
+        pdndx, pdndnobs, pdndbeta0 = t.jacobian(
             n_flat,
-            [self.x, self.x0, self.nobs, self.bbstat.beta0],
+            [self.x, self.nobs, self.bbstat.beta0],
             unconnected_gradients="zero",
         )
 
         # apply chain rule to take into account correlations with the fit parameters
-        dxdx0, dxdnobs, dxdbeta0 = self._dxdvars()
+        dxdtheta0, dxdparam0, dxdnobs, dxdbeta0 = self._dxdvars()
 
-        dndx0 = pdndx0 + pdndx @ dxdx0
+        dndtheta0 = pdndx @ dxdtheta0
+        dndparam0 = pdndx @ dxdparam0 if dxdparam0 is not None else None
         dndnobs = pdndnobs + pdndx @ dxdnobs
         dndbeta0 = tf.reshape(pdndbeta0, [pdndbeta0.shape[0], -1]) + pdndx @ dxdbeta0
 
-        return n, dndx0, dndnobs, dndbeta0
+        return n, dndtheta0, dndparam0, dndnobs, dndbeta0
 
     def _compute_expected(
         self, fun_exp, inclusive=True, profile=False, full=True, need_observables=True
@@ -1527,13 +1609,16 @@ class Fitter:
                     need_observables=need_observables,
                 )
 
-            _, dndx0, dndnobs, dndbeta0 = self._dndvars(fun_n)
+            _, dndtheta0, dndparam0, dndnobs, dndbeta0 = self._dndvars(fun_n)
+            vartheta0, varparam0 = self._x0_source_vars()
             impacts_gaussian, impacts_gaussian_grouped = (
                 global_impacts.gaussian_global_impacts_obs(
-                    dndx0,
+                    dndtheta0,
+                    dndparam0,
                     dndnobs,
                     dndbeta0,
-                    self.var_x0,
+                    vartheta0,
+                    varparam0,
                     self.nobs if self.varnobs is None else self.varnobs,
                     (
                         1.0
@@ -1541,15 +1626,11 @@ class Fitter:
                         or not self.bbstat.enabled
                         else 1.0 / self.bbstat.kstat
                     ),
-                    self.param_model.nparams,
                     self.bbstat.enabled,
                     self.bbstat.binByBinStatMode,
                     self.bbstat.beta_shape,
                     self.indata.systgroupidxs,
                     self.data_cov_inv,
-                    param_prior_idxs=(
-                        self.param_prior_idxs if self.param_prior_active else None
-                    ),
                 )
             )
         else:
@@ -1830,9 +1911,16 @@ class Fitter:
             observed = fun(None, self.nobs)
             return expected - observed
 
-        residuals, dresdx0, dresdnobs, dresdbeta0 = self._dndvars(fun_res)
+        residuals, dresdtheta0, dresdparam0, dresdnobs, dresdbeta0 = self._dndvars(
+            fun_res
+        )
+        vartheta0, varparam0 = self._x0_source_vars()
 
-        res_cov = dresdx0 @ (self.var_x0[:, None] * tf.transpose(dresdx0))
+        # source variances enter only where cw > 0; the dropped (free) columns
+        # contributed exactly zero to the old full-x0 quadratic form.
+        res_cov = dresdtheta0 @ (vartheta0[:, None] * tf.transpose(dresdtheta0))
+        if dresdparam0 is not None:
+            res_cov += dresdparam0 @ (varparam0[:, None] * tf.transpose(dresdparam0))
 
         if self.covarianceFit:
             res_cov_stat = dresdnobs @ tf.linalg.solve(
@@ -1996,13 +2084,16 @@ class Fitter:
     def reduced_nll(self):
         return self._compute_nll(full_nll=False)
 
-    def _compute_lc(self, full_nll=False):
+    def _compute_lc(self, full_nll=False, x0=None):
         # One constraint term over the full effective parameter vector
         # [poi, model_nui, theta]: the ParamModel block is constrained by
         # param_cw / param_x0 (declared priors; cw = 0 -> free) and the
         # nuisance block by indata.constraintweights / theta0.
+        # x0 defaults to self.x0; _dxdvars passes a perturbed copy to
+        # differentiate the loss w.r.t. a subset of the constraint centers.
+        x0 = self.x0 if x0 is None else x0
         cw = self.cw
-        lc = cw * 0.5 * tf.square(self.get_x() - self.x0)
+        lc = cw * 0.5 * tf.square(self.get_x() - x0)
         if full_nll:
             # normalization factor 0.5*log(2*pi*sigma^2) for constrained
             # entries, with sigma^2 = 1/cw and
@@ -2049,7 +2140,7 @@ class Fitter:
                 )
         return ln
 
-    def _compute_nll_components(self, profile=True, full_nll=False):
+    def _compute_nll_components(self, profile=True, full_nll=False, x0=None):
         nexpfullcentral, _, beta = self._compute_yields_with_beta(
             profile=profile,
             compute_norm=False,
@@ -2060,7 +2151,7 @@ class Fitter:
 
         ln = self._compute_ln(nexp, full_nll)
 
-        lc = self._compute_lc(full_nll)
+        lc = self._compute_lc(full_nll, x0=x0)
 
         lbeta = self._compute_lbeta(beta, full_nll)
 
@@ -2082,9 +2173,9 @@ class Fitter:
             self.external_terms, self.x, self.indata.dtype
         )
 
-    def _compute_nll(self, profile=True, full_nll=False):
+    def _compute_nll(self, profile=True, full_nll=False, x0=None):
         ln, lc, lbeta, lpenalty, beta = self._compute_nll_components(
-            profile=profile, full_nll=full_nll
+            profile=profile, full_nll=full_nll, x0=x0
         )
         l = ln + lc
 
@@ -2099,8 +2190,8 @@ class Fitter:
             l = l + lext
         return l
 
-    def _compute_loss(self, profile=True):
-        return self._compute_nll(profile=profile)
+    def _compute_loss(self, profile=True, x0=None):
+        return self._compute_nll(profile=profile, x0=x0)
 
     def _make_tf_functions(self):
         # Build tf.function wrappers at instance construction time so that

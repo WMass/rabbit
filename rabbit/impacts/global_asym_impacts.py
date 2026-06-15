@@ -48,28 +48,40 @@ def _envelope(values):
 
 def global_asym_impacts_parms(
     fitter,
-    selected_idxs,
+    selected_x_idxs,
     selected_names,
+    group_members=None,
     sigma=1.0,
     signs=(-1, 1),
     linear_warmstart=False,
 ):
-    """Run a per-nuisance x0-shift + re-fit and assemble the asymmetric
-    global impact tensor.
+    """Run a per-source x0-shift + re-fit and assemble the asymmetric global
+    impact tensor.
+
+    A "source" is any constraint center: a constrained nuisance or a priored
+    ParamModel parameter. For each one its center x0[idx] is shifted by +/-
+    sigma and the full fit is re-run; the resulting POI/NOI shifts are the
+    asymmetric global impacts. This mirrors the sources of
+    gaussian_global_impacts_parms (which exposes priored params as
+    <param>_prior columns), so the two agree in the Gaussian limit.
 
     Args:
         fitter: the Fitter instance (used for x, x0 and minimize).
-        selected_idxs: indices into the syst axis (0..nsyst-1) of nuisances to
-            scan.
-        selected_names: names of those nuisances (bytes), used as impact-axis
-            labels.
+        selected_x_idxs: full-x indices of the sources to scan (a nuisance i
+            is at fitter.param_model.nparams + i; a priored param is at its
+            own position in the leading param block).
+        selected_names: labels for those sources (bytes), used as impact-axis
+            labels (priored params are labelled <param>_prior by the caller).
+        group_members: optional dict {group_name(bytes): [full-x idxs]} used
+            to build the grouped quadrature envelopes. Covers both syst groups
+            and ParamModel impact groups.
         sigma: shift magnitude in units of the prefit constraint width
             (constraints are unit-sigma in rabbit, so 1.0 = 1 prefit sigma).
         signs: sequence (down, up). Bin 0 of axis_downUpVar -> first sign.
         linear_warmstart: experimental. If True, warm-start each refit at
-            x_nom + dxdtheta0[:, i] * shift, the Gaussian-approximation new
-            minimum for the shifted theta0. Should drastically reduce the
-            number of optimizer iterations on near-Gaussian nuisances.
+            x_nom + dxds[:, source] * shift, the Gaussian-approximation new
+            minimum for the shifted center. Should drastically reduce the
+            number of optimizer iterations on near-Gaussian sources.
             Requires fitter.cov to exist (same prerequisite as
             --gaussianGlobalImpacts).
 
@@ -78,14 +90,24 @@ def global_asym_impacts_parms(
         impacts: np.ndarray of shape (n_scanned, 2, n_total_params).
             Axis 1 is [down, up] matching axis_downUpVar.
         group_names: np.ndarray of bytes for groups containing scanned
-            nuisances (plus a trailing "Total").
+            sources (plus a trailing "Total").
         impacts_grouped: np.ndarray of shape (n_groups, 2, n_total_params).
     """
-    n_scanned = len(selected_idxs)
+    if group_members is None:
+        group_members = {}
+    selected_x_idxs = [int(idx) for idx in selected_x_idxs]
+    n_scanned = len(selected_x_idxs)
     n_total = len(fitter.parms)
     impacts = np.zeros((n_scanned, 2, n_total))
 
     nparams = fitter.param_model.nparams
+
+    # Prefit width of each constraint center: sqrt(var_x0) = 1/sqrt(cw). For
+    # nuisances cw = 1 so this is 1 (the historical "1.0 = 1 sigma"); for
+    # priored params it is the prior sigma, so a unit-sigma shift moves x0 by
+    # sigma, not by 1. Scaling by it keeps the asym impact in the same per-1-
+    # prefit-sigma units as gaussian_global_impacts_parms.
+    src_sigma_np = np.sqrt(fitter.var_x0.numpy())
 
     # Snapshot postfit nominal state to restore between iterations.
     x_nom = tf.identity(fitter.x.value())
@@ -94,17 +116,18 @@ def global_asym_impacts_parms(
     x_nom_np = x_nom.numpy()
 
     logger.info(
-        f"global_asym_impacts: shifting theta0 by +/- {sigma} sigma and "
-        f"re-fitting for {n_scanned} nuisances"
+        f"global_asym_impacts: shifting constraint centers by +/- {sigma} sigma "
+        f"and re-fitting for {n_scanned} sources"
         + (" (linear warm-start enabled)" if linear_warmstart else "")
     )
 
-    # Optional Gaussian-approximation warm-start.
-    # dxdx0 has shape [npar, npar]; column nparams + i gives the linearised
-    # response of the postfit minimum to a unit shift of theta0[i]. Computing
-    # it once before the loop is the same cost as one --gaussianGlobalImpacts
-    # call.
-    dxdx0_np = None
+    # Optional Gaussian-approximation warm-start. _dxdvars returns the postfit
+    # response to a unit shift of each constraint center, pre-split into the
+    # nuisance block (dxdtheta0[:, i]) and the priored-param columns
+    # (dxdparam0[:, j]); we map each scanned source's full-x index to its
+    # column. Computing it once is the same cost as one
+    # --gaussianGlobalImpacts call.
+    warmstart_col = None
     if linear_warmstart:
         if fitter.cov is None:
             raise RuntimeError(
@@ -112,40 +135,57 @@ def global_asym_impacts_parms(
                 "(incompatible with --noHessian)."
             )
         t_lws = time.perf_counter()
-        dxdx0_tf, _, _ = fitter._dxdvars()
-        dxdx0_np = dxdx0_tf.numpy()
+        dxdtheta0_tf, dxdparam0_tf, _, _ = fitter._dxdvars()
+        dxdtheta0_np = dxdtheta0_tf.numpy()
+        dxdparam0_np = dxdparam0_tf.numpy() if dxdparam0_tf is not None else None
+        prior_col = (
+            {int(p): j for j, p in enumerate(fitter.param_prior_idxs.numpy())}
+            if fitter.param_prior_active
+            else {}
+        )
+
+        def _warmstart_col(idx):
+            if idx >= nparams:
+                return dxdtheta0_np[:, idx - nparams]
+            return dxdparam0_np[:, prior_col[idx]]
+
+        warmstart_col = _warmstart_col
+
         logger.info(
-            f"global_asym_impacts: dxdx0 prepared in "
+            f"global_asym_impacts: dxds prepared in "
             f"{time.perf_counter() - t_lws:.2f}s"
         )
 
     t_per = np.zeros(n_scanned, dtype=np.float64)
     t_total0 = time.perf_counter()
 
-    for k, i in enumerate(selected_idxs):
-        i = int(i)
+    for k, idx in enumerate(selected_x_idxs):
         name = selected_names[k]
         name_str = name.decode() if isinstance(name, bytes) else name
-        logger.info(f"  [{k + 1}/{n_scanned}] theta0-shift refit for {name_str}")
+        logger.info(f"  [{k + 1}/{n_scanned}] x0-shift refit for {name_str}")
+
+        # shift the center by `sigma` prefit sigmas of this source (1 for
+        # unit-constrained nuisances, the prior sigma for priored params).
+        width = src_sigma_np[idx]
 
         t0 = time.perf_counter()
         for j, sign in enumerate(signs):
-            shift = float(sign) * float(sigma)
+            shift = float(sign) * float(sigma) * float(width)
 
-            # Always shift the constraint center for nuisance i by `shift`.
+            # Always shift the constraint center for source idx by `shift`.
             x0_shifted = x0_nom_np.copy()
-            x0_shifted[nparams + i] += shift
+            x0_shifted[idx] += shift
 
             # Warm-start x. With linear_warmstart, use the Gaussian-approx new
-            # minimum x_nom + dxdx0[:, nparams+i] * shift -- on near-Gaussian
-            # nuisances this lands at the new minimum to within roundoff.
-            # Without it, just shift x[nparams+i] by `shift` so the nuisance
-            # itself starts at the new constraint center.
-            if linear_warmstart:
-                x_shifted = x_nom_np + dxdx0_np[:, nparams + i] * shift
+            # minimum x_nom + dxds[:, source] * shift -- on near-Gaussian
+            # sources this lands at the new minimum to within roundoff.
+            # Without it, just shift x[idx] by `shift` so the parameter itself
+            # starts at the new constraint center.
+            if warmstart_col is not None:
+                x_shifted = x_nom_np + warmstart_col(idx) * shift
             else:
                 x_shifted = x_nom_np.copy()
-                x_shifted[nparams + i] += shift
+                x_shifted[idx] += shift
 
             fitter.x0.assign(x0_shifted)
             fitter.x.assign(x_shifted)
@@ -175,17 +215,16 @@ def global_asym_impacts_parms(
         logger.info(
             f"global_asym_impacts: total {t_total:.1f}s "
             f"(mean {t_per.mean():.2f}s, min {t_per.min():.2f}s, "
-            f"max {t_per.max():.2f}s per nuisance)"
+            f"max {t_per.max():.2f}s per source)"
         )
 
     # Grouped impacts via quadrature envelope, separately for down/up.
-    selected_set = set(int(idx) for idx in selected_idxs)
-    pos_in_scanned = {int(idx): k for k, idx in enumerate(selected_idxs)}
+    selected_set = set(selected_x_idxs)
+    pos_in_scanned = {idx: k for k, idx in enumerate(selected_x_idxs)}
 
     group_names = []
     group_impacts = []
-    for gname, gidxs in zip(fitter.indata.systgroups, fitter.indata.systgroupidxs):
-        gidxs = np.asarray(gidxs).astype(int)
+    for gname, gidxs in group_members.items():
         in_scanned = [pos_in_scanned[i] for i in gidxs if int(i) in selected_set]
         if not in_scanned:
             continue
