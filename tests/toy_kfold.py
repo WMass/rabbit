@@ -2,9 +2,12 @@
 complete k-fold U-statistic curvature (k-fold averaging). Each process's finite-MC
 template is split into 4 independent folds (multinomial 1/4 per bin); the full =
 sum of folds is derived by the writer. Writes toy_kfold.hdf5."""
+
 import os
-import numpy as np
+
 import hist
+import numpy as np
+
 from rabbit.tensorwriter import TensorWriter
 
 NB = 200
@@ -19,7 +22,9 @@ data = (n_flat + n_step).astype(float)
 sw_flat = rng.poisson(n_flat)
 sw_step = rng.poisson(n_step)
 # split each bin's counts into K folds via a multinomial(count, [1/K]*K)
-flat_folds = np.stack([rng.multinomial(c, [1.0 / K] * K) for c in sw_flat], axis=0).T  # [K, NB]
+flat_folds = np.stack(
+    [rng.multinomial(c, [1.0 / K] * K) for c in sw_flat], axis=0
+).T  # [K, NB]
 step_folds = np.stack([rng.multinomial(c, [1.0 / K] * K) for c in sw_step], axis=0).T
 
 ax = hist.axis.Regular(NB, 0.0, 1.0, name="x")
@@ -28,7 +33,8 @@ axf = hist.axis.IntCategory(list(range(K)), name="mcfold")
 
 def dhist(v):
     h = hist.Hist(ax, storage=hist.storage.Weight())
-    h.view()["value"] = v; h.view()["variance"] = v
+    h.view()["value"] = v
+    h.view()["variance"] = v
     return h
 
 

@@ -369,7 +369,9 @@ class TensorWriter:
         ax0 = _hist.axis.StrCategory(names, name="mcstat_params0")
         ax1 = _hist.axis.StrCategory(names, name="mcstat_params1")
         h = _hist.Hist(ax0, ax1, storage=_hist.storage.Double())
-        h.view(flow=False)[...] = -M  # hess = -M  ->  +1/2 x^T H x = -1/2 theta^T M theta
+        h.view(flow=False)[...] = (
+            -M
+        )  # hess = -M  ->  +1/2 x^T H x = -1/2 theta^T M theta
         self.add_external_likelihood_term(hess=h, name=name)
         # tag for the fitter's sandwich covariance
         self.mcstat_moment_term = name
@@ -1279,8 +1281,18 @@ class TensorWriter:
 
         if fold_axis is not None:
             return self._add_systematic_folded(
-                h, name, process, channel, kfactor, mirror, symmetrize,
-                add_to_data_covariance, as_difference, syst_axes, fold_axis, **kargs
+                h,
+                name,
+                process,
+                channel,
+                kfactor,
+                mirror,
+                symmetrize,
+                add_to_data_covariance,
+                as_difference,
+                syst_axes,
+                fold_axis,
+                **kargs,
             )
 
         # Fast batched path for SparseHist multi-systematic input. Conditions:
@@ -1406,8 +1418,19 @@ class TensorWriter:
         )
 
     def _add_systematic_folded(
-        self, h, name, process, channel, kfactor, mirror, symmetrize,
-        add_to_data_covariance, as_difference, syst_axes, fold_axis, **kargs
+        self,
+        h,
+        name,
+        process,
+        channel,
+        kfactor,
+        mirror,
+        symmetrize,
+        add_to_data_covariance,
+        as_difference,
+        syst_axes,
+        fold_axis,
+        **kargs,
     ):
         """Add a systematic whose variation histogram(s) carry an MC-stat fold
         axis, SPLITTING logk per fold (RABBIT_MCSTAT_DESIGN.md §2a). The full
@@ -1440,7 +1463,7 @@ class TensorWriter:
                 f"add_systematic(fold_axis=...): process '{process}' has no fold "
                 f"templates; add it with the same fold_axis first."
             )
-        norm_folds = self.dict_norm_folds[channel][process]   # [k, nbinschan]
+        norm_folds = self.dict_norm_folds[channel][process]  # [k, nbinschan]
         k = norm_folds.shape[0]
         ax_names = [a.name for a in h0.axes]
         if isinstance(fold_axis, str):
@@ -1471,10 +1494,16 @@ class TensorWriter:
             if as_difference:
                 up_full = norm_full + up_full
                 down_full = norm_full + down_full
-            lu_full = self.get_logk(up_full, norm_full, kfactor, systematic_type=systematic_type)
-            ld_full = -self.get_logk(down_full, norm_full, kfactor, systematic_type=systematic_type)
+            lu_full = self.get_logk(
+                up_full, norm_full, kfactor, systematic_type=systematic_type
+            )
+            ld_full = -self.get_logk(
+                down_full, norm_full, kfactor, systematic_type=systematic_type
+            )
             if symmetrize == "conservative":
-                logkavg_full = np.where(np.abs(lu_full) > np.abs(ld_full), lu_full, ld_full)
+                logkavg_full = np.where(
+                    np.abs(lu_full) > np.abs(ld_full), lu_full, ld_full
+                )
             else:
                 logkavg_full = 0.5 * (lu_full + ld_full)
         else:
@@ -1497,8 +1526,12 @@ class TensorWriter:
                 if as_difference:
                     up_f = norm_f + up_f
                     down_f = norm_f + down_f
-                lu = self.get_logk(up_f, norm_f, kfactor, systematic_type=systematic_type)
-                ld = -self.get_logk(down_f, norm_f, kfactor, systematic_type=systematic_type)
+                lu = self.get_logk(
+                    up_f, norm_f, kfactor, systematic_type=systematic_type
+                )
+                ld = -self.get_logk(
+                    down_f, norm_f, kfactor, systematic_type=systematic_type
+                )
                 if symmetrize == "conservative":
                     logkavg_folds[f] = np.where(np.abs(lu) > np.abs(ld), lu, ld)
                 elif symmetrize == "average":
@@ -1521,9 +1554,17 @@ class TensorWriter:
         else:
             h_full = h[{fold_idx: sum}]
         self.add_systematic(
-            h_full, name, process, channel, kfactor=kfactor, mirror=mirror,
-            symmetrize=symmetrize, add_to_data_covariance=add_to_data_covariance,
-            as_difference=as_difference, syst_axes=syst_axes, **kargs
+            h_full,
+            name,
+            process,
+            channel,
+            kfactor=kfactor,
+            mirror=mirror,
+            symmetrize=symmetrize,
+            add_to_data_covariance=add_to_data_covariance,
+            as_difference=as_difference,
+            syst_axes=syst_axes,
+            **kargs,
         )
         if is_asym and self.sparse:
             raise NotImplementedError(
@@ -1533,12 +1574,14 @@ class TensorWriter:
 
         # store the per-fold logk under the resolved (full) systematic name
         self.dict_logkavg_folds[channel].setdefault(process, {})
-        self.dict_logkavg_folds[channel][process][name] = logkavg_folds.astype(self.dtype)
+        self.dict_logkavg_folds[channel][process][name] = logkavg_folds.astype(
+            self.dtype
+        )
         # per-fold delta vs the full logk (for the sparse split-logk path)
         self.dict_logk_folds_delta[channel].setdefault(process, {})
         self.dict_logk_folds_delta[channel][process][name] = (
-            (logkavg_folds - logkavg_full[None, :]).astype(self.dtype)
-        )
+            logkavg_folds - logkavg_full[None, :]
+        ).astype(self.dtype)
         if is_asym:
             self.dict_logkhalfdiff_folds[channel].setdefault(process, {})
             self.dict_logkhalfdiff_folds[channel][process][name] = (
@@ -1951,9 +1994,7 @@ class TensorWriter:
         any_folded = any(len(self.fold_k[c]) for c in self.channels)
         norm_folds = None
         if any_folded:
-            kset = {
-                k for c in self.channels for k in self.fold_k[c].values()
-            }
+            kset = {k for c in self.channels for k in self.fold_k[c].values()}
             if len(kset) != 1:
                 raise NotImplementedError(
                     f"All folded processes must share a common number of folds k; "
@@ -2540,7 +2581,9 @@ class TensorWriter:
                 logk_folds_delta, f, "hlogk_folds_delta", maxChunkBytes=self.chunkSize
             )
             nbytes += h5pyutils_write.writeFlatInChunks(
-                mcstat_folded_syst_idx, f, "hmcstat_folded_syst_idx",
+                mcstat_folded_syst_idx,
+                f,
+                "hmcstat_folded_syst_idx",
                 maxChunkBytes=self.chunkSize,
             )
             logk_folds_delta = None

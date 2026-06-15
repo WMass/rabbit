@@ -10,10 +10,13 @@
 
 Run with OUT=<dir>. Needs toy_splitlogk.hdf5 (tests/toy_splitlogk.py) present.
 """
-import os, sys
-import numpy as np
-import hist
+
 import importlib.util as _ilu
+import os
+import sys
+
+import hist
+import numpy as np
 
 RABBIT_BASE = os.environ.get("RABBIT_BASE", ".")
 sys.path.insert(0, os.path.join(RABBIT_BASE, "bin"))
@@ -22,7 +25,7 @@ _spec = _ilu.spec_from_file_location(
 )
 _rfm = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_rfm)
-from rabbit import inputdata, fitter
+from rabbit import fitter, inputdata
 from rabbit.param_models import helpers as ph
 from rabbit.tensorwriter import TensorWriter
 
@@ -30,17 +33,20 @@ OUT = os.environ.get("OUT", "/tmp/claude")
 
 
 def build_toy_Mbb():
-    NB = 200; A, H1, H2 = 4962.0, 5112.0, 4962.0
+    NB = 200
+    A, H1, H2 = 4962.0, 5112.0, 4962.0
     rng = np.random.default_rng(20240614)
     n_flat = np.full(NB, A)
     n_step = np.concatenate([np.full(NB // 2, H1), np.full(NB // 2, H2)])
     data = (n_flat + n_step).astype(float)
-    sw_flat = rng.poisson(n_flat).astype(float); sw_step = rng.poisson(n_step).astype(float)
+    sw_flat = rng.poisson(n_flat).astype(float)
+    sw_step = rng.poisson(n_step).astype(float)
     ax = hist.axis.Regular(NB, 0.0, 1.0, name="x")
 
     def wh(v, var):
         h = hist.Hist(ax, storage=hist.storage.Weight())
-        h.view()["value"] = v; h.view()["variance"] = var
+        h.view()["value"] = v
+        h.view()["variance"] = var
         return h
 
     tw = TensorWriter(sparse=False)
@@ -48,21 +54,34 @@ def build_toy_Mbb():
     tw.add_data(wh(data, data), "ch0")
     tw.add_process(wh(sw_flat, sw_flat), "flat", "ch0", signal=True)
     tw.add_process(wh(sw_step, sw_step), "step", "ch0", signal=True)
-    Vbb = data + (sw_flat + sw_step)              # BB-lite inflated variance
+    Vbb = data + (sw_flat + sw_step)  # BB-lite inflated variance
     M = np.diag([np.sum(sw_flat / Vbb), np.sum(sw_step / Vbb)])
     tw.add_mc_stat_moment(M, ["flat", "step"])
     tw.write(outfolder=OUT, outfilename="toy_Mbb.hdf5")
 
 
 def fit(fn, debias, bbb, sandwich=None):
-    argv = [fn, "-o", f"{OUT}/vo", "-t", "0", "--chisqFit",
-            "--allowNegativeParam", "--mcStatDebias", debias]
+    argv = [
+        fn,
+        "-o",
+        f"{OUT}/vo",
+        "-t",
+        "0",
+        "--chisqFit",
+        "--allowNegativeParam",
+        "--mcStatDebias",
+        debias,
+    ]
     if not bbb:
         argv.append("--noBinByBinStat")
     a = _rfm.make_parser().parse_args(argv)
     ind = inputdata.FitInputData(fn, None)
-    f = fitter.Fitter(ind, ph.load_models([["Mu"]], ind, **vars(a)), a, do_blinding=False)
-    f.defaultassign(); f.set_nobs(ind.data_obs); f.minimize()
+    f = fitter.Fitter(
+        ind, ph.load_models([["Mu"]], ind, **vars(a)), a, do_blinding=False
+    )
+    f.defaultassign()
+    f.set_nobs(ind.data_obs)
+    f.minimize()
     _, g, h = f.loss_val_grad_hess()
     _, cov = f.edmval_cov(g, h)
     C = np.asarray(cov)
@@ -78,7 +97,9 @@ def fit(fn, debias, bbb, sandwich=None):
 if __name__ == "__main__":
     print("(A) continuous-M + BB-lite (toy_Mbb, BB-variance M):")
     build_toy_Mbb()
-    x, sig, S, gmax, eig = fit(f"{OUT}/toy_Mbb.hdf5", "continuousM", True, "continuousM")
+    x, sig, S, gmax, eig = fit(
+        f"{OUT}/toy_Mbb.hdf5", "continuousM", True, "continuousM"
+    )
     pd = bool(np.all(eig > 0))
     print(f"    x={np.round(x,4)} |grad|={gmax:.1e} PD={pd} hess_eig={np.round(eig,2)}")
     assert pd and gmax < 1e-3, "continuous-M + BB-lite did not converge PD"
@@ -88,7 +109,9 @@ if __name__ == "__main__":
     x0, sig0, _, g0, e0 = fit(fn, "none", True)
     x1, sig1, S1, g1, e1 = fit(fn, "twoHalf", True, "twoHalf")
     print(f"    none    x={np.round(x0,4)} tilt sigma={sig0[1]:.4f}")
-    print(f"    twoHalf x={np.round(x1,4)} tilt curv={sig1[1]:.4f} sandwich={np.sqrt(S1[1,1]):.4f}")
+    print(
+        f"    twoHalf x={np.round(x1,4)} tilt curv={sig1[1]:.4f} sandwich={np.sqrt(S1[1,1]):.4f}"
+    )
     assert bool(np.all(e1 > 0)) and g1 < 1e-3, "two-half + BB-lite not converged PD"
     assert np.sqrt(S1[1, 1]) > sig0[1], "two-half should inflate the tilt uncertainty"
     print("\n  ALL BB-lite composition checks passed.")

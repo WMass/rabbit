@@ -7,17 +7,21 @@
 
 Needs toy_kfold.hdf5 (tests/toy_kfold.py). Run with OUT=<dir>.
 """
-import os, sys
-import numpy as np
+
 import importlib.util as _ilu
+import os
+import sys
+
+import numpy as np
 
 RABBIT_BASE = os.environ.get("RABBIT_BASE", ".")
 sys.path.insert(0, os.path.join(RABBIT_BASE, "bin"))
 _spec = _ilu.spec_from_file_location(
     "rabbit_fit_main", os.path.join(RABBIT_BASE, "bin", "rabbit_fit.py")
 )
-_rfm = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_rfm)
-from rabbit import inputdata, fitter
+_rfm = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_rfm)
+from rabbit import fitter, inputdata
 from rabbit.param_models import helpers as ph
 
 NB, A, H1, H2 = 200, 4962.0, 5112.0, 4962.0
@@ -37,7 +41,8 @@ def ustat(Ti, V):
 
 def numpy_ref_k4():
     rng = np.random.default_rng(20240614)  # same seed as toy_kfold.py
-    swf = rng.poisson(n_flat); sws = rng.poisson(n_step)
+    swf = rng.poisson(n_flat)
+    sws = rng.poisson(n_step)
     ff = np.stack([rng.multinomial(c, [0.25] * 4) for c in swf], 0).T
     sf = np.stack([rng.multinomial(c, [0.25] * 4) for c in sws], 0).T
     Ti = [np.stack([ff[i], sf[i]], 1).astype(float) for i in range(4)]
@@ -45,13 +50,29 @@ def numpy_ref_k4():
 
 
 def rabbit_fisher(fn):
-    import tensorflow as tf
     a = _rfm.make_parser().parse_args(
-        [fn, "-o", "/tmp/claude/vo", "-t", "0", "--chisqFit", "--noBinByBinStat",
-         "--allowNegativeParam", "--mcStatDebias", "kfold", "--covMode", "fisher"])
+        [
+            fn,
+            "-o",
+            "/tmp/claude/vo",
+            "-t",
+            "0",
+            "--chisqFit",
+            "--noBinByBinStat",
+            "--allowNegativeParam",
+            "--mcStatDebias",
+            "kfold",
+            "--covMode",
+            "fisher",
+        ]
+    )
     ind = inputdata.FitInputData(fn, None)
-    f = fitter.Fitter(ind, ph.load_models([["Mu"]], ind, **vars(a)), a, do_blinding=False)
-    f.defaultassign(); f.set_nobs(ind.data_obs); f.minimize()
+    f = fitter.Fitter(
+        ind, ph.load_models([["Mu"]], ind, **vars(a)), a, do_blinding=False
+    )
+    f.defaultassign()
+    f.set_nobs(ind.data_obs)
+    f.minimize()
     _, _, h = f.loss_val_grad_hess()
     return f.n_folds, np.asarray(f.fisher_curvature(h))
 
@@ -60,7 +81,8 @@ def ensemble_rms(K, ntoy=300):
     rng = np.random.default_rng(100 + K)
     s = []
     for _ in range(ntoy):
-        swf = rng.poisson(n_flat); sws = rng.poisson(n_step)
+        swf = rng.poisson(n_flat)
+        sws = rng.poisson(n_step)
         ff = np.stack([rng.multinomial(c, [1.0 / K] * K) for c in swf], 0).T
         sf = np.stack([rng.multinomial(c, [1.0 / K] * K) for c in sws], 0).T
         Ti = [np.stack([ff[i], sf[i]], 1).astype(float) for i in range(K)]
@@ -75,14 +97,18 @@ if __name__ == "__main__":
     out = os.environ.get("OUT", "/tmp/claude")
     A4 = numpy_ref_k4()
     k, Fb = rabbit_fisher(f"{out}/toy_kfold.hdf5")
-    print(f"(A) rabbit k={k} fisher curvature == numpy U-statistic A_k: "
-          f"{np.allclose(Fb, A4, rtol=1e-4)}  "
-          f"(sigma(dif) rabbit={np.sqrt(ddif@np.linalg.inv(Fb)@ddif):.4f}, "
-          f"numpy={np.sqrt(ddif@np.linalg.inv(A4)@ddif):.4f})")
+    print(
+        f"(A) rabbit k={k} fisher curvature == numpy U-statistic A_k: "
+        f"{np.allclose(Fb, A4, rtol=1e-4)}  "
+        f"(sigma(dif) rabbit={np.sqrt(ddif@np.linalg.inv(Fb)@ddif):.4f}, "
+        f"numpy={np.sqrt(ddif@np.linalg.inv(A4)@ddif):.4f})"
+    )
     assert np.allclose(Fb, A4, rtol=1e-4)
 
     Tt = np.stack([n_flat, n_step], 1)
-    sinf = np.sqrt(ddif @ np.linalg.inv(np.einsum("bi,b,bj->ij", Tt, 1 / data, Tt)) @ ddif)
+    sinf = np.sqrt(
+        ddif @ np.linalg.inv(np.einsum("bi,b,bj->ij", Tt, 1 / data, Tt)) @ ddif
+    )
     print(f"(B) ensemble: sigma_inf={sinf:.4f}")
     prev = None
     for K in (4, 8, 16):

@@ -82,7 +82,10 @@ class Workspace:
             and getattr(fitter, "norm_A", None) is not None
         )
         extra_traditional = list(param_impact_group_names)
-        if _is_debiased and getattr(fitter, "mcStatDebiasCov", "sandwich") == "sandwich":
+        if (
+            _is_debiased
+            and getattr(fitter, "mcStatDebiasCov", "sandwich") == "sandwich"
+        ):
             extra_traditional.append("mcStatDebias")
         self.grouped_impact_axis = getGroupedImpactsAxes(
             fitter.indata,

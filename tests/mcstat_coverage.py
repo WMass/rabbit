@@ -13,20 +13,24 @@ Usage:
     OUT=/tmp/cov python3 tests/mcstat_coverage.py            # prints a table
     from mcstat_coverage import run_coverage                  # programmatic
 """
-import os, sys
-import numpy as np
-import hist
+
 import importlib.util as _ilu
+import os
+import sys
+
+import hist
+import numpy as np
 
 RABBIT_BASE = os.environ.get("RABBIT_BASE", ".")
 sys.path.insert(0, os.path.join(RABBIT_BASE, "bin"))
 _spec = _ilu.spec_from_file_location(
     "rabbit_fit_main", os.path.join(RABBIT_BASE, "bin", "rabbit_fit.py")
 )
-_rfm = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_rfm)
-from rabbit import inputdata, fitter
-from rabbit.tensorwriter import TensorWriter
+_rfm = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_rfm)
+from rabbit import fitter, inputdata
 from rabbit.param_models import helpers as ph
+from rabbit.tensorwriter import TensorWriter
 
 OUT = os.environ.get("OUT", "/tmp/claude")
 # The near-degenerate 2-process toy from the slides (RESULTS §1): a flat process
@@ -37,7 +41,7 @@ OUT = os.environ.get("OUT", "/tmp/claude")
 # the de-bias restores it.
 NB = int(os.environ.get("NB", "200"))
 FLAT = 4962.0
-HI = float(os.environ.get("HI", "5112"))   # step height; larger = less degenerate
+HI = float(os.environ.get("HI", "5112"))  # step height; larger = less degenerate
 N0 = np.full(NB, FLAT)
 N1 = np.concatenate([np.full(NB // 2, HI), np.full(NB // 2, FLAT)])
 # TRUE signal strengths. The degenerate (difference) direction must have a NONZERO
@@ -47,7 +51,7 @@ N1 = np.concatenate([np.full(NB // 2, HI), np.full(NB // 2, FLAT)])
 R0 = float(os.environ.get("R0", "1.3"))
 R1 = float(os.environ.get("R1", "0.7"))
 RTRUE = np.array([R0, R1])
-MU = R0 * N0 + R1 * N1                          # true total (data expectation)
+MU = R0 * N0 + R1 * N1  # true total (data expectation)
 AX = hist.axis.Regular(NB, 0.0, 1.0, name="x")
 DDIF = np.array([1.0, -1.0]) / np.sqrt(2.0)
 DSUM = np.array([1.0, 1.0]) / np.sqrt(2.0)
@@ -88,16 +92,31 @@ def _build(fn, T0, T1, folds0, folds1, data, debias, bbb, poisson):
 
 
 def _fit(fn, debias, covMode, debiasCov, bbb, poisson):
-    argv = [fn, "-o", f"{OUT}/vo", "-t", "0", "--allowNegativeParam",
-            "--mcStatDebias", debias, "--covMode", covMode,
-            "--mcStatDebiasCov", debiasCov]
+    argv = [
+        fn,
+        "-o",
+        f"{OUT}/vo",
+        "-t",
+        "0",
+        "--allowNegativeParam",
+        "--mcStatDebias",
+        debias,
+        "--covMode",
+        covMode,
+        "--mcStatDebiasCov",
+        debiasCov,
+    ]
     argv += [] if poisson else ["--chisqFit"]
     if not bbb:
         argv.append("--noBinByBinStat")
     a = _rfm.make_parser().parse_args(argv)
     ind = inputdata.FitInputData(fn, None)
-    f = fitter.Fitter(ind, ph.load_models([["Mu"]], ind, **vars(a)), a, do_blinding=False)
-    f.defaultassign(); f.set_nobs(ind.data_obs); f.minimize()
+    f = fitter.Fitter(
+        ind, ph.load_models([["Mu"]], ind, **vars(a)), a, do_blinding=False
+    )
+    f.defaultassign()
+    f.set_nobs(ind.data_obs)
+    f.minimize()
     _, grad, hess = f.loss_val_grad_hess()
     bread = f.fisher_curvature(hess) if covMode == "fisher" else hess
     _, cov_curv = f.edmval_cov(grad, bread)
@@ -112,12 +131,19 @@ def _fit(fn, debias, covMode, debiasCov, bbb, poisson):
     return f.x.numpy(), C, float(np.max(np.abs(grad.numpy())))
 
 
-def run_coverage(debias="none", covMode="observed", debiasCov="sandwich",
-                 bbb=False, poisson=False, ntoy=200, k=2, seed=1):
+def run_coverage(
+    debias="none",
+    covMode="observed",
+    debiasCov="sandwich",
+    bbb=False,
+    poisson=False,
+    ntoy=200,
+    k=2,
+    seed=1,
+):
     rng = np.random.default_rng(seed)
     fn = f"{OUT}/cov_{debias}_{covMode}_{debiasCov}_{int(bbb)}_{int(poisson)}.hdf5"
     cov_dif = cov_sum = 0
-    bias_dif = []
     res_dif = []
     sig_dif = []
     nbad = 0
@@ -135,28 +161,43 @@ def run_coverage(debias="none", covMode="observed", debiasCov="sandwich",
             # (a rank-deficient full matrix is fine as long as the projection is ok;
             # BB-lite on a near-degenerate toy can null the other direction).
             if gmax > 1e-2 or v_dif <= 0 or v_sum <= 0 or not np.isfinite(v_dif):
-                nbad += 1; continue
+                nbad += 1
+                continue
         except Exception:
-            nbad += 1; continue
-        r = x - RTRUE                                 # residual vs true signal strengths
+            nbad += 1
+            continue
+        r = x - RTRUE  # residual vs true signal strengths
         s_dif = np.sqrt(v_dif)
         s_sum = np.sqrt(v_sum)
         cov_dif += abs(DDIF @ r) < s_dif
         cov_sum += abs(DSUM @ r) < s_sum
-        res_dif.append(DDIF @ r); sig_dif.append(s_dif)
+        res_dif.append(DDIF @ r)
+        sig_dif.append(s_dif)
     n = ntoy - nbad
     if n == 0:
-        return dict(cov_dif=float("nan"), cov_sum=float("nan"), n=0, nbad=nbad,
-                    bias_dif=float("nan"), mean_res=float("nan"),
-                    rms_res=float("nan"), med_sig=float("nan"))
+        return dict(
+            cov_dif=float("nan"),
+            cov_sum=float("nan"),
+            n=0,
+            nbad=nbad,
+            bias_dif=float("nan"),
+            mean_res=float("nan"),
+            rms_res=float("nan"),
+            med_sig=float("nan"),
+        )
     res = np.array(res_dif)
     return dict(
-        cov_dif=cov_dif / n, cov_sum=cov_sum / n, n=n, nbad=nbad,
+        cov_dif=cov_dif / n,
+        cov_sum=cov_sum / n,
+        n=n,
+        nbad=nbad,
         # median residual = robust bias (mean is corrupted by the heavy tails the
         # de-bias develops near the singular limit); rms_res = the actual point
         # scatter (vs med_sig = the reported uncertainty -> coverage = rms/med).
-        bias_dif=float(np.median(res)), mean_res=float(np.mean(res)),
-        rms_res=float(np.std(res)), med_sig=float(np.median(sig_dif)),
+        bias_dif=float(np.median(res)),
+        mean_res=float(np.mean(res)),
+        rms_res=float(np.std(res)),
+        med_sig=float(np.median(sig_dif)),
     )
 
 
@@ -165,20 +206,39 @@ if __name__ == "__main__":
     configs = [
         ("none      observed sandwich  chisq", dict(debias="none")),
         ("continuousM observed sandwich chisq", dict(debias="continuousM")),
-        ("continuousM observed curvature chisq", dict(debias="continuousM", debiasCov="curvature")),
-        ("continuousM fisher  sandwich  chisq", dict(debias="continuousM", covMode="fisher")),
+        (
+            "continuousM observed curvature chisq",
+            dict(debias="continuousM", debiasCov="curvature"),
+        ),
+        (
+            "continuousM fisher  sandwich  chisq",
+            dict(debias="continuousM", covMode="fisher"),
+        ),
         ("twoHalf    observed sandwich  chisq", dict(debias="twoHalf")),
-        ("twoHalf    fisher   sandwich  chisq", dict(debias="twoHalf", covMode="fisher")),
-        ("kfold(8)   fisher   sandwich  chisq", dict(debias="kfold", covMode="fisher", k=8)),
+        (
+            "twoHalf    fisher   sandwich  chisq",
+            dict(debias="twoHalf", covMode="fisher"),
+        ),
+        (
+            "kfold(8)   fisher   sandwich  chisq",
+            dict(debias="kfold", covMode="fisher", k=8),
+        ),
         ("none       observed sandwich  chisq BBB", dict(debias="none", bbb=True)),
-        ("continuousM observed sandwich chisq BBB", dict(debias="continuousM", bbb=True)),
+        (
+            "continuousM observed sandwich chisq BBB",
+            dict(debias="continuousM", bbb=True),
+        ),
         ("twoHalf    observed sandwich  chisq BBB", dict(debias="twoHalf", bbb=True)),
         ("none       observed sandwich  POISSON", dict(debias="none", poisson=True)),
         ("twoHalf    observed sandwich  POISSON", dict(debias="twoHalf", poisson=True)),
     ]
     print(f"MC-stat coverage ensemble (ntoy={ntoy}, target cov(dif)=0.683)\n")
-    print(f"{'config':40s}{'cov(dif)':>9s}{'cov(sum)':>9s}{'bias(dif)':>11s}{'med_sig':>9s}{'nbad':>6s}")
+    print(
+        f"{'config':40s}{'cov(dif)':>9s}{'cov(sum)':>9s}{'bias(dif)':>11s}{'med_sig':>9s}{'nbad':>6s}"
+    )
     for label, kw in configs:
         r = run_coverage(ntoy=ntoy, **kw)
-        print(f"{label:40s}{r['cov_dif']:9.3f}{r['cov_sum']:9.3f}"
-              f"{r['bias_dif']:+11.4f}{r['med_sig']:9.4f}{r['nbad']:6d}")
+        print(
+            f"{label:40s}{r['cov_dif']:9.3f}{r['cov_sum']:9.3f}"
+            f"{r['bias_dif']:+11.4f}{r['med_sig']:9.4f}{r['nbad']:6d}"
+        )

@@ -266,9 +266,7 @@ class Fitter:
             # syst (and asym) axes.
             if self.indata.systematic_type == "normal" and self.param_model.nparams > 0:
                 rnorm_init = tf.broadcast_to(
-                    self.param_model.compute(
-                        self.param_model.xparamdefault, full=True
-                    ),
+                    self.param_model.compute(self.param_model.xparamdefault, full=True),
                     [self.indata.nbinsfull, self.indata.nproc],
                 )
                 ntrail = len(logk_folds.shape) - 3  # 1 (sym) or 2 (asym)
@@ -316,11 +314,7 @@ class Fitter:
                 "templates (hnorm_folds) found in the input; two-half de-biasing "
                 "is inactive. Add processes with a fold_axis in the TensorWriter."
             )
-        if (
-            self.n_folds is not None
-            and self.n_folds >= 3
-            and self.covMode != "fisher"
-        ):
+        if self.n_folds is not None and self.n_folds >= 3 and self.covMode != "fisher":
             logger.info(
                 f"k-fold de-biasing with k={self.n_folds} folds: the k-fold "
                 "AVERAGING (complete U-statistic, lower curvature-estimate "
@@ -1213,10 +1207,10 @@ class Fitter:
         pd2ldxdnobs, pd2ldxdnorm = t2.jacobian(
             grad, [self.nobs, norm], unconnected_gradients="zero"
         )
-        dxdnobs = -Ainv @ pd2ldxdnobs                              # [npar, nbins]
+        dxdnobs = -Ainv @ pd2ldxdnobs  # [npar, nbins]
         dxdnorm = -Ainv @ tf.reshape(
             pd2ldxdnorm, [tf.shape(pd2ldxdnorm)[0], -1]
-        )                                                          # [npar, nbinsfull*nproc]
+        )  # [npar, nbinsfull*nproc]
         var_nobs = self.varnobs if self.varnobs is not None else self.nobs
         sumw2_flat = tf.reshape(self.indata.sumw2, [-1])
         return (dxdnobs * var_nobs[None, :]) @ tf.transpose(dxdnobs) + (
@@ -2035,10 +2029,7 @@ class Fitter:
                 # systematic-template noise is de-biased. Curvature path only
                 # (templates='fold'); halves use the shared logk.
                 split_corr = None
-                if (
-                    self.logk_folds_delta is not None
-                    and templates == "fold"
-                ):
+                if self.logk_folds_delta is not None and templates == "fold":
                     theta_folded = tf.gather(theta, self.mcstat_folded_syst_idx)
                     split_corr = tf.einsum(
                         "bpj,j->bp", self.logk_folds_delta[fold_index], theta_folded
@@ -2428,9 +2419,7 @@ class Fitter:
 
         nexp = nexpfullcentral[: self.indata.nbins]
 
-        debiased = (
-            self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is not None
-        )
+        debiased = self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is not None
         if debiased:
             # Cross-fit jackknife combination L_cf = 2 L_full - 1/2 L_A - 1/2 L_B.
             # Since mu_bar = 1/2(n_A + n_B) = n_full exactly, this de-biases the

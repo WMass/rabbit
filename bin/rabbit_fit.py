@@ -561,23 +561,32 @@ def fit(args, fitter, ws, dofit=True):
             _debias = getattr(fitter, "mcStatDebias", "none")
             _debiascov = getattr(fitter, "mcStatDebiasCov", "sandwich")
             _is_debiased = (
-                (_debias == "continuousM" and getattr(fitter, "mcstat_M", None) is not None)
-                or (_debias in ("twoHalf", "kfold") and getattr(fitter, "norm_A", None) is not None)
+                _debias == "continuousM"
+                and getattr(fitter, "mcstat_M", None) is not None
+            ) or (
+                _debias in ("twoHalf", "kfold")
+                and getattr(fitter, "norm_A", None) is not None
             )
             if _debiascov == "dataPropagated" and _is_debiased:
                 # Huber-White delta-method sandwich (conservative; over-covers).
                 cov = fitter.cov_dataprop_sandwich(cov_curv)
-                logger.info("Reporting data-propagated Var(score) sandwich "
-                            "(Huber-White, conservative/over-covers; RESULTS §7d)")
+                logger.info(
+                    "Reporting data-propagated Var(score) sandwich "
+                    "(Huber-White, conservative/over-covers; RESULTS §7d)"
+                )
             elif _debiascov == "sandwich" and _is_debiased:
                 if _debias == "continuousM":
                     cov = fitter.cov_mcstat_sandwich(bread)
-                    logger.info("Reporting continuous-M sandwich covariance "
-                                f"(A^-1 + A^-1 M A^-1, covMode={_covmode})")
+                    logger.info(
+                        "Reporting continuous-M sandwich covariance "
+                        f"(A^-1 + A^-1 M A^-1, covMode={_covmode})"
+                    )
                 else:
                     cov = fitter.cov_twohalf_sandwich(bread, covMode=_covmode)
-                    logger.info("Reporting two-half sandwich covariance "
-                                f"(A^-1 H A^-1, covMode={_covmode})")
+                    logger.info(
+                        "Reporting two-half sandwich covariance "
+                        f"(A^-1 H A^-1, covMode={_covmode})"
+                    )
 
             ws.add_cov_hist(cov)
 
@@ -604,7 +613,9 @@ def fit(args, fitter, ws, dofit=True):
                         tf.linalg.diag_part(fitter.cov) - tf.linalg.diag_part(cov_curv)
                     ]
                 ws.add_impacts_hists(
-                    *fitter.impacts_parms(bread, cov=cov_curv, extra_group_vars=extra_vars)
+                    *fitter.impacts_parms(
+                        bread, cov=cov_curv, extra_group_vars=extra_vars
+                    )
                 )
 
             del hess
@@ -612,7 +623,9 @@ def fit(args, fitter, ws, dofit=True):
             if args.globalImpacts:
                 # de-biased fit: decompose the de-biased curvature consistently
                 ws.add_impacts_hists(
-                    *fitter.global_impacts_parms(cov=cov_curv if _is_debiased else None),
+                    *fitter.global_impacts_parms(
+                        cov=cov_curv if _is_debiased else None
+                    ),
                     base_name="global_impacts",
                     global_impacts=True,
                 )
