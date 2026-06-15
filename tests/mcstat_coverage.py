@@ -127,17 +127,26 @@ def run_coverage(debias="none", covMode="observed", debiasCov="sandwich",
         try:
             _build(fn, T0, T1, folds0, folds1, data, debias, bbb, poisson)
             x, C, gmax = _fit(fn, debias, covMode, debiasCov, bbb, poisson)
-            if gmax > 1e-2 or not np.all(np.linalg.eigvalsh(C) > 0):
+            v_dif = DDIF @ C @ DDIF
+            v_sum = DSUM @ C @ DSUM
+            # require convergence and POSITIVE variance in the measured directions
+            # (a rank-deficient full matrix is fine as long as the projection is ok;
+            # BB-lite on a near-degenerate toy can null the other direction).
+            if gmax > 1e-2 or v_dif <= 0 or v_sum <= 0 or not np.isfinite(v_dif):
                 nbad += 1; continue
         except Exception:
             nbad += 1; continue
         r = x - RTRUE                                 # residual vs true signal strengths
-        s_dif = np.sqrt(DDIF @ C @ DDIF)
-        s_sum = np.sqrt(DSUM @ C @ DSUM)
+        s_dif = np.sqrt(v_dif)
+        s_sum = np.sqrt(v_sum)
         cov_dif += abs(DDIF @ r) < s_dif
         cov_sum += abs(DSUM @ r) < s_sum
         res_dif.append(DDIF @ r); sig_dif.append(s_dif)
     n = ntoy - nbad
+    if n == 0:
+        return dict(cov_dif=float("nan"), cov_sum=float("nan"), n=0, nbad=nbad,
+                    bias_dif=float("nan"), mean_res=float("nan"),
+                    rms_res=float("nan"), med_sig=float("nan"))
     res = np.array(res_dif)
     return dict(
         cov_dif=cov_dif / n, cov_sum=cov_sum / n, n=n, nbad=nbad,
