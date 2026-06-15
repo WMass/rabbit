@@ -378,6 +378,49 @@ def common_parser():
         "(e.g. mixed-sign-weight cancellations).",
     )
     parser.add_argument(
+        "--mcStatDebias",
+        default="none",
+        choices=["none", "continuousM", "twoHalf", "kfold"],
+        help="Limited-MC-statistics de-biasing of the POI point/curvature. "
+        "'continuousM' subtracts the frozen noise-floor matrix M (supplied via "
+        "TensorWriter.add_mc_stat_moment) from the curvature: -1/2 theta^T M theta in "
+        "the objective. NOTE: only de-biases parameters that enter the prediction "
+        "LINEARLY (use --allowNegativeParam for POIs; rabbit's default x^2 transform "
+        "cancels the correction). 'twoHalf'/'kfold' use cross-fit fold templates "
+        "(general / nonlinear-safe). Default 'none'.",
+    )
+    parser.add_argument(
+        "--mcStatDebiasCov",
+        default="sandwich",
+        choices=["curvature", "sandwich", "dataPropagated"],
+        help="Covariance reported when --mcStatDebias != none. 'curvature' = inverse "
+        "de-biased Hessian A^-1 (undercovers). 'sandwich' = A^-1 H A^-1 = "
+        "A^-1 + A^-1 M A^-1 (analytic meat; calibration-free ~0.68 with BB-lite, "
+        "undercovers without). 'dataPropagated' = Huber-White delta-method sandwich "
+        "propagating the data AND template (sumw2) variances through theta_hat "
+        "(continuous-M, dense): CONSERVATIVE, over-covers (~0.81, needs a downward "
+        "calibration; RESULTS §7d). Default 'sandwich'.",
+    )
+    parser.add_argument(
+        "--mcStatKfold",
+        default=2,
+        type=int,
+        help="DEPRECATED / unused: the number of folds k is inferred from the "
+        "fold-axis size in the input, and the k-fold averaging uses the COMPLETE "
+        "pairwise U-statistic (all C(k,k/2)/2 groupings, O(k), parameter-free) in "
+        "--covMode fisher. No fold/regrouping count needs to be chosen here.",
+    )
+    parser.add_argument(
+        "--covMode",
+        default="observed",
+        choices=["observed", "fisher"],
+        help="Curvature primitive used for ALL covariances (the standard inverse-Hessian "
+        "cov AND the de-biased sandwich bread+meat, consistently). 'observed' = the "
+        "autograd Hessian grad^2 L (Efron-Hinkley, data-conditional). 'fisher' = the "
+        "Gauss-Newton expected information J^T D J (lower-variance, finite-MC-cleaner, "
+        "drops the residual.d2mu term). Default 'observed' (current rabbit behaviour).",
+    )
+    parser.add_argument(
         "--paramModel",
         default=None,
         nargs="+",

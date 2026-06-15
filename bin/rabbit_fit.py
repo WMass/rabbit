@@ -540,8 +540,53 @@ def fit(args, fitter, ws, dofit=True):
         if not args.noEDM and not args.noHessian:
             # compute the covariance matrix and estimated distance to minimum
             _, grad, hess = fitter.loss_val_grad_hess()
-            edmval, cov = fitter.edmval_cov(grad, hess)
+
+            # --covMode fisher: replace the observed-Hessian curvature with the
+            # Gauss-Newton expected information (J^T D J + nondata), used as the
+            # bread for the (de-biased) covariance everywhere. Applies to the
+            # standard cov and the sandwich bread consistently.
+            _covmode = getattr(fitter, "covMode", "observed")
+            bread = fitter.fisher_curvature(hess) if _covmode == "fisher" else hess
+
+            edmval, cov_curv = fitter.edmval_cov(grad, bread)
+            cov = cov_curv
             logger.info(f"edmval: {edmval}")
+
+            # Robust (sandwich) covariance for the de-biased fit. Bread = the
+            # (fisher- or observed-) curvature `bread`; continuous-M uses the
+            # analytic meat H = A + M (Sigma = A^-1 + A^-1 M A^-1), two-half uses
+            # the full-sample meat (both in --covMode). cov_curv is kept so the
+            # impacts can decompose the de-biased CURVATURE consistently and the
+            # sandwich's extra term is reported as the `mcStatDebias` group.
+            _debias = getattr(fitter, "mcStatDebias", "none")
+            _debiascov = getattr(fitter, "mcStatDebiasCov", "sandwich")
+            _is_debiased = (
+                _debias == "continuousM"
+                and getattr(fitter, "mcstat_M", None) is not None
+            ) or (
+                _debias in ("twoHalf", "kfold")
+                and getattr(fitter, "norm_A", None) is not None
+            )
+            if _debiascov == "dataPropagated" and _is_debiased:
+                # Huber-White delta-method sandwich (conservative; over-covers).
+                cov = fitter.cov_dataprop_sandwich(cov_curv)
+                logger.info(
+                    "Reporting data-propagated Var(score) sandwich "
+                    "(Huber-White, conservative/over-covers; RESULTS §7d)"
+                )
+            elif _debiascov == "sandwich" and _is_debiased:
+                if _debias == "continuousM":
+                    cov = fitter.cov_mcstat_sandwich(bread)
+                    logger.info(
+                        "Reporting continuous-M sandwich covariance "
+                        f"(A^-1 + A^-1 M A^-1, covMode={_covmode})"
+                    )
+                else:
+                    cov = fitter.cov_twohalf_sandwich(bread, covMode=_covmode)
+                    logger.info(
+                        "Reporting two-half sandwich covariance "
+                        f"(A^-1 H A^-1, covMode={_covmode})"
+                    )
 
             ws.add_cov_hist(cov)
 
@@ -558,13 +603,29 @@ def fit(args, fitter, ws, dofit=True):
                 logger.info(f"edmvalbeta: {edmvalbeta}")
 
             if args.doImpacts:
-                ws.add_impacts_hists(*fitter.impacts_parms(hess))
+                # Decompose the de-biased CURVATURE (cov_curv) with the matching
+                # curvature `bread`, so total/syst/stat are consistent. When the
+                # reported cov is the sandwich, append the extra coverage term
+                # diag(sandwich - curvature) as the `mcStatDebias` impact group.
+                extra_vars = None
+                if _is_debiased and _debiascov == "sandwich":
+                    extra_vars = [
+                        tf.linalg.diag_part(fitter.cov) - tf.linalg.diag_part(cov_curv)
+                    ]
+                ws.add_impacts_hists(
+                    *fitter.impacts_parms(
+                        bread, cov=cov_curv, extra_group_vars=extra_vars
+                    )
+                )
 
             del hess
 
             if args.globalImpacts:
+                # de-biased fit: decompose the de-biased curvature consistently
                 ws.add_impacts_hists(
-                    *fitter.global_impacts_parms(),
+                    *fitter.global_impacts_parms(
+                        cov=cov_curv if _is_debiased else None
+                    ),
                     base_name="global_impacts",
                     global_impacts=True,
                 )

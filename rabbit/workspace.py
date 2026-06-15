@@ -70,11 +70,28 @@ class Workspace:
         param_impact_group_names = [
             name for name, _ in fitter._resolved_param_impact_groups()
         ]
+        # When a de-biased fit reports the robust (sandwich) covariance, the
+        # traditional impacts decompose the de-biased CURVATURE and append the
+        # extra coverage term diag(sandwich - curvature) as an "mcStatDebias"
+        # group (matching the extra column from traditional_impacts.impacts_parms).
+        _is_debiased = (
+            getattr(fitter, "mcStatDebias", "none") == "continuousM"
+            and getattr(fitter, "mcstat_M", None) is not None
+        ) or (
+            getattr(fitter, "mcStatDebias", "none") in ("twoHalf", "kfold")
+            and getattr(fitter, "norm_A", None) is not None
+        )
+        extra_traditional = list(param_impact_group_names)
+        if (
+            _is_debiased
+            and getattr(fitter, "mcStatDebiasCov", "sandwich") == "sandwich"
+        ):
+            extra_traditional.append("mcStatDebias")
         self.grouped_impact_axis = getGroupedImpactsAxes(
             fitter.indata,
             bin_by_bin_stat=fitter.bbstat.enabled,
             per_process=False,
-            extra_groups=param_impact_group_names,
+            extra_groups=extra_traditional,
         )
         self.grouped_global_impact_axis = getGroupedImpactsAxes(
             fitter.indata,

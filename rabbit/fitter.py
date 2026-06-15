@@ -214,6 +214,149 @@ class Fitter:
             self.expected_yield(), trainable=False, name="nexpnom"
         )
 
+        # --- limited-MC-statistics de-biasing options
+        self.mcStatDebias = getattr(options, "mcStatDebias", "none")
+        self.mcStatDebiasCov = getattr(options, "mcStatDebiasCov", "sandwich")
+        self.mcStatKfold = getattr(options, "mcStatKfold", 2)
+        self.covMode = getattr(options, "covMode", "observed")
+        # Frozen noise-floor matrix M (nparams x nparams), reconstructed from any
+        # external term named "mcstat*" (TensorWriter.add_mc_stat_moment stores
+        # hess = -M, so M = -scatter(hess_dense)). Used for the continuous-M
+        # sandwich covariance Sigma = A^-1 + A^-1 M A^-1 (H - A = M).
+        self.mcstat_M = self._build_mcstat_M()
+        # Two-half / k-fold cross-fit templates: precompute the half-sample
+        # norm tensors norm_A, norm_B [nbinsfull, nproc] from the fold
+        # templates (default groups = first/second half of the k folds, each
+        # rescaled by k/(k/2)=2 so <norm_A>=<norm_B>=norm_full). Shared logk.
+        self.norm_A = None
+        self.norm_B = None
+        # n_folds and the raw per-fold templates are kept for the complete
+        # k-fold U-statistic curvature (k-fold averaging, see _ln_terms_for_fisher).
+        self.n_folds = None
+        norm_folds = getattr(self.indata, "norm_folds", None)
+        if norm_folds is not None:
+            k = int(norm_folds.shape[0])
+            if k % 2 != 0:
+                raise NotImplementedError(
+                    f"two-half de-biasing needs an even number of folds; got k={k}."
+                )
+            self.n_folds = k
+            half = k // 2
+            scale = tf.constant(k / half, dtype=self.indata.dtype)  # = 2
+            self.norm_A = scale * tf.reduce_sum(norm_folds[:half], axis=0)
+            self.norm_B = scale * tf.reduce_sum(norm_folds[half:], axis=0)
+
+        # Split-logk halves (optional): when systematics were written with a
+        # fold_axis (hlogk_folds present) each half uses its own logk so the
+        # systematic-template noise is de-biased too; otherwise both halves share
+        # self.logk (the dominant nominal noise is already de-biased via norm^A/B).
+        # Per-fold logk == per-half logk only for k=2 (log-ratio, not additive),
+        # and the x2 norm rescale leaves the ratio unchanged.
+        self.logk_A = self.logk
+        self.logk_B = self.logk
+        # Per-fold scaled logk [k, ...] for the U-statistic curvature; None means
+        # use the shared self.logk for every fold (the common case).
+        self.logk_folds_scaled = None
+        logk_folds = getattr(self.indata, "logk_folds", None)
+        if logk_folds is not None:
+            # apply the same constant rnorm_init scaling as _init_logk_scaled.
+            # logk_folds is [k, nbinsfull, nproc, nsyst] (symmetric) or
+            # [k, nbinsfull, nproc, 2, nsyst] (asymmetric); broadcast rnorm_init
+            # ([nbinsfull, nproc]) over the leading fold axis and trailing
+            # syst (and asym) axes.
+            if self.indata.systematic_type == "normal" and self.param_model.nparams > 0:
+                rnorm_init = tf.broadcast_to(
+                    self.param_model.compute(self.param_model.xparamdefault, full=True),
+                    [self.indata.nbinsfull, self.indata.nproc],
+                )
+                ntrail = len(logk_folds.shape) - 3  # 1 (sym) or 2 (asym)
+                scale = tf.reshape(
+                    rnorm_init,
+                    [1, self.indata.nbinsfull, self.indata.nproc] + [1] * ntrail,
+                )
+                self.logk_folds_scaled = logk_folds * scale
+            else:
+                self.logk_folds_scaled = logk_folds
+            # The CURVATURE (U-statistic) uses the per-fold logk for any k. The
+            # OBJECTIVE (point) needs the per-HALF logk, which equals the per-fold
+            # logk only for k=2 (log of a sum != sum of logs). So for k=2 the
+            # objective uses the split half logk (full treatment); for k>2 the
+            # objective falls back to the shared logk (the point still de-biases
+            # the dominant nominal-template noise via norm^A/norm^B; the
+            # systematic-template noise is de-biased in the curvature).
+            if int(logk_folds.shape[0]) == 2:
+                self.logk_A = self.logk_folds_scaled[0]
+                self.logk_B = self.logk_folds_scaled[1]
+            else:
+                logger.info(
+                    "split-logk with k>2: the objective uses shared logk (the "
+                    "point de-biases nominal-template noise); the systematic-"
+                    "template noise is de-biased in the k-fold U-statistic "
+                    "curvature (--covMode fisher)."
+                )
+        # Sparse split-logk: per-fold logk delta for folded systs (applied as a
+        # exp(delta . theta) correction to the shared sparse systematic factor in
+        # the per-fold curvature yields). log_normal only.
+        self.logk_folds_delta = getattr(self.indata, "logk_folds_delta", None)
+        self.mcstat_folded_syst_idx = getattr(
+            self.indata, "mcstat_folded_syst_idx", None
+        )
+        if (
+            self.logk_folds_delta is not None
+            and self.indata.systematic_type != "log_normal"
+        ):
+            raise NotImplementedError(
+                "sparse split-logk is supported only for log_normal systematics."
+            )
+        if self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is None:
+            logger.warning(
+                f"--mcStatDebias {self.mcStatDebias} requested but no fold "
+                "templates (hnorm_folds) found in the input; two-half de-biasing "
+                "is inactive. Add processes with a fold_axis in the TensorWriter."
+            )
+        if self.n_folds is not None and self.n_folds >= 3 and self.covMode != "fisher":
+            logger.info(
+                f"k-fold de-biasing with k={self.n_folds} folds: the k-fold "
+                "AVERAGING (complete U-statistic, lower curvature-estimate "
+                "variance) is realized only in --covMode fisher. In observed mode "
+                "the curvature uses the single 2-half split (no averaging); pass "
+                "--covMode fisher to use all C(k,k/2)/2 groupings."
+            )
+        if self.mcStatDebias == "continuousM":
+            if self.mcstat_M is None:
+                logger.warning(
+                    "--mcStatDebias continuousM requested but no 'mcstat' external "
+                    "moment term found in the input; continuous-M is inactive. Supply "
+                    "M via TensorWriter.add_mc_stat_moment(M, param_names)."
+                )
+            elif not self._mcstat_M_params_linear():
+                # The -1/2 theta^T M theta penalty only de-biases parameters that
+                # enter the prediction LINEARLY. If any parameter that M touches
+                # is nonlinear (e.g. the default x^2 POI transform, or log-normal
+                # systematics), the data Fisher grows as the -M theta gradient
+                # shifts the minimum and cancels the -M curvature subtraction
+                # (RESULTS.md S9a) -> no de-bias of the point or covariance for
+                # those parameters. Two-half de-biasing has no such restriction.
+                logger.warning(
+                    "--mcStatDebias continuousM: the supplied M acts on parameters "
+                    "that enter the prediction NONLINEARLY (e.g. the default rabbit "
+                    "x^2 POI transform [use --allowNegativeParam for a linear POI], "
+                    "or log_normal systematics). The -1/2 theta^T M theta penalty is "
+                    "cancelled by Fisher growth at the shifted minimum and will NOT "
+                    "de-bias the point or covariance for those parameters "
+                    "(RESULTS.md S9a). Use a linear parametrization for the de-biased "
+                    "parameters, or the two-half method (--mcStatDebias twoHalf)."
+                )
+            if self.mcstat_M is not None and self.bbstat.enabled:
+                logger.warning(
+                    "--mcStatDebias continuousM with bin-by-bin stat (BB-lite) ON: "
+                    "M must be computed with the BB-lite-inflated variance "
+                    "(mu_b + sum_proc sumw2) in its denominator, NOT the bare data "
+                    "variance. Otherwise M over-subtracts the (already BB-inflated) "
+                    "curvature and H - M becomes non-positive-definite (the fit will "
+                    "diverge / Cholesky will fail). See RABBIT_MCSTAT_DESIGN.md §1b."
+                )
+
     def init_fit_parms(
         self,
         param_model,
@@ -789,6 +932,322 @@ class Fitter:
                 self.x.assign(pparms.sample())
             self.bbstat.randomize_postfit()
 
+    def _mcstat_M_params_linear(self):
+        """True iff every parameter the mcstat moment M touches enters the
+        prediction/NLL linearly, so that -1/2 theta^T M theta de-biases exactly
+        (constant curvature, no minimum-shift cancellation; RESULTS.md §9a).
+
+        A parameter is "linear" here when:
+          * POI (index < npoi): the param model is linear (allowNegativeParam,
+            i.e. rnorm = x rather than the default rnorm = x^2), and
+          * systematic: the systematics enter additively (systematic_type
+            'normal') with a symmetric tensor (the asymmetric interpolation is
+            nonlinear), and
+        the per-bin NLL is Gaussian (chisqFit) so its curvature does not depend
+        on the fit point (a Poisson l'' = nobs/nexp^2 varies with nexp(theta)
+        even for a linear nexp). Returns True only if ALL touched parameters meet
+        the relevant condition.
+        """
+        if self.mcstat_M is None:
+            return True
+        if not self.chisqFit:
+            return False  # Poisson/other: curvature is theta-dependent
+        npoi = self.param_model.npoi
+        mcstat_terms = [
+            t for t in self.external_terms if str(t["name"]).startswith("mcstat")
+        ]
+        touched = set()
+        for t in mcstat_terms:
+            touched.update(int(i) for i in t["indices"].numpy())
+        for i in touched:
+            if i < npoi:
+                if not self.param_model.is_linear:
+                    return False
+            else:
+                if not (
+                    self.indata.systematic_type == "normal"
+                    and self.indata.symmetric_tensor
+                ):
+                    return False
+        return True
+
+    def _build_mcstat_M(self):
+        """Reconstruct the frozen noise-floor matrix M (nparams x nparams) from
+        external terms whose name starts with 'mcstat'.
+
+        TensorWriter.add_mc_stat_moment stores the term Hessian as hess = -M
+        (so the objective contribution 0.5 x^T hess x = -1/2 x^T M x de-biases
+        the curvature). Here we scatter each term's (-hess_dense) block back into
+        the full nparams x nparams space, indexed by the term's parameter indices.
+        Returns None if no such term is present (continuous-M inactive).
+        """
+        mcstat = [t for t in self.external_terms if str(t["name"]).startswith("mcstat")]
+        if not mcstat:
+            return None
+        n = int(self.x.shape[0])
+        M = tf.zeros([n, n], dtype=self.indata.dtype)
+        for t in mcstat:
+            if t["hess_dense"] is None:
+                raise NotImplementedError(
+                    "mcstat moment term must use a dense Hessian (sparse M not "
+                    "yet supported for the sandwich covariance)."
+                )
+            idx = t["indices"]
+            coords = tf.reshape(
+                tf.stack(tf.meshgrid(idx, idx, indexing="ij"), axis=-1), [-1, 2]
+            )
+            # objective uses hess = -M, so M = -hess_dense
+            updates = tf.reshape(-t["hess_dense"], [-1])
+            M = tf.tensor_scatter_nd_add(M, coords, updates)
+        return M
+
+    def _compute_nll_meat(self):
+        """Plain full-sample NLL (no jackknife de-bias), used as the two-half
+        sandwich meat H = grad^2 L_full. Mirrors _compute_nll but always uses the
+        full templates and the ordinary per-bin ln."""
+        nexpfullcentral, _, beta = self._compute_yields_with_beta(
+            profile=True, compute_norm=False, full=len(self.regularizers)
+        )
+        nexp = nexpfullcentral[: self.indata.nbins]
+        l = self._compute_ln(nexp) + self._compute_lc()
+        lbeta = self._compute_lbeta(beta)
+        if lbeta is not None:
+            l = l + lbeta
+        lext = self._compute_external_nll()
+        if lext is not None:
+            l = l + lext
+        return l
+
+    @tf.function
+    def loss_val_grad_hess_meat(self):
+        with tf.GradientTape() as t2:
+            with tf.GradientTape() as t1:
+                val = self._compute_nll_meat()
+            grad = t1.gradient(val, self.x)
+        hess = t2.jacobian(grad, self.x)
+        return val, grad, hess
+
+    def _ln_terms_for_fisher(self, debiased):
+        """List of (nexp[:nbins], coeff) summed in the active ln term.
+
+        debiased=True and a two-half/k-fold debias active -> the jackknife
+        combination [(full,2),(A,-1/2),(B,-1/2)] (its Gauss-Newton data part is
+        exactly the cross-half Fisher F_ch). Otherwise the plain full term
+        [(full,1)]. Yields are taken through the BB-lite profiling (full) so the
+        Fisher is consistent with the observed Hessian it replaces."""
+        nbins = self.indata.nbins
+        nexp_full = self._compute_yields_with_beta(
+            profile=True, compute_norm=False, full=len(self.regularizers)
+        )[0][:nbins]
+        if (
+            debiased
+            and self.mcStatDebias in ("twoHalf", "kfold")
+            and self.norm_A is not None
+        ):
+            nexp_A = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="A"
+            )[0][:nbins]
+            nexp_B = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="B"
+            )[0][:nbins]
+            return [(nexp_full, 2.0), (nexp_A, -0.5), (nexp_B, -0.5)]
+        return [(nexp_full, 1.0)]
+
+    def _fisher_data_terms(self, debiased):
+        """Terms (nexp, coeff) whose Gauss-Newton sum sum_i coeff_i J_i^T D J_i is
+        the de-biased data Fisher F_data used as the GN curvature.
+
+        For a fold-based debias this is the COMPLETE k-fold U-statistic (k-fold
+        AVERAGING): using J_full = sum_i J_i^raw (raw, unrescaled folds),
+
+            F_ch = k/(k-1) [ J_full^T D J_full - sum_i J_i^raw^T D J_i^raw ]
+                 = k/(k-1) sum_{i!=j} J_i^raw^T D J_j^raw
+
+        i.e. the average over ALL fold pairs, computed in O(k) via the
+        full-minus-self identity (no enumeration of partitions). For k=2 it
+        equals the single 2-half cross-half Fisher exactly; for k>=3 it averages
+        the C(k,k/2)/2 half-groupings, reducing the curvature-estimate variance
+        toward the continuous-M floor as k grows. The RAW folds (~n_full/k) are
+        used only here (the GN form is residual-independent), never in the
+        objective ln (which keeps the rescaled halves for a sensible point)."""
+        nbins = self.indata.nbins
+        nexp_full = self._compute_yields_with_beta(
+            profile=True, compute_norm=False, full=len(self.regularizers)
+        )[0][:nbins]
+        fold_active = (
+            self.mcStatDebias in ("twoHalf", "kfold") and self.n_folds is not None
+        )
+        if not fold_active:
+            return [(nexp_full, 1.0)]
+
+        # Per-fold raw predictions n_i (each with its own logk for split-logk),
+        # times the full-sample BB-lite beta so all terms are consistently
+        # profiled (beta_factor=1 without BB-lite). The "full" term is the SUM of
+        # the per-fold predictions, J_sumfold = sum_i J_i, so the full-minus-self
+        # identity F_sumfold - sum_i F_i = sum_{i!=j} cross holds EXACTLY for both
+        # shared logk (where sum_i n_i == nexp_full) and split logk (where it does
+        # not). Using n_sumfold for the meat too keeps bread/meat consistent
+        # (H - A = M) under split-logk.
+        if self.bbstat.enabled:
+            nexp_full_raw = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="full"
+            )[0][:nbins]
+            beta_factor = nexp_full / tf.where(
+                nexp_full_raw == 0.0, tf.ones_like(nexp_full_raw), nexp_full_raw
+            )
+        else:
+            beta_factor = tf.ones_like(nexp_full)
+        per_fold = [
+            beta_factor
+            * self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="fold", fold_index=i
+            )[0][:nbins]
+            for i in range(self.n_folds)
+        ]
+        n_sumfold = tf.add_n(per_fold)
+        if debiased:
+            coeff = self.n_folds / (self.n_folds - 1.0)
+            return [(n_sumfold, coeff)] + [(n_i, -coeff) for n_i in per_fold]
+        return [(n_sumfold, 1.0)]
+
+    def _fisher_core(self, hess_obj, debiased):
+        """Gauss-Newton (expected-information) curvature corresponding to the
+        observed-Hessian `hess_obj`:
+
+            F = hess_obj - H_ln_obs + F_data
+
+        H_ln_obs is the observed Hessian of the OBJECTIVE's data term (rescaled
+        halves), so `hess_obj - H_ln_obs` is the non-data curvature (constraints,
+        external M, BB-lite). F_data is the de-biased data Gauss-Newton Fisher
+        from _fisher_data_terms (the complete k-fold U-statistic for the bread;
+        the full J^T D J for the meat). D = ell''(nexp): 1/V chisq, data_cov_inv
+        covFit, 1/nexp Poisson. Drops the residual * d2nexp piece while keeping
+        the non-data curvature (RABBIT_MCSTAT_DESIGN.md §2c/§2d)."""
+        with tf.GradientTape(persistent=True) as t2:
+            with tf.GradientTape(persistent=True) as t1:
+                obj_terms = self._ln_terms_for_fisher(debiased)
+                fisher_terms = self._fisher_data_terms(debiased)
+                ln = tf.add_n([c * self._compute_ln(n) for n, c in obj_terms])
+            g = t1.gradient(ln, self.x)
+        H_ln = t2.jacobian(g, self.x)
+
+        F = tf.zeros_like(hess_obj)
+        for n, c in fisher_terms:
+            J = t1.jacobian(n, self.x)  # [nbins, nparams]
+            if self.covarianceFit:
+                JT_Cinv = tf.matmul(J, self.data_cov_inv, transpose_a=True)
+                Fterm = tf.matmul(JT_Cinv, J)
+            else:
+                D = (1.0 / self.varnobs) if self.chisqFit else (1.0 / n)
+                Fterm = tf.einsum("bi,b,bj->ij", J, D, J)
+            F = F + c * Fterm
+        del t1, t2
+        return hess_obj - H_ln + F
+
+    @tf.function
+    def fisher_curvature(self, hess_obj):
+        """Gauss-Newton curvature of the ACTIVE objective (jackknife if a
+        two-half debias is on; else the full term). Used as the sandwich bread
+        and as the standard-covariance curvature under --covMode fisher."""
+        return self._fisher_core(hess_obj, True)
+
+    @tf.function
+    def fisher_curvature_full(self, hess_meat):
+        """Gauss-Newton curvature of the FULL (undebiased) objective. Used as the
+        sandwich meat under --covMode fisher."""
+        return self._fisher_core(hess_meat, False)
+
+    def cov_twohalf_sandwich(self, A, covMode="observed"):
+        """Two-half / k-fold robust (sandwich) covariance Sigma = A^-1 H A^-1.
+
+        Bread A = the de-biased (jackknife) curvature; meat H = the full-sample
+        curvature. Both follow `covMode` (don't mix): 'observed' = autograd
+        Hessians (A = grad^2 L_cf, H = grad^2 L_full); 'fisher' = Gauss-Newton
+        (A = F_ch + nondata, H = F_full + nondata). See RABBIT_MCSTAT_DESIGN.md
+        §2c. The passed `A` must already be in the requested mode.
+        """
+        _, _, H_obs = self.loss_val_grad_hess_meat()
+        if covMode == "fisher":
+            H = self.fisher_curvature_full(H_obs)
+        else:
+            H = H_obs
+        Ainv = tf.linalg.inv(A)
+        return Ainv @ tf.cast(H, Ainv.dtype) @ Ainv
+
+    def cov_dataprop_sandwich(self, Ainv):
+        """Data-propagated Var(score) sandwich (Huber-White / delta-method).
+
+        Propagates the per-bin DATA variance and the per-(bin,proc) TEMPLATE
+        variance (sumw2 = the MC-stat variance) through the de-biased estimator
+        theta_hat(nobs, norm) by implicit differentiation:
+
+            Sigma = dx/dnobs . diag(Var[nobs]) . (dx/dnobs)^T
+                  + dx/dnorm . diag(sumw2)     . (dx/dnorm)^T
+
+        with dx/dv = -A^-1 d^2L/dx dv (A = de-biased bread; `Ainv` = A^-1). The
+        FIRST term equals the analytic A^-1 H A^-1 (data Fisher meat); the SECOND
+        adds the template-noise propagation. This is the conservative route: it
+        OVER-covers (~0.81 in the numpy tests, RESULTS §7d) and needs a downward
+        calibration k~0.81, vs the calibration-free analytic/BB-lite meat (~0.67).
+        Dense only (watches indata.norm); the de-biased POINT (M in the
+        minimization) is still required for an unbiased centre (§7d)."""
+        if self.indata.sparse:
+            raise NotImplementedError(
+                "data-propagated sandwich is dense-only (it differentiates the "
+                "loss w.r.t. indata.norm)."
+            )
+        Ainv = tf.cast(Ainv, self.indata.dtype)
+        norm = self.indata.norm
+        with tf.GradientTape() as t2:
+            t2.watch([self.nobs, norm])
+            with tf.GradientTape() as t1:
+                t1.watch([self.nobs, norm])
+                val = self._compute_loss()
+            grad = t1.gradient(val, self.x)
+        pd2ldxdnobs, pd2ldxdnorm = t2.jacobian(
+            grad, [self.nobs, norm], unconnected_gradients="zero"
+        )
+        dxdnobs = -Ainv @ pd2ldxdnobs  # [npar, nbins]
+        dxdnorm = -Ainv @ tf.reshape(
+            pd2ldxdnorm, [tf.shape(pd2ldxdnorm)[0], -1]
+        )  # [npar, nbinsfull*nproc]
+        var_nobs = self.varnobs if self.varnobs is not None else self.nobs
+        sumw2_flat = tf.reshape(self.indata.sumw2, [-1])
+        return (dxdnobs * var_nobs[None, :]) @ tf.transpose(dxdnobs) + (
+            dxdnorm * sumw2_flat[None, :]
+        ) @ tf.transpose(dxdnorm)
+
+    def cov_mcstat_sandwich(self, A):
+        """Continuous-M robust (sandwich) covariance.
+
+        Sigma = A^-1 H A^-1 with bread A = de-biased curvature (grad^2 of the
+        objective WITH the -1/2 theta^T M theta penalty) and meat H = the
+        same-sample curvature WITHOUT the penalty. Because the penalty is the
+        frozen quadratic -1/2 theta^T M theta, H = A + M exactly, so
+
+            Sigma = A^-1 (A + M) A^-1 = A^-1 + A^-1 M A^-1.
+
+        No second Hessian pass is needed. Frozen support only (the M-penalty
+        treats M as constant; valid in the linear-Gaussian regime where
+        continuous-M de-biases, RESULTS.md S1c/S9a).
+
+        Parameters
+        ----------
+        A : tf.Tensor, shape [npar, npar]
+            The de-biased objective Hessian (e.g. from loss_val_grad_hess()).
+
+        Returns
+        -------
+        tf.Tensor, shape [npar, npar]
+            The sandwich covariance.
+        """
+        if self.mcstat_M is None:
+            raise RuntimeError(
+                "cov_mcstat_sandwich requires an mcstat moment term (none found)."
+            )
+        Ainv = tf.linalg.inv(A)
+        return Ainv + Ainv @ self.mcstat_M @ Ainv
+
     def edmval_cov(self, grad, hess):
         if len(self.frozen_params) > 0:
             # Only keep parameters that were floating in the fit
@@ -921,7 +1380,15 @@ class Fitter:
         )
 
     @tf.function
-    def impacts_parms(self, hess):
+    def impacts_parms(self, hess, cov=None, extra_group_vars=None):
+        # cov: the covariance matrix to DECOMPOSE (per-nuisance + grouped syst
+        # impacts). Defaults to self.cov. For a de-biased fit pass the de-biased
+        # CURVATURE covariance (A^-1, in the selected --covMode) and `hess` = the
+        # matching de-biased curvature, so the whole decomposition (total / syst /
+        # stat) is internally consistent; the sandwich's extra coverage term is
+        # then reported as the `mcStatDebias` extra group via extra_group_vars.
+        if cov is None:
+            cov = self.cov
 
         nstat = (
             self.param_model.npoi
@@ -940,7 +1407,7 @@ class Fitter:
 
         param_groups = self._resolved_param_impact_groups()
         impacts, impacts_grouped = traditional_impacts.impacts_parms(
-            self.cov,
+            cov,
             cov_stat,
             cov_stat_no_bbb,
             self.param_model.npoi,
@@ -948,12 +1415,18 @@ class Fitter:
             self.indata.systgroupidxs,
             nmodel_params=self.param_model.npoi + self.param_model.npou,
             param_groupidxs=[idxs for _, idxs in param_groups],
+            extra_group_vars=extra_group_vars,
         )
 
         return impacts, impacts_grouped
 
     @tf.function
-    def global_impacts_parms(self):
+    def global_impacts_parms(self, cov=None):
+        # cov: covariance to decompose (default self.cov). For a de-biased fit
+        # pass the de-biased CURVATURE covariance so the global-impact groups
+        # (theta0 / nobs / beta0 / syst) decompose it consistently.
+        if cov is None:
+            cov = self.cov
         return global_impacts.global_impacts_parms(
             self.x,
             self.bbstat.ubeta,
@@ -968,7 +1441,7 @@ class Fitter:
             self.bbstat.enabled,
             self.bbstat.binByBinStatMode,
             self.globalImpactsFromJVP,
-            self.cov,
+            cov,
         )
 
     @tf.function
@@ -1487,7 +1960,14 @@ class Fitter:
             else:
                 self.logk = self.indata.logk * rnorm_init[..., None, None]
 
-    def _compute_yields_noBBB(self, full=True, compute_norm=True):
+    def _compute_yields_noBBB(
+        self, full=True, compute_norm=True, templates="full", fold_index=None
+    ):
+        # templates: "full" uses indata.norm; "A"/"B" use the precomputed
+        # half-sample fold templates norm_A/norm_B (two-half de-biasing, shared
+        # logk); "fold" uses the RAW per-fold template norm_folds[fold_index]
+        # (for the complete k-fold U-statistic curvature). Only supported in the
+        # dense path.
         # full: compute yields inclduing masked channels
         # compute_norm: also build the dense [nbins, nproc] normcentral tensor.
         # In sparse mode this is expensive (forward + backward) and is only
@@ -1530,6 +2010,49 @@ class Fitter:
                 axis=-1,
             )
 
+            if templates != "full":
+                # De-bias fold/half yields in sparse mode: the per-fold/half norm
+                # templates are stored DENSE, so scatter the (shared) systematic
+                # factor from the sparse logk into a dense [nbinsfull, nproc] grid
+                # and contract with the dense norm. Split-logk (per-fold logk) is
+                # not supported in sparse mode.
+                if templates == "A":
+                    norm_dense = self.norm_A
+                elif templates == "B":
+                    norm_dense = self.norm_B
+                else:
+                    norm_dense = self.indata.norm_folds[fold_index]
+                idx = self.indata.norm.indices  # [nnz, 2] = (bin, proc)
+                shape = [self.indata.nbinsfull, self.indata.nproc]
+                # split-logk (sparse): multiply the shared log_normal factor by
+                # exp(delta . theta) over the folded systs for THIS fold, so the
+                # systematic-template noise is de-biased. Curvature path only
+                # (templates='fold'); halves use the shared logk.
+                split_corr = None
+                if self.logk_folds_delta is not None and templates == "fold":
+                    theta_folded = tf.gather(theta, self.mcstat_folded_syst_idx)
+                    split_corr = tf.einsum(
+                        "bpj,j->bp", self.logk_folds_delta[fold_index], theta_folded
+                    )
+                if self.indata.systematic_type == "log_normal":
+                    factor = tf.tensor_scatter_nd_update(
+                        tf.ones(shape, dtype=norm_dense.dtype), idx, tf.exp(logsnorm)
+                    )
+                    if split_corr is not None:
+                        factor = factor * tf.exp(split_corr)
+                    normcentral = norm_dense * rnorm * factor
+                else:  # "normal": additive variation (norm-independent)
+                    add = tf.tensor_scatter_nd_update(
+                        tf.zeros(shape, dtype=norm_dense.dtype), idx, logsnorm
+                    )
+                    normcentral = norm_dense * rnorm + add
+                if not (full or self.indata.nbinsmasked == 0):
+                    normcentral = normcentral[: self.indata.nbins]
+                nexpcentral = tf.reduce_sum(normcentral, axis=-1)
+                if not compute_norm:
+                    normcentral = None
+                return nexpcentral, normcentral
+
             # Build a sparse [nbinsfull, nproc] tensor whose values absorb
             # the per-entry syst variation and the per-(bin, proc) POI
             # scaling rnorm. The sparsity pattern is unchanged from
@@ -1567,14 +2090,32 @@ class Fitter:
             if compute_norm:
                 normcentral = tf.sparse.to_dense(snormnorm_sparse)
         else:
+            if templates == "A":
+                norm_src = self.norm_A
+                logk_src = self.logk_A
+            elif templates == "B":
+                norm_src = self.norm_B
+                logk_src = self.logk_B
+            elif templates == "fold":
+                # raw per-fold template (unrescaled); shared logk unless split-logk
+                norm_src = self.indata.norm_folds[fold_index]
+                logk_src = (
+                    self.logk
+                    if self.logk_folds_scaled is None
+                    else self.logk_folds_scaled[fold_index]
+                )
+            else:
+                norm_src = self.indata.norm
+                logk_src = self.logk
+
             if full or self.indata.nbinsmasked == 0:
                 nbins = self.indata.nbinsfull
-                logk = self.logk
-                norm = self.indata.norm
+                logk = logk_src
+                norm = norm_src
             else:
                 nbins = self.indata.nbins
-                logk = self.logk[:nbins]
-                norm = self.indata.norm[:nbins]
+                logk = logk_src[:nbins]
+                norm = norm_src[:nbins]
 
             if self.indata.symmetric_tensor:
                 mlogk = tf.reshape(
@@ -1878,10 +2419,50 @@ class Fitter:
 
         nexp = nexpfullcentral[: self.indata.nbins]
 
-        ln = self._compute_ln(nexp, full_nll)
+        debiased = self.mcStatDebias in ("twoHalf", "kfold") and self.norm_A is not None
+        if debiased:
+            # Cross-fit jackknife combination L_cf = 2 L_full - 1/2 L_A - 1/2 L_B.
+            # Since mu_bar = 1/2(n_A + n_B) = n_full exactly, this de-biases the
+            # point (gradient = cross-fit score) and curvature (cross-half
+            # Fisher) regardless of nonlinearity. Shared logk; full templates
+            # carry the BB-lite beta profiling.
+            nexp_A = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="A"
+            )[0][: self.indata.nbins]
+            nexp_B = self._compute_yields_noBBB(
+                full=False, compute_norm=False, templates="B"
+            )[0][: self.indata.nbins]
+            if self.bbstat.enabled:
+                # Apply the FULL-sample profiled beta (per-bin multiplicative
+                # factor beta = nexp / nexp_full_raw) to the half predictions too.
+                # Without this the BB-lite profiling flattens L_full's curvature
+                # while the -1/2 L_A - 1/2 L_B terms keep full curvature, making
+                # the jackknife A = 2 H_full,bb - 1/2 H_A - 1/2 H_B indefinite
+                # (unbounded objective). Sharing beta keeps H_A,bb ~ H_B,bb ~
+                # H_full,bb so A ~ H_full,bb > 0.
+                nexp_full_raw = self._compute_yields_noBBB(
+                    full=False, compute_norm=False, templates="full"
+                )[0][: self.indata.nbins]
+                beta_factor = nexp / tf.where(
+                    nexp_full_raw == 0.0,
+                    tf.ones_like(nexp_full_raw),
+                    nexp_full_raw,
+                )
+                nexp_A = nexp_A * beta_factor
+                nexp_B = nexp_B * beta_factor
+            ln = (
+                2.0 * self._compute_ln(nexp, full_nll)
+                - 0.5 * self._compute_ln(nexp_A, full_nll)
+                - 0.5 * self._compute_ln(nexp_B, full_nll)
+            )
+        else:
+            ln = self._compute_ln(nexp, full_nll)
 
         lc = self._compute_lc(full_nll)
 
+        # lbeta (BB-lite MC-stat constraint) and lc (theta priors) are counted
+        # once. With two-half the same profiled beta is shared across the full
+        # and half terms (see above), so its constraint enters with weight 1.
         lbeta = self._compute_lbeta(beta, full_nll)
 
         if len(self.regularizers):

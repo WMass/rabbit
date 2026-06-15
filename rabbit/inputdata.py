@@ -172,6 +172,35 @@ class FitInputData:
 
                 self.sumw2 = tf.where(kstat == 0.0, self.sumw, self.sumw2)
 
+            # MC-stat cross-fit fold templates [k, nbinsfull, nproc] (optional;
+            # present only when a process was written with a fold_axis). Used by
+            # the two-half / k-fold de-biasing in the fitter.
+            if "hnorm_folds" in f.keys():
+                self.norm_folds = maketensor(f["hnorm_folds"])
+                self.mcstat_fold_k = int(
+                    f.attrs.get("mcstat_fold_k", self.norm_folds.shape[0])
+                )
+            else:
+                self.norm_folds = None
+                self.mcstat_fold_k = None
+
+            # Split-logk fold tensor [k, nbinsfull, nproc, nsyst] (optional;
+            # present only when a systematic was written with a fold_axis). When
+            # absent, two-half de-biasing shares one logk across folds.
+            if "hlogk_folds" in f.keys():
+                self.logk_folds = maketensor(f["hlogk_folds"])
+            else:
+                self.logk_folds = None
+
+            # Sparse split-logk: per-fold logk delta for folded systs (dense,
+            # reduced syst dim) + the folded global syst indices.
+            if "hlogk_folds_delta" in f.keys():
+                self.logk_folds_delta = maketensor(f["hlogk_folds_delta"])
+                self.mcstat_folded_syst_idx = maketensor(f["hmcstat_folded_syst_idx"])
+            else:
+                self.logk_folds_delta = None
+                self.mcstat_folded_syst_idx = None
+
             # compute indices for channels
             ibin = 0
             for channel, info in self.channel_info.items():
