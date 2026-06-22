@@ -31,23 +31,32 @@ CONTOUR_HESS_MODES = ("exact", "hvp", "frozen", "bfgs", "sr1")
 
 
 def match_regexp_params(regular_expressions, parameter_names):
+    # Match parameter names against a list of expressions where each entry may
+    # be either an exact parameter name or a regex matched against the FULL
+    # parameter name (re.fullmatch). Full anchoring means an expression that
+    # names one parameter exactly can never also match parameters whose names
+    # merely extend it (important for --unblind, where a prefix match would
+    # silently unblind more than intended); match a family of parameters with
+    # an explicit pattern, e.g. 'alphaS.*'. Returns the union of exact and
+    # regex matches, preserving the parameter_names order and de-duplicating.
+    # Mixing exact and regex entries in the same call is supported.
     if isinstance(regular_expressions, str):
         regular_expressions = [regular_expressions]
 
-    # Check for exact matches first
-    exact_matches = [
-        s for expr in regular_expressions for s in parameter_names if s.decode() == expr
-    ]
-    if exact_matches:
-        return exact_matches
-
-    # Fall back to regex matching
+    exact_lookup = set(regular_expressions)
     compiled_expressions = [re.compile(expr) for expr in regular_expressions]
-    return [
-        s
-        for s in parameter_names
-        if any(regex.match(s.decode()) for regex in compiled_expressions)
-    ]
+
+    matched = []
+    seen = set()
+    for s in parameter_names:
+        decoded = s.decode() if hasattr(s, "decode") else s
+        if decoded in exact_lookup or any(
+            r.fullmatch(decoded) for r in compiled_expressions
+        ):
+            if decoded not in seen:
+                seen.add(decoded)
+                matched.append(s)
+    return matched
 
 
 class FitterCallback:
@@ -207,6 +216,7 @@ class Fitter:
             param_model,
             options.setConstraintMinimum,
             unblind=options.unblind,
+            blinding_group=options.blindingGroup,
             freeze_parameters=options.freezeParameters,
         )
 
@@ -219,6 +229,7 @@ class Fitter:
         param_model,
         set_constraint_minimum=[],
         unblind=False,
+        blinding_group=[],
         freeze_parameters=[],
     ):
         self.param_model = param_model
@@ -246,7 +257,7 @@ class Fitter:
                 trainable=False,
                 name="offset_theta",
             )
-            self.init_blinding_values(unblind)
+            self.init_blinding_values(unblind, blinding_group)
 
         self.parms = np.concatenate([self.param_model.params, self.indata.systs])
 
@@ -466,15 +477,25 @@ class Fitter:
         ]
         self.update_frozen_params()
 
-    def init_blinding_values(self, unblind_parameter_expressions=[]):
+    def init_blinding_values(
+        self, unblind_parameter_expressions=[], blinding_group_expressions=[]
+    ):
         logger.debug(f"Unblind parameters with {unblind_parameter_expressions}")
+        all_param_names = [
+            *self.param_model.params[: self.param_model.npoi],
+            *[self.indata.systs[i] for i in self.indata.noiidxs],
+        ]
         unblind_parameters = match_regexp_params(
-            unblind_parameter_expressions,
-            [
-                *self.param_model.params[: self.param_model.npoi],
-                *[self.indata.systs[i] for i in self.indata.noiidxs],
-            ],
+            unblind_parameter_expressions, all_param_names
         )
+        # unblinding is sensitive: always report exactly which parameters the
+        # expressions resolved to, so an over-broad pattern is visible
+        if unblind_parameters:
+            unblind_names = [
+                p.decode() if isinstance(p, bytes) else str(p)
+                for p in unblind_parameters
+            ]
+            logger.info(f"Unblinding {len(unblind_names)} parameters: {unblind_names}")
 
         # check if dataset is an integer (i.e. if it is real data or not) and use this to choose the random seed
         is_dataobs_int = np.sum(
@@ -498,14 +519,47 @@ class Fitter:
             value = rng.normal(loc=mean, scale=std)
             return value
 
+        # Build a map: param name -> seed string. Default is the param's own name; for
+        # parameters matching a blinding group the seed is the group regex string, so all
+        # members of the group share an identical deterministic offset (preserving relative
+        # differences while blinding absolute values).
+        if isinstance(blinding_group_expressions, str):
+            blinding_group_expressions = [blinding_group_expressions]
+        param_to_seed = {}
+        param_to_group = {}
+        for expr in blinding_group_expressions:
+            matched = match_regexp_params(expr, all_param_names)
+            for p in matched:
+                if p in param_to_seed:
+                    continue  # first matching group wins
+                param_to_seed[p] = expr
+                param_to_group[p] = expr
+
+        # Refuse to run if --unblind and --blindingGroup match the same parameter:
+        # the user's intent is ambiguous (unblind it, or share a group offset?), and
+        # silently picking one risks accidentally unblinding a sensitive parameter.
+        overlap = [p for p in unblind_parameters if p in param_to_group]
+        if overlap:
+            details = ", ".join(
+                f"{p.decode() if isinstance(p, bytes) else p}"
+                f" (group '{param_to_group[p]}')"
+                for p in overlap
+            )
+            raise RuntimeError(
+                "The following parameters match both --unblind and --blindingGroup; "
+                "refusing to proceed to avoid an ambiguous (un)blinding. "
+                f"Tighten the regexes to make the intent explicit: {details}"
+            )
+
         # multiply offset to nois
         self._blinding_values_theta = np.zeros(self.indata.nsyst, dtype=np.float64)
         for i in self.indata.noiidxs:
             param = self.indata.systs[i]
             if param in unblind_parameters:
                 continue
-            logger.debug(f"Blind parameter {param}")
-            value = deterministic_random_from_string(param)
+            seed = param_to_seed.get(param, param)
+            logger.debug(f"Blind parameter {param} (seed='{seed}')")
+            value = deterministic_random_from_string(seed)
             self._blinding_values_theta[i] = value
 
         # add offset to pois
@@ -514,8 +568,9 @@ class Fitter:
             param = self.param_model.params[i]
             if param in unblind_parameters:
                 continue
-            logger.debug(f"Blind signal strength modifier for {param}")
-            value = deterministic_random_from_string(param)
+            seed = param_to_seed.get(param, param)
+            logger.debug(f"Blind parameter {param} (seed='{seed}')")
+            value = deterministic_random_from_string(seed)
             self._blinding_values_poi[i] = np.exp(value)
 
     def set_blinding_offsets(self, blind=True):
