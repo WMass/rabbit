@@ -33,9 +33,6 @@ import numpy as np
 
 from rabbit import io_tools
 
-# Use a per-run output directory so concurrent CI runs (e.g. several open PRs)
-# don't clobber each other's intermediate fit results on a shared path. In CI
-# RABBIT_OUTDIR is a unique uuid dir; locally fall back to a fresh temp dir.
 OUTDIR = (
     Path(os.environ.get("RABBIT_OUTDIR") or tempfile.mkdtemp())
     / "test_global_asym_impacts"
