@@ -784,19 +784,6 @@ def main():
             for j, (data_values, data_variances) in enumerate(datasets):
 
                 ifitter.defaultassign()
-                # If --externalPostfit was supplied AND this is an
-                # asimov toy (-t -1), load the postfit values BEFORE we
-                # compute the expected yield. Otherwise expected_yield()
-                # below is evaluated at the prefit point (because
-                # defaultassign() just reset x), so we'd get a
-                # prefit-Asimov regardless of --externalPostfit. The
-                # in-fit() load (around line 551) then re-runs harmlessly.
-                if ifit == -1 and args.externalPostfit is not None:
-                    ifitter.load_fitresult(
-                        args.externalPostfit,
-                        args.externalPostfitResult,
-                        profile=not args.noPostfitProfileBB,
-                    )
                 if ifit == -1:
                     group.append("asimov")
                     ifitter.set_nobs(ifitter.expected_yield())
