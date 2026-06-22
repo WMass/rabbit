@@ -39,7 +39,4 @@ def load_models(model_specs, indata, **kwargs):
     models = [load_model(spec[0], indata, *spec[1:], **kwargs) for spec in model_specs]
     if len(models) == 1:
         return models[0]
-    # allowNegativeParam is derived inside CompositeParamModel from the
-    # POI-carrying submodels only (an `any` over all models would let a
-    # POU-only model's flag corrupt another model's sqrt-stored POIs).
     return CompositeParamModel(models)
