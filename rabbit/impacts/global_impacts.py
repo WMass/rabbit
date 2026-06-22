@@ -197,18 +197,24 @@ def _compute_grouped_impacts(
     bin_by_bin_stat,
     bin_by_bin_stat_mode,
     systgroupidxs,
-    impacts_theta0_sq,
+    impacts_sources_sq,
     impacts_nobs,
     impacts_beta0_total,
     impacts_beta0_process,
-    impacts_param0_sq=None,
+    n_param_sources=0,
 ):
     """Assemble the grouped impacts tensor from all contributions.
 
-    impacts_param0_sq holds the squared impacts of the ParamModel prior
-    centers (one column per priored param); they are appended at the END of
-    the grouped axis, matching the column order of the output axes.
+    impacts_sources_sq holds the squared per-source impacts as a single
+    collection ordered [nuisance block | priored params]. The trailing
+    n_param_sources columns (the priored params) are appended at the END of
+    the grouped axis as individual sources, matching the output axes; the
+    leading nuisance columns are combined into the systematic groups. The
+    split here is only to assemble the grouped axis in its historical order.
     """
+    nsyst = int(impacts_sources_sq.shape[-1]) - n_param_sources
+    impacts_theta0_sq = impacts_sources_sq[:, :nsyst]
+    impacts_param0_sq = impacts_sources_sq[:, nsyst:] if n_param_sources else None
     if bin_by_bin_stat:
         impacts_grouped = tf.stack([impacts_nobs, impacts_beta0_total], axis=-1)
         if bin_by_bin_stat_mode == "full":
@@ -252,7 +258,8 @@ def global_impacts_parms(
     bin_by_bin_stat_mode,
     global_impacts_from_jvp,
     cov,
-    param_prior_idxs=None,
+    source_idxs,
+    n_param_sources=0,
 ):
     idxs_poi = tf.range(nsignal_params, dtype=tf.int64)
     idxs_noi = tf.constant(nmodel_params + noiidxs, dtype=tf.int64)
@@ -279,23 +286,16 @@ def global_impacts_parms(
             pd2ldbeta2_pdexpdbeta=None,
         )
 
-    # impacts_x0 covers the full constraint term: the nuisance block AND any
-    # ParamModel prior penalties (rows in the ParamModel block, nonzero where
-    # the model declares priors). Per-1-sigma units come out automatically
-    # since sc = sqrt(d2lc/dx2) = sqrt(cw) = 1/sigma.
+    # impacts_x0 covers the full constraint term over the whole parameter
+    # vector. The reported sources (constrained nuisances + priored params)
+    # are a single collection picked out by source_idxs; params and systs are
+    # treated identically here. Per-1-sigma units come out automatically since
+    # sc = sqrt(d2lc/dx2) = sqrt(cw) = 1/sigma.
     impacts_x0 = _compute_global_impacts_x0(x, compute_lc_fn, cov_dexpdx)
-    impacts_theta0 = tf.transpose(impacts_x0[nmodel_params:])
+    impacts_sources = tf.transpose(tf.gather(impacts_x0, source_idxs, axis=0))
 
-    impacts_theta0_sq = tf.square(impacts_theta0)
-    var_x0 = tf.reduce_sum(impacts_theta0_sq, axis=-1)
-
-    impacts_param0_sq = None
-    if param_prior_idxs is not None:
-        impacts_param0 = tf.transpose(
-            tf.gather(impacts_x0[:nmodel_params], param_prior_idxs, axis=0)
-        )
-        impacts_param0_sq = tf.square(impacts_param0)
-        var_x0 += tf.reduce_sum(impacts_param0_sq, axis=-1)
+    impacts_sources_sq = tf.square(impacts_sources)
+    var_x0 = tf.reduce_sum(impacts_sources_sq, axis=-1)
 
     var_nobs = var_total - var_x0
     if bin_by_bin_stat:
@@ -305,17 +305,14 @@ def global_impacts_parms(
         bin_by_bin_stat,
         bin_by_bin_stat_mode,
         systgroupidxs,
-        impacts_theta0_sq,
+        impacts_sources_sq,
         tf.sqrt(var_nobs),
         impacts_beta0_total,
         impacts_beta0_process,
-        impacts_param0_sq=impacts_param0_sq,
+        n_param_sources=n_param_sources,
     )
 
-    if param_prior_idxs is not None:
-        impacts_theta0 = tf.concat([impacts_theta0, impacts_param0], axis=-1)
-
-    return impacts_theta0, impacts_grouped
+    return impacts_sources, impacts_grouped
 
 
 def global_impacts_obs(
@@ -335,10 +332,11 @@ def global_impacts_obs(
     expvar_flat,
     expvar_shape,
     profile,
+    source_idxs,
+    n_param_sources=0,
     pdexpdbeta=None,
     pd2ldbeta2_pdexpdbeta=None,
     prefit_unconstrained_nuisance_uncertainty=0.0,
-    param_prior_idxs=None,
 ):
     """
     Global impacts on observable bins, used inside _expected_with_variance.
@@ -387,18 +385,11 @@ def global_impacts_obs(
         )
 
     impacts_x0 = _compute_global_impacts_x0(x, compute_lc_fn, cov_dexpdx)
-    impacts_theta0 = tf.transpose(impacts_x0[nmodel_params:])
+    # single source collection (constrained nuisances + priored params)
+    impacts_sources = tf.transpose(tf.gather(impacts_x0, source_idxs, axis=0))
 
-    impacts_theta0_sq = tf.square(impacts_theta0)
-    var_x0 = tf.reduce_sum(impacts_theta0_sq, axis=-1)
-
-    impacts_param0_sq = None
-    if param_prior_idxs is not None:
-        impacts_param0 = tf.transpose(
-            tf.gather(impacts_x0[:nmodel_params], param_prior_idxs, axis=0)
-        )
-        impacts_param0_sq = tf.square(impacts_param0)
-        var_x0 += tf.reduce_sum(impacts_param0_sq, axis=-1)
+    impacts_sources_sq = tf.square(impacts_sources)
+    var_x0 = tf.reduce_sum(impacts_sources_sq, axis=-1)
 
     var_nobs = expvar_flat - var_x0
     if bin_by_bin_stat:
@@ -408,17 +399,14 @@ def global_impacts_obs(
         bin_by_bin_stat,
         bin_by_bin_stat_mode,
         systgroupidxs,
-        impacts_theta0_sq,
+        impacts_sources_sq,
         tf.sqrt(var_nobs),
         impacts_beta0_total,
         impacts_beta0_process,
-        impacts_param0_sq=impacts_param0_sq,
+        n_param_sources=n_param_sources,
     )
 
-    if param_prior_idxs is not None:
-        impacts_theta0 = tf.concat([impacts_theta0, impacts_param0], axis=-1)
-
-    impacts = tf.reshape(impacts_theta0, [*expvar_shape, impacts_theta0.shape[-1]])
+    impacts = tf.reshape(impacts_sources, [*expvar_shape, impacts_sources.shape[-1]])
     impacts_grouped = tf.reshape(
         impacts_grouped, [*expvar_shape, impacts_grouped.shape[-1]]
     )
@@ -427,20 +415,34 @@ def global_impacts_obs(
 
 
 def _gaussian_global_impacts(
-    dxdtheta0,
+    dxdx0,
     dxdnobs,
     dxdbeta0,
-    vartheta0,
+    varx0,
     varnobs,
     varbeta0,
     bin_by_bin_stat,
     bin_by_bin_stat_mode,
     beta_shape,
     systgroupidxs,
+    n_param_sources=0,
     data_cov_inv=None,
-    dxdparam0=None,
-    varparam0=None,
 ):
+    # dxdx0 / varx0 are the single source collection ordered
+    # [nuisance block | priored params]. The leading nuisance columns and the
+    # trailing priored-param columns are split out only to assemble the
+    # grouped axis in its historical order [syst groups | stat | bbb | priors];
+    # the per-source impacts themselves are computed uniformly.
+    nsyst = int(dxdx0.shape[-1]) - n_param_sources
+    dxdtheta0 = dxdx0[:, :nsyst]
+    vartheta0 = varx0[:nsyst]
+    if n_param_sources:
+        dxdparam0 = dxdx0[:, nsyst:]
+        varparam0 = varx0[nsyst:]
+    else:
+        dxdparam0 = None
+        varparam0 = None
+
     if data_cov_inv is not None:
         data_cov = tf.linalg.inv(data_cov_inv)
         # equivalent to tf.linalg.diag_part(dxdnobs @ data_cov @ tf.transpose(dxdnobs)) but avoiding computing full matrix
@@ -498,12 +500,10 @@ def _gaussian_global_impacts(
 
 
 def gaussian_global_impacts_parms(
-    dxdtheta0,
-    dxdparam0,
+    dxdx0,
     dxdnobs,
     dxdbeta0,
-    vartheta0,
-    varparam0,
+    varx0,
     varnobs,
     varbeta0,
     nsignal_params,
@@ -513,66 +513,56 @@ def gaussian_global_impacts_parms(
     bin_by_bin_stat_mode,
     beta_shape,
     systgroupidxs,
+    n_param_sources=0,
     data_cov_inv=None,
 ):
-    # The derivative columns come pre-split from the Fitter as
-    # [nuisance/theta block] and [priored params]; here we only gather the
-    # poi/noi rows whose impacts are reported (dxdparam0 is None when no
-    # priors are declared).
-    dxdtheta0 = _gather_poi_noi_vector(
-        dxdtheta0, noiidxs, nsignal_params, nmodel_params
-    )
+    # dxdx0 is the single source-derivative collection; gather the poi/noi
+    # rows whose impacts are reported (columns / sources are untouched).
+    dxdx0 = _gather_poi_noi_vector(dxdx0, noiidxs, nsignal_params, nmodel_params)
     dxdnobs = _gather_poi_noi_vector(dxdnobs, noiidxs, nsignal_params, nmodel_params)
     dxdbeta0 = _gather_poi_noi_vector(dxdbeta0, noiidxs, nsignal_params, nmodel_params)
-    if dxdparam0 is not None:
-        dxdparam0 = _gather_poi_noi_vector(
-            dxdparam0, noiidxs, nsignal_params, nmodel_params
-        )
 
     return _gaussian_global_impacts(
-        dxdtheta0,
+        dxdx0,
         dxdnobs,
         dxdbeta0,
-        vartheta0,
+        varx0,
         varnobs,
         varbeta0,
         bin_by_bin_stat,
         bin_by_bin_stat_mode,
         beta_shape,
         systgroupidxs,
+        n_param_sources,
         data_cov_inv,
-        dxdparam0=dxdparam0,
-        varparam0=varparam0,
     )
 
 
 def gaussian_global_impacts_obs(
-    dndtheta0,
-    dndparam0,
+    dndx0,
     dndnobs,
     dndbeta0,
-    vartheta0,
-    varparam0,
+    varx0,
     varnobs,
     varbeta0,
     bin_by_bin_stat,
     bin_by_bin_stat_mode,
     beta_shape,
     systgroupidxs,
+    n_param_sources=0,
     data_cov_inv=None,
 ):
     return _gaussian_global_impacts(
-        dndtheta0,
+        dndx0,
         dndnobs,
         dndbeta0,
-        vartheta0,
+        varx0,
         varnobs,
         varbeta0,
         bin_by_bin_stat,
         bin_by_bin_stat_mode,
         beta_shape,
         systgroupidxs,
+        n_param_sources,
         data_cov_inv,
-        dxdparam0=dndparam0,
-        varparam0=varparam0,
     )

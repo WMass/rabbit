@@ -305,9 +305,9 @@ def make_parser():
         default=False,
         action="store_true",
         help="EXPERIMENTAL: warm-start each --globalAsymImpacts refit at the "
-        "Gaussian-approximation new minimum x_nom + dxdtheta0[:, i] * shift "
+        "Gaussian-approximation new minimum x_nom + dxdx0[:, source] * shift "
         "(same Jacobian as --gaussianGlobalImpacts). On near-Gaussian "
-        "nuisances this should reduce per-nuisance refit cost by 10-50x. "
+        "sources this should reduce per-source refit cost by 10-50x. "
         "Adds one --gaussianGlobalImpacts-equivalent precompute up front. "
         "Off by default until validated on real tensors.",
     )
@@ -841,15 +841,24 @@ def main():
         "nois": ifitter.parms[ifitter.param_model.nparams :][indata.noiidxs],
     }
 
-    # ParamModel Gaussian priors (if the model declared sigmas). Stored as
-    # a small dict so downstream tooling can see what was applied without
-    # parsing the rabbit log.
+    # ParamModel Gaussian priors (if the model declared sigmas). Read straight
+    # from the model (the single source of truth) so downstream tooling can see
+    # what was applied without parsing the rabbit log.
     if getattr(ifitter, "param_prior_active", False):
+        pm = ifitter.param_model
+        sigmas = np.asarray(pm.prior_sigmas, dtype=np.float64)
+        mask = np.isfinite(sigmas) & (sigmas > 0)
+        means = getattr(pm, "prior_means", None)
+        means = (
+            np.asarray(pm.xparamdefault).astype(np.float64)
+            if means is None
+            else np.asarray(means, dtype=np.float64)
+        )
         meta["param_priors"] = {
-            "params": ifitter.param_model.params,  # all nparams names
-            "mask": ifitter.param_prior_mask.numpy(),  # bool array
-            "sigmas": ifitter.param_prior_sigmas.numpy(),  # NaN where mask False
-            "means": ifitter.param_prior_means.numpy(),  # NaN where mask False
+            "params": pm.params,  # all nparams names
+            "mask": mask,  # bool array
+            "sigmas": np.where(mask, sigmas, np.nan),  # NaN where no prior
+            "means": np.where(mask, means, np.nan),  # NaN where no prior
         }
 
     with workspace.Workspace(

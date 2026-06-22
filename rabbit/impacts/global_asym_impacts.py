@@ -100,8 +100,6 @@ def global_asym_impacts_parms(
     n_total = len(fitter.parms)
     impacts = np.zeros((n_scanned, 2, n_total))
 
-    nparams = fitter.param_model.nparams
-
     # Prefit width of each constraint center: sqrt(var_x0) = 1/sqrt(cw). For
     # nuisances cw = 1 so this is 1 (the historical "1.0 = 1 sigma"); for
     # priored params it is the prior sigma, so a unit-sigma shift moves x0 by
@@ -122,11 +120,10 @@ def global_asym_impacts_parms(
     )
 
     # Optional Gaussian-approximation warm-start. _dxdvars returns the postfit
-    # response to a unit shift of each constraint center, pre-split into the
-    # nuisance block (dxdtheta0[:, i]) and the priored-param columns
-    # (dxdparam0[:, j]); we map each scanned source's full-x index to its
-    # column. Computing it once is the same cost as one
-    # --gaussianGlobalImpacts call.
+    # response to a unit shift of each constraint center as a single collection
+    # of columns aligned with fitter.x0_source_idxs; we map each scanned
+    # source's full-x index to its column. Computing it once is the same cost
+    # as one --gaussianGlobalImpacts call.
     warmstart_col = None
     if linear_warmstart:
         if fitter.cov is None:
@@ -135,19 +132,12 @@ def global_asym_impacts_parms(
                 "(incompatible with --noHessian)."
             )
         t_lws = time.perf_counter()
-        dxdtheta0_tf, dxdparam0_tf, _, _ = fitter._dxdvars()
-        dxdtheta0_np = dxdtheta0_tf.numpy()
-        dxdparam0_np = dxdparam0_tf.numpy() if dxdparam0_tf is not None else None
-        prior_col = (
-            {int(p): j for j, p in enumerate(fitter.param_prior_idxs.numpy())}
-            if fitter.param_prior_active
-            else {}
-        )
+        dxdx0_tf, _, _ = fitter._dxdvars()
+        dxdx0_np = dxdx0_tf.numpy()
+        src_col = {int(s): k for k, s in enumerate(fitter.x0_source_idxs.numpy())}
 
         def _warmstart_col(idx):
-            if idx >= nparams:
-                return dxdtheta0_np[:, idx - nparams]
-            return dxdparam0_np[:, prior_col[idx]]
+            return dxdx0_np[:, src_col[idx]]
 
         warmstart_col = _warmstart_col
 
