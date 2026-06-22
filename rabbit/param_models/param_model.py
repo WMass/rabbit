@@ -71,13 +71,33 @@ class ParamModel:
 
 class CompositeParamModel(ParamModel):
     """
-    multiply different param models together
+    Multiply different param models together.
+
+    The fitter-facing parameter layout MUST be [all POIs | all POUs] — every
+    npoi-sliced consumer assumes it (get_poi squaring & blinding, impacts,
+    output reporting). Submodels are therefore concatenated per-block:
+
+        params = [poi(m1), poi(m2), ..., pou(m1), pou(m2), ...]
+
+    and compute() reassembles each submodel's native [poi | pou] vector from
+    the two blocks. (A naive per-model concatenation would place an earlier
+    model's POUs inside the composite's POI slice whenever a POU-carrying
+    model precedes a POI-carrying one — the fitter would then silently
+    square and blind those POUs.)
+
+    ``allowNegativeParam`` governs the fitter's single squaring transform of
+    the composite POI block, so it is derived from the POI-carrying
+    submodels (which must agree); POU-only submodels don't vote. Passing it
+    explicitly raises if it conflicts with the submodels.
+
+    Submodel ``prior_sigmas`` / ``prior_means`` declarations and
+    ``param_impact_groups`` are propagated through the same permutation.
     """
 
     def __init__(
         self,
         param_models,
-        allowNegativeParam=False,
+        allowNegativeParam=None,
     ):
 
         self.param_models = param_models
@@ -85,20 +105,105 @@ class CompositeParamModel(ParamModel):
         self.npoi = sum([m.npoi for m in param_models])
         self.npou = sum([m.npou for m in param_models])
 
-        self.params = np.concatenate([m.params for m in param_models])
+        self.params = np.concatenate(
+            [np.asarray(m.params[: m.npoi]) for m in param_models]
+            + [np.asarray(m.params[m.npoi :]) for m in param_models]
+        )
 
-        self.allowNegativeParam = allowNegativeParam
+        self.xparamdefault = tf.concat(
+            [m.xparamdefault[: m.npoi] for m in param_models]
+            + [m.xparamdefault[m.npoi :] for m in param_models],
+            axis=0,
+        )
 
-        self.is_linear = self.nparams == 0 or self.allowNegativeParam
+        poi_flags = {bool(m.allowNegativeParam) for m in param_models if m.npoi > 0}
+        if len(poi_flags) > 1:
+            raise ValueError(
+                "CompositeParamModel: submodels with POIs disagree on "
+                "allowNegativeParam; the fitter applies a single squaring "
+                "transform to the composite POI block, so a mix cannot be "
+                "represented."
+            )
+        derived = next(iter(poi_flags)) if poi_flags else None
+        if allowNegativeParam is None:
+            self.allowNegativeParam = derived if derived is not None else False
+        else:
+            if derived is not None and bool(allowNegativeParam) != derived:
+                raise ValueError(
+                    f"CompositeParamModel: explicit allowNegativeParam="
+                    f"{allowNegativeParam} conflicts with the POI-carrying "
+                    f"submodels (allowNegativeParam={derived})."
+                )
+            self.allowNegativeParam = bool(allowNegativeParam)
 
-        self.xparamdefault = tf.concat([m.xparamdefault for m in param_models], axis=0)
+        # The product of >1 parameter-dependent factors is nonlinear, and the
+        # squaring transform (allowNegativeParam=False) makes even a single
+        # linear factor quadratic in the stored parameters.
+        n_active = sum(1 for m in param_models if m.nparams > 0)
+        self.is_linear = self.nparams == 0 or (
+            self.allowNegativeParam
+            and n_active <= 1
+            and all(m.is_linear for m in param_models if m.nparams > 0)
+        )
+
+        # Gaussian priors: propagate submodel declarations (NaN = no prior),
+        # permuted like params. Means default to each submodel's own
+        # xparamdefault, matching the Fitter's fallback.
+        if any(getattr(m, "prior_sigmas", None) is not None for m in param_models):
+            sigmas = []
+            means = []
+            for m in param_models:
+                s = getattr(m, "prior_sigmas", None)
+                s = (
+                    np.asarray(s, dtype=np.float64)
+                    if s is not None
+                    else np.full(m.nparams, np.nan)
+                )
+                mu = getattr(m, "prior_means", None)
+                mu = (
+                    np.asarray(mu, dtype=np.float64)
+                    if mu is not None
+                    else np.asarray(m.xparamdefault).astype(np.float64)
+                )
+                sigmas.append(s)
+                means.append(mu)
+            self.prior_sigmas = np.concatenate(
+                [s[: m.npoi] for s, m in zip(sigmas, param_models)]
+                + [s[m.npoi :] for s, m in zip(sigmas, param_models)]
+            )
+            self.prior_means = np.concatenate(
+                [v[: m.npoi] for v, m in zip(means, param_models)]
+                + [v[m.npoi :] for v, m in zip(means, param_models)]
+            )
+
+        # impact groups are name-based, so a plain merge survives the
+        # permutation
+        groups = {}
+        for m in param_models:
+            for k, v in getattr(m, "param_impact_groups", {}).items():
+                groups.setdefault(k, []).extend(v)
+        if groups:
+            self.param_impact_groups = groups
 
     def compute(self, param, full=False):
-        start = 0
+        poi_offset = 0
+        pou_offset = self.npoi
         results = []
         for m in self.param_models:
-            results.append(m.compute(param[start : start + m.nparams], full))
-            start += m.nparams
+            parts = []
+            if m.npoi > 0:
+                parts.append(param[poi_offset : poi_offset + m.npoi])
+            if m.npou > 0:
+                parts.append(param[pou_offset : pou_offset + m.npou])
+            if len(parts) > 1:
+                mparam = tf.concat(parts, axis=0)
+            elif parts:
+                mparam = parts[0]
+            else:
+                mparam = param[0:0]
+            results.append(m.compute(mparam, full))
+            poi_offset += m.npoi
+            pou_offset += m.npou
 
         rnorm = functools.reduce(lambda a, b: a * b, results)
         return rnorm

@@ -39,5 +39,4 @@ def load_models(model_specs, indata, **kwargs):
     models = [load_model(spec[0], indata, *spec[1:], **kwargs) for spec in model_specs]
     if len(models) == 1:
         return models[0]
-    allow_neg = any(getattr(m, "allowNegativeParam", False) for m in models)
-    return CompositeParamModel(models, allowNegativeParam=allow_neg)
+    return CompositeParamModel(models)
