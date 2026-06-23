@@ -6,7 +6,7 @@ import h5py
 import numpy as np
 from wums.sparse_hist import SparseHist  # noqa: F401  re-exported for convenience
 
-from rabbit import common, h5pyutils_write
+from rabbit import auxiliary, common, h5pyutils_write
 
 from wums import ioutils, logging  # isort: skip
 
@@ -72,6 +72,11 @@ class TensorWriter:
         # fit parameter list (POIs + systs) at fit time. See
         # add_external_likelihood_term for details.
         self.external_terms = []
+
+        # Generic auxiliary array bundles (not used by the fit). Each entry is
+        # {"name": str, "datasets": {key: ndarray | list[str]}}; see
+        # add_auxiliary and rabbit.auxiliary.
+        self.auxiliary = []
 
         self.clipSystVariations = False
         if self.clipSystVariations > 0.0:
@@ -1442,6 +1447,28 @@ class TensorWriter:
             }
         )
 
+    def add_auxiliary(self, name, datasets):
+        """Store a named bundle of arbitrary arrays in the output.
+
+        The bundle is written under the top-level ``auxiliary`` HDF5 group and
+        exposed on the read side as ``FitInputData.auxiliary[name]``. It is not
+        used by the fit itself; it is a side channel for ParamModels to carry
+        pre-computed inputs (e.g. a response matrix) that must stay consistent
+        with the datacard. See :mod:`rabbit.auxiliary`.
+
+        Parameters
+        ----------
+        name : str
+            Bundle identifier (the auxiliary subgroup name). Must be unique.
+        datasets : dict
+            ``{key: np.ndarray | list[str]}``. Numeric arrays round-trip
+            bit-for-bit (dtype + shape); 1-D string lists round-trip as
+            ``list[str]``.
+        """
+        if any(a["name"] == name for a in self.auxiliary):
+            raise RuntimeError(f"auxiliary '{name}' already added")
+        self.auxiliary.append({"name": name, "datasets": dict(datasets)})
+
     @staticmethod
     def _sparse_values_at(sparse_csr, indices):
         """Extract values from a flat CSR array at the given flat indices.
@@ -2211,6 +2238,12 @@ class TensorWriter:
                         "hess_sparse",
                         maxChunkBytes=self.chunkSize,
                     )
+
+        # Write generic auxiliary array bundles (not used by the fit; a side
+        # channel for ParamModels). See rabbit.auxiliary.
+        nbytes += auxiliary.write_auxiliary_group(
+            f, self.auxiliary, maxChunkBytes=self.chunkSize
+        )
 
         logger.info(f"Total raw bytes in arrays = {nbytes}")
 
