@@ -2,10 +2,7 @@
 
 An auxiliary entry is a named bundle of arbitrary arrays — numeric ndarrays
 and/or 1-D string lists — stashed in the input HDF5 under a top-level
-``auxiliary`` group. It is **not** used by the fit itself; it is a side channel
-for ParamModels to carry pre-computed inputs (e.g. a reco x gen response matrix)
-that must stay consistent with the datacard they are fit against, rather than
-being read from a separate, independently-versioned file at fit time.
+``auxiliary`` group. It is not used by the fit itself.
 
 This mirrors the ``external_terms`` mechanism (see
 :mod:`rabbit.external_likelihood`): :class:`rabbit.tensorwriter.TensorWriter`
