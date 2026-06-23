@@ -305,9 +305,9 @@ def make_parser():
         default=False,
         action="store_true",
         help="EXPERIMENTAL: warm-start each --globalAsymImpacts refit at the "
-        "Gaussian-approximation new minimum x_nom + dxdtheta0[:, i] * shift "
+        "Gaussian-approximation new minimum x_nom + dxdx0[:, source] * shift "
         "(same Jacobian as --gaussianGlobalImpacts). On near-Gaussian "
-        "nuisances this should reduce per-nuisance refit cost by 10-50x. "
+        "sources this should reduce per-source refit cost by 10-50x. "
         "Adds one --gaussianGlobalImpacts-equivalent precompute up front. "
         "Off by default until validated on real tensors.",
     )
@@ -410,16 +410,34 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
 
                 fitter_saturated = copy.deepcopy(fitter)
 
-                toy_theta0 = tf.identity(fitter_saturated.theta0)
+                # preserve the (possibly toy-randomized) constraint centers
+                # across the re-init: the theta block maps 1:1, and the
+                # original model's prior centers land at [0:npoi] and
+                # [composite.npoi : composite.npoi+npou] in the composite
+                # [POIs | POUs] layout; the saturated model's own params keep
+                # the freshly initialized centers
+                orig_model = fitter_saturated.param_model
+                toy_x0 = tf.identity(fitter_saturated.x0.value())
                 saved_regularizers = fitter_saturated.regularizers
                 saved_tau = float(fitter_saturated.tau.numpy())
                 fitter_saturated.init_fit_parms(
                     composite_model,
                     args.setConstraintMinimum,
                     unblind=args.unblind,
+                    blinding_group=args.blindingGroup,
                     freeze_parameters=args.freezeParameters,
                 )
-                fitter_saturated.theta0.assign(toy_theta0)
+                fitter_saturated.x0[composite_model.nparams :].assign(
+                    toy_x0[orig_model.nparams :]
+                )
+                if orig_model.npoi > 0:
+                    fitter_saturated.x0[: orig_model.npoi].assign(
+                        toy_x0[: orig_model.npoi]
+                    )
+                if orig_model.npou > 0:
+                    fitter_saturated.x0[
+                        composite_model.npoi : composite_model.npoi + orig_model.npou
+                    ].assign(toy_x0[orig_model.npoi : orig_model.nparams])
                 fitter_saturated.regularizers = saved_regularizers
                 fitter_saturated.tau.assign(saved_tau)
 
@@ -858,6 +876,27 @@ def main():
         "pois": ifitter.param_model.params[: ifitter.param_model.npoi],
         "nois": ifitter.parms[ifitter.param_model.nparams :][indata.noiidxs],
     }
+
+    # ParamModel Gaussian priors (if the model declared sigmas). Read straight
+    # from the model (the single source of truth) so downstream tooling can see
+    # what was applied without parsing the rabbit log.
+    if getattr(ifitter, "param_prior_active", False):
+        pm = ifitter.param_model
+        np_dtype = ifitter.indata.dtype.as_numpy_dtype
+        sigmas = np.asarray(pm.prior_sigmas, dtype=np_dtype)
+        mask = np.isfinite(sigmas) & (sigmas > 0)
+        means = getattr(pm, "prior_means", None)
+        means = (
+            np.asarray(pm.xparamdefault).astype(np_dtype)
+            if means is None
+            else np.asarray(means, dtype=np_dtype)
+        )
+        meta["param_priors"] = {
+            "params": pm.params,  # all nparams names
+            "mask": mask,  # bool array
+            "sigmas": np.where(mask, sigmas, np.nan),  # NaN where no prior
+            "means": np.where(mask, means, np.nan),  # NaN where no prior
+        }
 
     with workspace.Workspace(
         args.outpath,

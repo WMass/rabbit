@@ -22,13 +22,12 @@ def _envelope(values):
 
 def nonprofiled_impacts_parms(
     x,
-    theta0,
+    x0,
     frozen_indices,
     frozen_params,
-    constraintweights,
+    cw,
     systgroups,
     systgroupidxs,
-    nparams,
     minimize_fn,
     diagnostics=False,
     loss_val_grad_hess_fn=None,
@@ -37,13 +36,12 @@ def nonprofiled_impacts_parms(
     """
     Args:
         x: TF Variable holding all fit parameters (POIs + nuisances).
-        theta0: TF Variable list of nuisance parameter central values.
+        x0: TF Variable of constraint centers, index-aligned with x.
         frozen_indices: indices (into x) of the frozen parameters.
         frozen_params: names of the frozen parameters.
-        constraintweights: constraint weights for each nuisance parameter.
+        cw: constraint weights, index-aligned with x.
         systgroups: systematic group names.
         systgroupidxs: per-group lists of nuisance parameter indices.
-        nparams: total number of model parameters (nparams + npou); offset from x index to theta0 index.
         minimize_fn: callable that runs the fit (no arguments).
         diagnostics: if True, log EDM after each minimization (requires loss_val_grad_hess_fn).
         loss_val_grad_hess_fn: callable returning (val, grad, hess); used only when diagnostics=True.
@@ -53,21 +51,23 @@ def nonprofiled_impacts_parms(
     x_tmp_tiled = tf.tile(tf.reshape(x_tmp, [1, 1, -1]), [len(frozen_indices), 2, 1])
     nonprofiled_impacts = tf.Variable(x_tmp_tiled)
 
-    theta0_tmp = tf.identity(theta0.value())
+    x0_tmp = tf.identity(x0.value())
 
-    err_theta = tf.where(
-        constraintweights == 0.0,
+    # prefit sigma = 1/sqrt(cw); the distinction from the variance 1/cw
+    # matters since ParamModel priors introduce genuinely non-unit cw
+    err_x0 = tf.where(
+        cw == 0.0,
         unconstrained_err,
-        tf.math.reciprocal(constraintweights),
+        tf.math.rsqrt(cw),
     )
 
     for i, idx in enumerate(frozen_indices):
         logger.info(f"Now at parameter {frozen_params[i]}")
 
         for j, sign in enumerate((1, -1)):
-            variation = sign * err_theta[idx - nparams] + theta0_tmp[idx - nparams]
+            variation = sign * err_x0[idx] + x0_tmp[idx]
             # vary the non-profiled parameter
-            theta0[idx - nparams].assign(variation)
+            x0[idx].assign(variation)
             x[idx].assign(
                 variation
             )  # this should not be needed but should accelerate the minimization
@@ -83,7 +83,7 @@ def nonprofiled_impacts_parms(
             x.assign(x_tmp)
 
         # back to original value
-        theta0[idx - nparams].assign(theta0_tmp[idx - nparams])
+        x0[idx].assign(x0_tmp[idx])
 
     impact_group_names = []
     impact_groups = []

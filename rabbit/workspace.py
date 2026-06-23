@@ -22,8 +22,9 @@ def getGroupedImpactsAxes(
         impact_names.append("binByBinStat")
         if per_process:
             impact_names.extend([f"binByBinStat{p}" for p in indata.procs.astype(str)])
-    # ParamModel parameter groups are appended at the end, matching the column
-    # order produced by traditional_impacts.impacts_parms.
+    # ParamModel-related columns (parameter groups for the traditional
+    # impacts, prior sources for the global impacts) are appended at the
+    # end, matching the column order produced by the impact calculations.
     if extra_groups:
         impact_names.extend(extra_groups)
     return hist.axis.StrCategory(impact_names, name="impacts")
@@ -61,12 +62,14 @@ class Workspace:
         self.noiidxs = fitter.indata.noiidxs
 
         # some information for the impact histograms
-        systs = list(fitter.indata.systs.astype(str))
         parms = list(fitter.parms.astype(str))
+        # The global impacts report a source per parameter over the whole
+        # vector (unconstrained params are exactly zero), same axis as the
+        # per-parameter (traditional) impacts.
         self.impact_axis = hist.axis.StrCategory(parms, name="impacts")
-        self.global_impact_axis = hist.axis.StrCategory(systs, name="impacts")
-        # ParamModel impact groups (e.g. SCETlib NP gamma_nu / F_eff) are only
-        # computed by the traditional impacts, so extend that axis only.
+        self.global_impact_axis = hist.axis.StrCategory(parms, name="impacts")
+        # ParamModel impact groups (e.g. SCETlib NP gamma_nu / F_eff) extend
+        # both the traditional and the global grouped axes.
         param_impact_group_names = [
             name for name, _ in fitter._resolved_param_impact_groups()
         ]
@@ -80,6 +83,7 @@ class Workspace:
             fitter.indata,
             bin_by_bin_stat=fitter.bbstat.enabled,
             per_process=fitter.bbstat.binByBinStatMode == "full",
+            extra_groups=param_impact_group_names,
         )
 
         self.extension = "hdf5"
