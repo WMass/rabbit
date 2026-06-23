@@ -79,7 +79,7 @@ def global_asym_impacts_parms(
             (constraints are unit-sigma in rabbit, so 1.0 = 1 prefit sigma).
         signs: sequence (down, up). Bin 0 of axis_downUpVar -> first sign.
         linear_warmstart: experimental. If True, warm-start each refit at
-            x_nom + dxds[:, source] * shift, the Gaussian-approximation new
+            x_nom + dxdx0[:, idx] * shift, the Gaussian-approximation new
             minimum for the shifted center. Should drastically reduce the
             number of optimizer iterations on near-Gaussian sources.
             Requires fitter.cov to exist (same prerequisite as
@@ -119,12 +119,11 @@ def global_asym_impacts_parms(
         + (" (linear warm-start enabled)" if linear_warmstart else "")
     )
 
-    # Optional Gaussian-approximation warm-start. _dxdvars returns the postfit
-    # response to a unit shift of each constraint center as a single collection
-    # of columns aligned with fitter.x0_source_idxs; we map each scanned
-    # source's full-x index to its column. Computing it once is the same cost
-    # as one --gaussianGlobalImpacts call.
-    warmstart_col = None
+    # Optional Gaussian-approximation warm-start. dxdx0[:, j] is the postfit
+    # response to a unit shift of constraint center x0[j], so a scanned
+    # source's full-x index directly selects its column. Computing it once is
+    # the same cost as one --gaussianGlobalImpacts call.
+    dxdx0_np = None
     if linear_warmstart:
         if fitter.cov is None:
             raise RuntimeError(
@@ -134,15 +133,8 @@ def global_asym_impacts_parms(
         t_lws = time.perf_counter()
         dxdx0_tf, _, _ = fitter._dxdvars()
         dxdx0_np = dxdx0_tf.numpy()
-        src_col = {int(s): k for k, s in enumerate(fitter.x0_source_idxs.numpy())}
-
-        def _warmstart_col(idx):
-            return dxdx0_np[:, src_col[idx]]
-
-        warmstart_col = _warmstart_col
-
         logger.info(
-            f"global_asym_impacts: dxds prepared in "
+            f"global_asym_impacts: dxdx0 prepared in "
             f"{time.perf_counter() - t_lws:.2f}s"
         )
 
@@ -167,12 +159,12 @@ def global_asym_impacts_parms(
             x0_shifted[idx] += shift
 
             # Warm-start x. With linear_warmstart, use the Gaussian-approx new
-            # minimum x_nom + dxds[:, source] * shift -- on near-Gaussian
-            # sources this lands at the new minimum to within roundoff.
-            # Without it, just shift x[idx] by `shift` so the parameter itself
-            # starts at the new constraint center.
-            if warmstart_col is not None:
-                x_shifted = x_nom_np + warmstart_col(idx) * shift
+            # minimum x_nom + dxdx0[:, idx] * shift -- on near-Gaussian sources
+            # this lands at the new minimum to within roundoff. Without it,
+            # just shift x[idx] by `shift` so the parameter itself starts at
+            # the new constraint center.
+            if dxdx0_np is not None:
+                x_shifted = x_nom_np + dxdx0_np[:, idx] * shift
             else:
                 x_shifted = x_nom_np.copy()
                 x_shifted[idx] += shift

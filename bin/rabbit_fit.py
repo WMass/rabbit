@@ -882,13 +882,14 @@ def main():
     # what was applied without parsing the rabbit log.
     if getattr(ifitter, "param_prior_active", False):
         pm = ifitter.param_model
-        sigmas = np.asarray(pm.prior_sigmas, dtype=np.float64)
+        np_dtype = ifitter.indata.dtype.as_numpy_dtype
+        sigmas = np.asarray(pm.prior_sigmas, dtype=np_dtype)
         mask = np.isfinite(sigmas) & (sigmas > 0)
         means = getattr(pm, "prior_means", None)
         means = (
-            np.asarray(pm.xparamdefault).astype(np.float64)
+            np.asarray(pm.xparamdefault).astype(np_dtype)
             if means is None
-            else np.asarray(means, dtype=np.float64)
+            else np.asarray(means, dtype=np_dtype)
         )
         meta["param_priors"] = {
             "params": pm.params,  # all nparams names
