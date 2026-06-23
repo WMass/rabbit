@@ -199,6 +199,11 @@ class FitInputData:
 
             self.external_terms = read_external_terms_from_h5(f.get("external_terms"))
 
+            # Load generic auxiliary array bundles (optional). See rabbit.auxiliary.
+            from rabbit.auxiliary import read_auxiliary_from_h5
+
+            self.auxiliary = read_auxiliary_from_h5(f.get("auxiliary"))
+
     @tf.function
     def expected_events_nominal(self):
         rnorm = tf.ones(self.nproc, dtype=self.dtype)
