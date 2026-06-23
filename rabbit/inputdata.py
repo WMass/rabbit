@@ -199,8 +199,7 @@ class FitInputData:
 
             self.external_terms = read_external_terms_from_h5(f.get("external_terms"))
 
-            # Load generic auxiliary array bundles (optional). A side channel
-            # for ParamModels; not used by the fit. See rabbit.auxiliary.
+            # Load generic auxiliary array bundles (optional). See rabbit.auxiliary.
             from rabbit.auxiliary import read_auxiliary_from_h5
 
             self.auxiliary = read_auxiliary_from_h5(f.get("auxiliary"))
