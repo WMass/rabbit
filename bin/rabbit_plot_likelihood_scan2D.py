@@ -2,6 +2,7 @@
 
 import os
 
+import hist
 import matplotlib.pyplot as plt
 import mplhep as hep
 import numpy as np
@@ -22,6 +23,14 @@ def make_parser():
         nargs=2,
         action="append",
         help="Parameters to plot the likelihood scan",
+    )
+    parser.add_argument(
+        "--scales",
+        type=float,
+        nargs=2,
+        action="append",
+        default=[],
+        help="Scaling factors for parameter values",
     )
     parser.add_argument(
         "--legPos", type=str, default="upper right", help="Set legend position"
@@ -305,6 +314,16 @@ def plot_scan(
 
 def main():
     args = make_parser().parse_args()
+
+    if len(args.scales) > len(args.params):
+        raise Exception("""
+        option "--scales" has more pairs than "--params". It can only have as many or less.
+        If less, pairs of 1.0 will be automatically patched.
+        """)
+    elif len(args.scales) < len(args.params):
+        for i in range(len(args.params) - len(args.scales)):
+            args.scales.append([1.0, 1.0])
+
     fitresult, meta = io_tools.get_fitresult(args.infile, args.result, meta=True)
     config = plot_tools.load_config(args.config)
 
@@ -322,13 +341,22 @@ def main():
     if "contour_scans2D" in fitresult.keys():
         h_contour = fitresult["contour_scans2D"].get()
 
-    for px, py in args.params:
-        px_value = h_params[{"parms": px}].value
-        py_value = h_params[{"parms": py}].value
+    for ip, (px, py) in enumerate(args.params):
+        px_scale, py_scale = args.scales[ip]
+        px_value = px_scale * h_params[{"parms": px}].value
+        py_value = py_scale * h_params[{"parms": py}].value
 
         cov = None
         if h_cov is not None and not args.noHessian:
-            cov = h_cov[{"parms_x": [px, py], "parms_y": [px, py]}].values()
+            # given the scalings w1 and w2, compute
+            # [ [c11 * w1 * w1, c12 * w1 * w2],
+            #   [c21 * w1 * w2, c22 * w2 * w2],
+            # ]
+            w = np.array([px_scale, py_scale])
+            cov = (
+                np.outer(w, w)
+                * h_cov[{"parms_x": [px, py], "parms_y": [px, py]}].values()
+            )
 
         h_contour_params = None
         if (
@@ -340,7 +368,16 @@ def main():
 
         h_scan = None
         if f"nll_scan2D_{px}_{py}" in fitresult.keys() and not args.noScan:
-            h_scan = fitresult[f"nll_scan2D_{px}_{py}"].get()
+            h_scan_in = fitresult[f"nll_scan2D_{px}_{py}"].get()
+            # scale categorical axis value
+            cats0 = [str(float(x) * px_scale) for x in h_scan_in.axes[0]]
+            cats1 = [str(float(x) * py_scale) for x in h_scan_in.axes[1]]
+            h_scan = hist.Hist(
+                hist.axis.StrCategory(cats0, name=h_scan_in.axes[0].name),
+                hist.axis.StrCategory(cats1, name=h_scan_in.axes[1].name),
+                storage=h_scan_in.storage_type(),
+            )
+            h_scan.view(flow=True)[...] = h_scan_in.view(flow=True)
 
         fig = plot_scan(
             args,
