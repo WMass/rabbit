@@ -2239,8 +2239,7 @@ class TensorWriter:
                         maxChunkBytes=self.chunkSize,
                     )
 
-        # Write generic auxiliary array bundles (not used by the fit; a side
-        # channel for ParamModels). See rabbit.auxiliary.
+        # Write generic auxiliary array bundles (not used by the fit). See rabbit.auxiliary.
         nbytes += auxiliary.write_auxiliary_group(
             f, self.auxiliary, maxChunkBytes=self.chunkSize
         )
