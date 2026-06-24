@@ -430,10 +430,67 @@ jobs:
           rabbit_limit.py $RABBIT_OUTDIR/test_tensor_bsm.hdf5 -o $RABBIT_OUTDIR/ --postfix bsm
           -t 0 --unblind --expectSignal bsm1 0 --expectSignal bsm2 1 --allowNegativeParam --asymptoticLimits bsm1 --levels 0.05
 
-      - name: bsm limits on channel 
+      - name: check bsm observed likelihood limit
+        run: |
+          python - <<'PY'
+          import os
+          import numpy as np
+          from rabbit import io_tools
+
+          fr = io_tools.get_fitresult(
+              os.path.join(os.environ["RABBIT_OUTDIR"], "limits_bsm.hdf5")
+          )
+          keys = list(fr.keys())
+          assert "likelihood_asymptoticLimits_observed" in keys, keys
+          obs = np.array(
+              fr["likelihood_asymptoticLimits_observed"].get().values()
+          ).flatten()
+          assert np.all(np.isfinite(obs)) and np.all(obs > 0), obs
+          # observed must sit inside the expected +/-2 sigma band (clb axis
+          # ordered 0.025 .. 0.975), with padding for the gaussian/likelihood
+          # method difference; this catches NaN / sign / scale regressions
+          exp = np.array(fr["likelihood_asymptoticLimits_expected"].get().values())
+          lo = exp[..., 0].flatten()
+          hi = exp[..., -1].flatten()
+          assert np.all(obs >= 0.5 * lo) and np.all(obs <= 2.0 * hi), (obs, lo, hi)
+          gobs = np.array(
+              fr["gaussian_asymptoticLimits_observed"].get().values()
+          ).flatten()
+          assert np.all(obs > 0.3 * gobs) and np.all(obs < 3.0 * gobs), (obs, gobs)
+          print("likelihood observed limit OK:", obs)
+          PY
+
+      - name: bsm limits on channel
         run: >-
           rabbit_limit.py $RABBIT_OUTDIR/test_tensor_bsm.hdf5 -o $RABBIT_OUTDIR/ --postfix bsm
           -t 0 --unblind --paramModel Mixture bsm1 sig --expectSignal bsm1_sig_mixing 0 --asymptoticLimits bsm1_sig_mixing --levels 0.05 --allowNegativeParam
+
+      - name: check bsm observed likelihood limit on channel
+        run: |
+          python - <<'PY'
+          import os
+          import numpy as np
+          from rabbit import io_tools
+
+          fr = io_tools.get_fitresult(
+              os.path.join(os.environ["RABBIT_OUTDIR"], "limits_bsm.hdf5")
+          )
+          keys = list(fr.keys())
+          assert "likelihood_asymptoticLimits_observed" in keys, keys
+          obs = np.array(
+              fr["likelihood_asymptoticLimits_observed"].get().values()
+          ).flatten()
+          assert np.all(np.isfinite(obs)) and np.all(obs > 0), obs
+          exp = np.array(fr["likelihood_asymptoticLimits_expected"].get().values())
+          lo = exp[..., 0].flatten()
+          hi = exp[..., -1].flatten()
+          assert np.all(obs >= 0.5 * lo) and np.all(obs <= 2.0 * hi), (obs, lo, hi)
+          gobs = np.array(
+              fr["gaussian_asymptoticLimits_observed"].get().values()
+          ).flatten()
+          assert np.all(obs > 0.3 * gobs) and np.all(obs < 3.0 * gobs), (obs, gobs)
+          print("likelihood observed limit on channel OK:", obs)
+          PY
 
   plotting:
     runs-on: [self-hosted, linux, x64]

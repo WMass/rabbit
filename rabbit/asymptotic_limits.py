@@ -1,189 +1,131 @@
 import numpy as np
-import scipy.optimize
-import tensorflow as tf
 from scipy.optimize import root
 from wums import logging
 
-from rabbit import tfhelpers as tfh
+import tensorflow as tf  # isort: skip
+
+from rabbit import tfhelpers as tfh  # isort: skip
 
 logger = logging.child_logger(__name__)
 
 
-@tf.function
-def limit_constraint(f):
-    val = f()
-    return val
-
-
-@tf.function
-def limit_constraint_val_grad(fitter, fitter_asimov, f):
-    with tf.GradientTape() as t:
-        t.watch([fitter.x, fitter_asimov.x])
-        val = f()
-    grad = t.gradient(val, [fitter.x, fitter_asimov.x])
-    grad = tf.concat(grad, 0)
-
-    return val, grad
-
-
 def compute_likelihood_limit(
-    fitter, fitter_asimov, nllvalreduced, nllvalreduced_asimov, param, cl
+    fitter,
+    fitter_asimov,
+    nllvalreduced,
+    nllvalreduced_asimov,
+    param,
+    cl_s,
+    muhat=None,
+    fun=None,
+    r_init=None,
+    allow_negative=True,
 ):
+    """Observed asymptotic CLs upper limit from the profile likelihood.
 
-    # We have 2 fitters, one to fit the asimov dataset and one to fit the real data
-    # The two are allowed to have different parameters; but the POI has to be the same
+    Reuses the same profiled-NLL machinery as the (working) expected limit:
+    the profile-likelihood test statistic is evaluated with `fitter` fitted to
+    data (q_mu) and with `fitter_asimov` fitted to the background-only Asimov
+    dataset (q_{mu,A}). The limit is the value of `param` for which
+    CLs(mu) = cl_s, following the asymptotic formulae of Cowan, Cranmer,
+    Gross, Vitells, arXiv:1007.1727.
 
-    # initial values
+    For a negative best-fit signal strength the modified test statistic
+    q-tilde_mu (Eq. 16) is used, taking the mu=0 conditional fit as reference
+    instead of the global minimum, consistent with the `xobs < 0` branch of
+    `compute_gaussian_limit`.
+
+    If `fun` is given (channel/mapping case) the limit is reported on the
+    mapped observable at the limit point, matching the convention of the
+    expected channel limit produced via `contour_scan(fun=...)`.
+    """
     idx = np.where(fitter.parms.astype(str) == param)[0][0]
-    xval = tf.identity(fitter.x).numpy()
+    if muhat is None:
+        # best-fit POI in the internal (self.x) space, consistent with
+        # profiled_nll_at_poi (also correct for the channel/mapping case
+        # where `param` is the POI driving the mapped observable)
+        muhat = float(fitter.x.numpy()[idx])
 
-    xval_asimov = np.zeros_like(xval)
-    xval_asimov[idx] = xval[idx]
-    fitter_asimov.x.assign(xval_asimov)
-
-    # perform an asumov fit at xobs to get good starting values
-    fitter_asimov.freeze_params(param)
-    fitter_asimov.minimize()
-    fitter_asimov.defreeze_params(param)
-
-    xval_asimov = tf.identity(fitter_asimov.x).numpy()
-    xval_asimov = np.delete(xval_asimov, idx)
-    xval_init = np.concatenate([xval, xval_asimov])
-
-    # to find the upper limit we set the mu equal to mu_obs also for the asimov dataset
-    # xval_init[len(xval_init)//2:][idx] = xval_init[idx]
-
-    # TODO: modified statistics
-
-    def _compute_limit_constraint():
-        qmu = tf.sqrt(2 * (fitter._compute_nll() - nllvalreduced))
-        qA = tf.sqrt(2 * (fitter_asimov._compute_nll() - nllvalreduced_asimov))
-        constraint = cl * tfh.normal_cdf(qA - qmu) + tfh.normal_cdf(qmu) - 1
-
-        logger.debug(f"q_mu = {qmu}")
-        logger.debug(f"q_A = {qA}")
-        logger.debug(f"constraint = {constraint}")
-
-        logger.debug(f"fitter_asimov.x = {fitter_asimov.x}")
-        logger.debug(f"fitter.x = {fitter.x}")
-
-        return constraint
-
-    def _compute_limit_constraint_grad():
-        qmu = tf.sqrt(2 * (fitter._compute_nll() - nllvalreduced))
-        qA = tf.sqrt(2 * (fitter_asimov._compute_nll() - nllvalreduced_asimov))
-
-        phi_qmu = tfh.normal_pdf(qmu)
-        phi_qA_qmu = tfh.normal_pdf(qA - qmu)
-
-        with tf.GradientTape() as t:
-            val = tf.sqrt(2 * fitter._compute_nll())
-        dqmu_dx = t.gradient(val, fitter.x)
-
-        with tf.GradientTape() as t:
-            val = tf.sqrt(2 * fitter_asimov._compute_nll())
-        dqA_dx = t.gradient(val, fitter_asimov.x)
-
-        # from first fitter
-        dconstraint_dx1 = (phi_qmu - cl * phi_qA_qmu) * dqmu_dx
-
-        # from second fitter
-        dconstraint_dx2 = cl * phi_qA_qmu * dqA_dx
-
-        dconstraint_dx1 = dconstraint_dx1.numpy()
-        dconstraint_dx2 = dconstraint_dx2.numpy()
-
-        # common x[idx]
-        dconstraint_dx1[idx] = dconstraint_dx1[idx] + dconstraint_dx2[idx]
-
-        # drop x[idx] from second fitter
-        dconstraint_dx2 = np.delete(dconstraint_dx2, idx)
-
-        dconstraint_dx = np.concatenate([dconstraint_dx1, dconstraint_dx2])
-
-        logger.debug(f"q_mu = {qmu}")
-        logger.debug(f"q_A = {qA}")
-        logger.debug(f"dqmu_dx = {dqmu_dx}")
-        logger.debug(f"dqA_dx = {dqA_dx}")
-        logger.debug(f"dconstraint_dx1 = {dconstraint_dx1}")
-        logger.debug(f"dconstraint_dx2 = {dconstraint_dx2}")
-
-        logger.debug(f"dconstraint/dx = {dconstraint_dx}")
-
-        return dconstraint_dx
-
-    def scipy_constraint(xval):
-        logger.info(f"scipy_constraint: xval = {xval}")
-
-        nx = (len(xval) + 1) // 2
-        x1 = xval[:nx]
-        x2 = xval[nx:]
-        x2 = np.insert(x2, idx, x1[idx])
-
-        fitter.x.assign(x1)
-        fitter_asimov.x.assign(x2)
-        val = _compute_limit_constraint()
-        # val = limit_constraint(_compute_limit_constraint)
-        return val.numpy()
-
-    def scipy_constraint_grad(xval):
-        logger.info(f"scipy_constraint_grad: xval = {xval}")
-
-        nx = (len(xval) + 1) // 2
-        x1 = xval[:nx]
-        x2 = xval[nx:]
-        x2 = np.insert(x2, idx, x1[idx])
-
-        fitter.x.assign(x1)
-        fitter_asimov.x.assign(x2)
-
-        # val, grad = limit_constraint_val_grad(fitter, fitter_asimov, _compute_limit_constraint)
-        grad = _compute_limit_constraint_grad()
-        return grad
-
-    nlc = scipy.optimize.NonlinearConstraint(
-        fun=scipy_constraint,
-        lb=-0.5,  # -0.5 at qmu = 0
-        ub=0,
-        jac=scipy_constraint_grad,
-        hess=scipy.optimize.SR1(),  # TODO: use exact hessian or hessian vector product
+    logger.info(
+        f"Compute observed (Likelihood) limit for {param}, "
+        f"mu_hat = {muhat}, CLs = {cl_s}"
     )
 
-    # Objective function and its derivatives
-    def objective(params):
-        logger.debug(f"param[{idx}] = {params[idx]}")
-        return -params[idx]
+    # Reference NLL for the data test statistic q_mu (denominator of the
+    # profile likelihood ratio). Modified statistics (mu_hat < 0): use the
+    # mu = 0 conditional fit as reference instead of the global minimum.
+    if allow_negative and muhat < 0:
+        logger.debug("Use modified statistics (mu_hat < 0)")
+        ref = fitter.profiled_nll_at_poi(param, 0.0)
+        mu_lo = 0.0
+    else:
+        ref = nllvalreduced
+        mu_lo = muhat
 
-    def objective_jac(params):
-        jac = np.zeros_like(params)
-        jac[idx] = -0.001
-        return jac
+    def sqrt_qmu(mu):
+        # one-sided test statistic for an upper limit
+        if mu <= mu_lo:
+            return 0.0
+        dnll = fitter.profiled_nll_at_poi(param, mu) - ref
+        return np.sqrt(max(0.0, 2.0 * dnll))
 
-    def objective_hessp(params, v):
-        return np.zeros_like(v)
+    def sqrt_qA(mu):
+        # background-only Asimov: best fit at mu = 0, reference is its minimum
+        if mu <= 0.0:
+            return 0.0
+        dnll = fitter_asimov.profiled_nll_at_poi(param, mu) - nllvalreduced_asimov
+        return np.sqrt(max(0.0, 2.0 * dnll))
 
-    res = scipy.optimize.minimize(
-        objective,
-        xval_init,
-        method="trust-constr",
-        jac=objective_jac,
-        hessp=objective_hessp,
-        constraints=[nlc],
-        options={
-            "maxiter": 500,
-            "xtol": 1e-10,
-            "gtol": 1e-10,
-            # "verbose": 3
-        },
-    )
+    def cls_minus_alpha(mu):
+        mu = float(np.asarray(mu).reshape(-1)[0])
+        # np.float64 (not python float) so tfh.normal_cdf can read .dtype
+        qmu = np.float64(sqrt_qmu(mu))
+        qA = np.float64(sqrt_qA(mu))
+        # CLs+b - cl_s * CLb ; same algebra as compute_gaussian_limit
+        val = tfh.normal_cdf(-qmu).numpy() - cl_s * tfh.normal_cdf(qA - qmu).numpy()
+        logger.debug(
+            f"mu = {mu}, sqrt(q_mu) = {qmu}, sqrt(q_A) = {qA}, "
+            f"CLs+b - cl_s*CLb = {val}"
+        )
+        return val
 
-    if not res["success"]:
-        logger.warning("No success")
+    if r_init is None or not np.isfinite(r_init) or r_init <= mu_lo:
+        # scale-aware default: ~2 sigma above the best fit
+        sigma = float(fitter.cov[idx, idx].numpy()) ** 0.5
+        if not np.isfinite(sigma) or sigma <= 0:
+            sigma = 1.0
+        r_init = max(mu_lo, muhat) + 2.0 * sigma
 
-    limit = res["x"][idx]
+    res = root(cls_minus_alpha, r_init)
+    if not res.success:
+        logger.warning(f"Root finding for observed limit on {param} did not converge")
+
+    mu_limit = float(np.asarray(res.x).reshape(-1)[0])
+
+    if fun is not None:
+        # profile at the limit POI and report the mapped observable, same
+        # convention as the expected channel limit (contour_scan(fun=...))
+        xsave = tf.identity(fitter.x)
+        xval = xsave.numpy()
+        xval[idx] = mu_limit
+        fitter.x.assign(xval)
+        fitter.freeze_params(param)
+        fitter.minimize()
+        fitter.defreeze_params(param)
+        exp, *_ = fitter.expected_with_variance(
+            fun,
+            profile=True,
+            compute_cov=False,
+            compute_global_impacts=False,
+            need_observables=True,
+            inclusive=True,
+        )
+        fitter.x.assign(xsave)
+        limit = float(exp.numpy()[0])
+    else:
+        limit = mu_limit
 
     logger.info(f"Observed (Likelihood): {param} < {limit}")
-
     return limit
 
 
