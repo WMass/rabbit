@@ -304,12 +304,13 @@ def test_fit(args, card, model):
     if args.full:
         ref = STEP1[model]
         print("  vs step-1 (cf_masslik_fit.py, full cache):")
-        for nm, (v, e) in ref.items():
+        for nm, entry in ref.items():
             if nm == "nll":
-                d = abs(nll - v)
+                d = abs(nll - entry)
                 ok &= d < 1e-2
-                print(f"    {'NLL':>10s}: {nll:.6f} vs {v:.6f}  (d = {d:.2e})")
+                print(f"    {'NLL':>10s}: {nll:.6f} vs {entry:.6f}  (d = {d:.2e})")
                 continue
+            v, e = entry
             i = names.index(nm)
             dv = abs(x[i] - v) / max(abs(v), 1e-12)
             de = abs(err[i] - e) / e
