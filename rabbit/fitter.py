@@ -123,6 +123,18 @@ class Fitter:
                 f"jitCompile must be one of 'auto', 'on', 'off'; got {_jit_opt!r}"
             )
         _has_unbinned = bool(getattr(self.indata, "unbinned_terms", []))
+        # An empty block in the parameter vector [poi | model_nui | syst] --
+        # a ParamModel with npoi = 0 (e.g. ExternalParams / UnbinnedParams
+        # declaring only nuisances) or a datacard with no systematics -- makes
+        # get_x() slice a length-0 piece out of x and tf.where over it. XLA has
+        # no gradient kernel for either ("Scatter dimension 0 is of size zero"
+        # / "StridedSliceGrad" on an empty tensor) and the whole jit-compiled
+        # loss+gradient call fails. Graph mode handles it fine, so drop jit.
+        _empty_block = (
+            param_model.npoi == 0
+            or param_model.npou == 0
+            or self.indata.nsyst == 0
+        )
         if _jit_opt == "off":
             self.jit_compile = False
         elif _jit_opt == "on":
@@ -141,10 +153,21 @@ class Fitter:
                     "jit_compile will be disabled."
                 )
                 self.jit_compile = False
+            elif _empty_block:
+                logger.warning(
+                    "--jitCompile=on requested but the parameter vector has an "
+                    f"empty block (npoi={param_model.npoi}, "
+                    f"npou={param_model.npou}, nsyst={self.indata.nsyst}); XLA "
+                    "has no gradient kernel for the length-0 slice/select in "
+                    "get_x(), so jit_compile will be disabled."
+                )
+                self.jit_compile = False
             else:
                 self.jit_compile = True
         else:  # "auto"
-            self.jit_compile = not self.indata.sparse and not _has_unbinned
+            self.jit_compile = (
+                not self.indata.sparse and not _has_unbinned and not _empty_block
+            )
         # When --noHessian is requested the postfit Hessian is never
         # computed, so the dense [npar, npar] covariance matrix should
         # not be allocated. self.cov is set to None in that case and
