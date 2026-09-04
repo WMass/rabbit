@@ -17,6 +17,7 @@ baseline_models = {
     "SmoothABCDIsoMT": "abcd_isomtmt_model",
     "SmoothExtendedABCDIsoMT": "abcd_isomtmt_model",
     "UnbinnedParams": "unbinned_params",
+    "ExternalParams": "external_params",
 }
 
 

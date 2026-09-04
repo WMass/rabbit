@@ -2136,9 +2136,19 @@ class Fitter:
         log-normalization is gated on ``full_nll``. External terms are stored
         expanded, so the centering constant has to be added back explicitly.
         See :mod:`rabbit.external_likelihood`.
+
+        Evaluated at the *effective* parameter vector ``get_x()`` (not the raw
+        ``self.x``), like :meth:`_compute_lc` and :meth:`_compute_unbinned_nll`:
+        the ``stop_gradient`` that ``get_x`` applies to frozen entries is what
+        makes a frozen parameter actually frozen in a likelihood or contour
+        scan. With ``self.x`` an external term kept pulling on a scanned
+        parameter, which matters as soon as a parameter is shared between an
+        external term and something else (e.g. a global calibration parameter
+        appearing both in a quadratic hit-chi2 term and in an unbinned mass
+        term).
         """
         return external_likelihood.compute_external_nll(
-            self.external_terms, self.x, self.indata.dtype, full_nll=full_nll
+            self.external_terms, self.get_x(), self.indata.dtype, full_nll=full_nll
         )
 
     def _compute_unbinned_nll(self, full_nll=False):
