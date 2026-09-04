@@ -302,8 +302,10 @@ def main():
         priors[name] = (float(mean), float(sigma))
     unknown = set(priors) - set(term.param_names)
     if unknown:
-        raise ValueError(f"--prior for unknown parameter(s) {sorted(unknown)}; "
-                         f"the term has {term.param_names}")
+        raise ValueError(
+            f"--prior for unknown parameter(s) {sorted(unknown)}; "
+            f"the term has {term.param_names}"
+        )
     poi_names = [s for s in args.poi.split(",") if s]
 
     defaults = []
