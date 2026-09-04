@@ -75,6 +75,10 @@ class Toy:
         self.nextra = nextra
         self.ntheta = nshared + nextra
         self.names = [f"theta{j}" for j in range(self.ntheta)]
+        # the mass term sees only the first nshared; the rest exist solely in
+        # the quadratic term and must be declared by ExternalParams
+        self.shared = self.names[:nshared]
+        self.extra = self.names[nshared:]
 
         self.sigma = rng.uniform(0.020, 0.045, n)
         self.mobs = rng.normal(0.0005, 1.0, n) * self.sigma
@@ -136,13 +140,17 @@ class Toy:
         val += 0.5 * np.sum(cw * (vec - x0) ** 2)
         return val
 
-    def solve(self, with_ext=True, with_mass=True):
+    def solve(self, with_ext=True, with_mass=True, fixed=None):
         """Exact minimum and covariance of the analytic NLL.
 
-        Returns ``(x, cov, nll)`` with ``x = [alpha, k, theta...]``.
+        ``fixed`` holds ``{name: value}`` for parameters to profile *around*
+        rather than minimize over (the frozen-parameter case). Returns
+        ``(x, cov, nll)`` with ``x = [alpha, k, theta...]``.
         """
+        fixed = dict(fixed or {})
         nu = 1 + self.ntheta
         names = ["alpha", "k"] + self.names
+        u_names = ["alpha"] + self.names
         cw, x0 = self._prior_arrays(names)
         cw_u = np.concatenate([cw[:1], cw[2:]])
         x0_u = np.concatenate([x0[:1], x0[2:]])
@@ -156,26 +164,40 @@ class Toy:
         AWA = self.A.T @ (self.W[:, None] * self.A)
         AWm = self.A.T @ (self.W * self.mobs)
 
+        ufix = np.zeros(nu)
+        free = []
+        for i, nm in enumerate(u_names):
+            if nm in fixed:
+                ufix[i] = fixed[nm]
+            else:
+                free.append(i)
+        free = np.asarray(free, dtype=int)
+
         def u_of_k(k):
+            u = ufix.copy()
             if not with_mass:
-                # alpha (u[0]) is touched by nothing: solve the theta block
-                # only and leave alpha at 0
-                u = np.zeros(nu)
-                u[1:] = np.linalg.solve(Q[1:, 1:], -G[1:])
+                # alpha is touched by nothing here: solve the theta block only
+                fr = free[free > 0]
+                rhs = -G[fr] - Q[np.ix_(fr, free[free == 0])].sum(axis=1) * 0.0
+                rhs = rhs - Q[np.ix_(fr, np.arange(nu))] @ ufix
+                u[fr] = np.linalg.solve(Q[np.ix_(fr, fr)], rhs + Q[np.ix_(fr, fr)] @ ufix[fr])
                 return u
-            return np.linalg.solve(AWA / k + Q, AWm / k - G)
+            M = AWA / k + Q
+            rhs = AWm / k - G - M @ ufix + M[:, free] @ ufix[free]
+            u[free] = np.linalg.solve(M[np.ix_(free, free)], rhs[free])
+            return u
 
         def f(k):
             u = u_of_k(k)
             return self.nll(u[0], k, u[1:], with_ext, with_mass)
 
-        if with_mass:
+        if with_mass and "k" not in fixed:
             res = scipy.optimize.minimize_scalar(
                 f, bracket=(0.5, 1.0, 2.0), method="brent", options={"xtol": 1e-14}
             )
             k = float(res.x)
         else:
-            k = 1.0
+            k = float(fixed.get("k", 1.0))
         u = u_of_k(k)
         alpha, theta = u[0], u[1:]
 
@@ -216,8 +238,8 @@ class Toy:
             bkg_frac=0.0,
             floor="none",
             chunk=256,
-            jac=(self.jac_idx, self.jac_val, (self.n, self.ntheta)),
-            jac_params=self.names,
+            jac=(self.jac_idx, self.jac_val, (self.n, self.nshared)),
+            jac_params=self.shared,
             channel="toy",
         )
 
@@ -270,7 +292,7 @@ class Toy:
                     "tgrid": self.tgrid,
                     "jac_indices": self.jac_idx,
                     "jac_values": self.jac_val,
-                    "jac_shape": np.array([self.n, self.ntheta], dtype=np.int64),
+                    "jac_shape": np.array([self.n, self.nshared], dtype=np.int64),
                 },
                 param_defaults=defaults,
                 param_prior_sigmas=sigmas,
@@ -330,13 +352,23 @@ def make_fitter(filename, models, **opts):
     return f
 
 
+def cov_from_fitter(f):
+    """Postfit covariance = inverse of the NLL Hessian at the minimum.
+
+    ``Fitter.cov`` is only *allocated* in ``__init__``; it is filled by the
+    output stage of ``rabbit_fit.py``, not by ``minimize()``.
+    """
+    _, _, hess = f.loss_val_grad_hess()
+    return np.linalg.inv(hess.numpy())
+
+
 def fit_and_read(filename, models, order, **opts):
     f = make_fitter(filename, models, **opts)
     f.minimize()
     parms = f.parms.astype(str)
     x = f.x.numpy()
     val = {nm: float(x[np.where(parms == nm)[0][0]]) for nm in order}
-    cov = f.cov.numpy()
+    cov = cov_from_fitter(f)
     err = {
         nm: float(np.sqrt(cov[i, i]))
         for nm, i in ((nm, int(np.where(parms == nm)[0][0])) for nm in order)
@@ -409,7 +441,9 @@ def test_mass_only(tmpdir):
     for i, nm in enumerate(parms):
         x[i] = 1.0 if nm == "k" else rng.normal(0.0, 0.3)
     f.x.assign(tf.constant(x, dtype=f.x.dtype))
-    got = float(f.full_nll().numpy())
+    # reduced, not full: the 1-bin dummy channel contributes exactly +1 to the
+    # full Poisson NLL (n = nexp = 1 -> nexp + log n!) and 0 to the reduced one
+    got = float(f.reduced_nll().numpy())
     ref_val = toy.nll(
         x[list(parms).index("alpha")],
         x[list(parms).index("k")],
@@ -434,7 +468,7 @@ def test_joint(tmpdir):
     assert models == [
         ["UnbinnedParams"],
         ["ExternalParams", "bundle:global_params"],
-    ], models
+    ], models  # theta4/theta5 exist only in the quadratic term
     order = ["alpha", "k"] + toy.names
     ref_x, ref_cov, ref_nll = toy.solve()
     ref = {nm: ref_x[i] for i, nm in enumerate(order)}
@@ -480,7 +514,13 @@ def test_freeze(tmpdir):
     print("\n=== 5. freezing a shared parameter (external term at get_x) ===")
     toy = Toy()
     card, models = toy.write_card(os.path.join(tmpdir, "freeze.hdf5"))
-    f = make_fitter(card, models, freezeParameters=["theta0"])
+    # trust-krylov, not trust-exact: freezing zeroes the parameter's whole
+    # Hessian row and column, and the exact trust-region subproblem solver
+    # cannot handle the resulting singular block (it wanders along the null
+    # direction). Same reason likelihood scans use trust-krylov.
+    f = make_fitter(
+        card, models, freezeParameters=["theta0"], minimizerMethod="trust-krylov"
+    )
     parms = list(f.parms.astype(str))
     i0 = parms.index("theta0")
     x = f.x.numpy()
@@ -492,40 +532,13 @@ def test_freeze(tmpdir):
     print(f"    theta0 after the fit: {got:.12f} (frozen at 0.370000000000)")
 
     # and the profiled rest must equal the analytic conditional minimum
-    ref_x, _, _ = _conditional_solution(toy, {"theta0": 0.37})
+    ref_x, _, _ = toy.solve(fixed={"theta0": 0.37})
     order = ["alpha", "k"] + toy.names
     val = {nm: float(f.x.numpy()[parms.index(nm)]) for nm in order}
     ref = {nm: ref_x[i] for i, nm in enumerate(order)}
     ok &= report("profiled minimum at theta0 = 0.37", val, ref, 1e-6)
     print("  PASS" if ok else "  FAIL")
     return ok
-
-
-def _conditional_solution(toy, fixed):
-    """Analytic minimum with some parameters held at given values."""
-    order = ["alpha", "k"] + toy.names
-    free = [nm for nm in order if nm not in fixed]
-
-    def unpack(v):
-        d = dict(fixed)
-        for nm, val in zip(free, v):
-            d[nm] = val
-        return (
-            d["alpha"],
-            d["k"],
-            np.array([d[nm] for nm in toy.names]),
-        )
-
-    x0 = np.array([1.0 if nm == "k" else 0.0 for nm in free])
-    res = scipy.optimize.minimize(
-        lambda v: toy.nll(*unpack(v)), x0, method="Nelder-Mead",
-        options={"xatol": 1e-12, "fatol": 1e-14, "maxiter": 200000, "maxfev": 200000},
-    )
-    res = scipy.optimize.minimize(
-        lambda v: toy.nll(*unpack(v)), res.x, method="BFGS", tol=1e-14
-    )
-    a, k, th = unpack(res.x)
-    return np.concatenate([[a, k], th]), None, res.fun
 
 
 # ---------------------------------------------------------------------------
@@ -562,8 +575,10 @@ def test_injection(tmpdir):
         )
     # and consistency of the analytic reference itself
     shift = ref_x[2:] - base_x[2:]
+    # the analytic reference itself is only exact to the tolerance of its 1D
+    # minimization over k (brent, xtol 1e-14 -> ~1e-9 on the linear block)
     print(f"    analytic shift - injection: max |d| = {np.abs(shift - inj).max():.2e}")
-    ok &= np.abs(shift - inj).max() < 1e-12
+    ok &= np.abs(shift - inj).max() < 1e-8
     print("  PASS" if ok else "  FAIL")
     return ok
 
