@@ -577,7 +577,7 @@ def test_datacard(args):
         )
 
         names = list(f.parms.astype(str))
-        npoi = f.parammodel.npoi
+        npoi = f.param_model.npoi
         print(
             f"  fit parameters {names}, npoi = {npoi} -> POIs {names[:npoi]}, "
             f"nuisances {names[npoi:]}"
@@ -626,7 +626,7 @@ def parse_args():
     p.add_argument("--n", type=int, default=200000, help="toy candidates")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--window", type=float, nargs=2, default=[50.0, 130.0])
-    p.add_argument("--nm", type=int, default=16384)
+    p.add_argument("--nm", type=int, default=32768)
     p.add_argument("--nfft", type=int, default=None)
     p.add_argument("--nt", type=int, default=256, help="quadrature points in t")
     p.add_argument("--tmax", type=float, default=8.0, help="t range in units of sigma")

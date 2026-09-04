@@ -89,9 +89,11 @@ the transform happens once per NLL evaluation rather than once per candidate:
 ``dm`` (how well the piecewise-linear pdf represents the lineshape, O(dm^2))
 and ``dtau`` (the interpolation, O(dtau^4) with a coefficient set by the fourth
 moment of the *truncated* mass distribution, i.e. by how far the window
-reaches). The defaults put both below 1e-6 of the peak smeared density for a
-50-130 GeV window and a 1-2 GeV resolution; ``tests/test_zgamma_kernel.py``
-measures them.
+reaches). With ``nfft`` given as a multiple of ``nm`` the two are independent:
+``dtau = 2 pi / (nfft dm)`` and ``dm = W / nm``, so ``dtau`` depends only on the
+multiple and the window width. The defaults put both at or below ~1e-6 of the
+peak smeared density for a 50-130 GeV window and a 1-2 GeV resolution;
+``tests/test_zgamma_kernel.py`` measures them.
 
 Everything from the matrix element to the interpolation is plain TensorFlow, so
 value, gradient and Hessian with respect to ``m_Z`` and ``Gamma_Z`` come from
@@ -241,9 +243,13 @@ class ZGammaLineshape:
         Generator-level mass window ``[m_lo, m_hi]`` the lineshape is truncated
         and renormalised to. Must lie inside the luminosity table's range.
     nm : int
-        Uniform mass-grid points on the window. The default 16384 gives
-        ``dm ~ 5 MeV`` on a 80 GeV window; the piecewise-linear representation
-        error is then ~1e-7 of the peak density.
+        Uniform mass-grid points on the window. The default 32768 gives
+        ``dm ~ 2.4 MeV`` on a 80 GeV window, for which the piecewise-linear
+        representation error is ~1e-6 of the peak *smeared* density (it is
+        O(dm^2): 16384 gives ~3e-6). Raising it costs only the transform --
+        with the default ``nfft = 16 nm`` the CF grid spacing ``dtau =
+        2 pi / (nfft dm) = 2 pi / (16 W)`` does not depend on ``nm`` at all,
+        so the per-candidate interpolation is untouched.
     nfft : int, optional
         Zero-padded transform length (``>= nm``, rounded up to a power of two).
         Sets the CF grid spacing ``dtau = 2 pi / (nfft dm)`` and hence the
@@ -283,7 +289,7 @@ class ZGammaLineshape:
         self,
         m_ref=MZ_RUNNING,
         window=(50.0, 130.0),
-        nm=16384,
+        nm=32768,
         nfft=None,
         tau_max=40.0,
         lumi=DEFAULT_LUMI,
