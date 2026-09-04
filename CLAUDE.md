@@ -124,6 +124,17 @@ Note that a card whose only free parameters come from these terms has `npoi=0`
 and often `nsyst=0`; XLA has no gradient kernel for the resulting length-0
 slice/select in `get_x()`, so the Fitter disables `jit_compile` in that case.
 
+Two practical points for a card that is *only* a quadratic term. **Use
+`--minimizerMethod trust-exact`**: the problem is a small dense quadratic, the
+exact trust-region solve converges in a couple of steps (7 s on a 50-parameter
+CVH field card, values reproducing the closed-form `-H^-1 g` to 6e-10 of the
+error), whereas trust-krylov's CG needs ~`sqrt(cond(H))` iterations (56 s, and
+the minimum only to 1e-3 of the error). And **scale the parameters to a common
+unit before writing `H`**: an external Hessian whose parameters differ by orders
+of magnitude in what they physically do is correspondingly ill-conditioned, and
+trust-krylov did not converge at all on the unscaled version of that same card
+(cond 6.6e9 unscaled vs 1.9e7 scaled).
+
 ### Auxiliary data: `rabbit/auxiliary.py`
 `TensorWriter.add_auxiliary(name, datasets)` stores a named bundle of arbitrary arrays (numeric ndarrays and/or 1-D string lists) under a top-level `auxiliary` HDF5 group, exposed on the read side as `FitInputData.auxiliary[name]`. It is not used by the fit itself; it is a side channel for param models to carry pre-computed inputs that must stay consistent with the datacard.
 
