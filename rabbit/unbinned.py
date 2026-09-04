@@ -27,7 +27,8 @@ with
 * ``phi_res``   the *physics* kernel of the resonance: a delta function
                 (J/psi, K_S), a Breit-Wigner (Upsilon; analytic CF
                 ``e^{i m t - Gamma |t| / 2}``), or a numerical lineshape CF
-                (Z/gamma*, a function of m_Z, Gamma_Z, ...) -- see
+                (Z/gamma*, a function of m_Z, Gamma_Z, ..., supplied by a
+                provider from :mod:`rabbit.lineshapes`) -- see
                 :class:`PhysicsKernel`;
 * ``S_i(t)``    the per-candidate resolution CF exponent, a sum over
                 *families* ``S_i(t) = sum_f k_f S_{f,i}(t)``, each family a
@@ -237,13 +238,54 @@ class TabulatedLineshapeKernel(PhysicsKernel):
     channel abstraction is real: it is a drop-in for any other
     :class:`PhysicsKernel`, and :class:`MassCFTerm` needs no change to use
     it.
+
+    A provider is any object with
+
+    * ``provider(values, t_abs) -> (re, im)``, the additive complex exponent
+      ``(log|phi|, arg phi)`` broadcast to the shape of ``t_abs``;
+    * ``param_names``, the fit parameters it consumes;
+    * optionally ``config()``, a JSON-serialisable dict with a ``"type"`` key,
+      which is what lets the kernel survive the round trip through the
+      datacard: :func:`rabbit.lineshapes.make_provider` rebuilds it from that
+      dict on the read side.
+
+    :class:`rabbit.lineshapes.zgamma.ZGammaLineshape` is the reference
+    implementation (Z/gamma*, POIs ``m_Z`` and ``Gamma_Z``).
+
+    Parameters
+    ----------
+    param_names : sequence of str, optional
+        Fit parameters the kernel consumes. Defaults to the provider's own
+        ``param_names``; giving both is allowed but they must agree.
+    provider : callable or dict, optional
+        The provider object, or its ``config()`` dict (as stored in the
+        datacard), which is instantiated through
+        :func:`rabbit.lineshapes.make_provider`.
     """
 
     kind = "tabulated"
 
-    def __init__(self, param_names, provider=None):
-        self.param_names = tuple(param_names)
+    def __init__(self, param_names=None, provider=None):
+        if isinstance(provider, dict):
+            from rabbit.lineshapes import make_provider
+
+            provider = make_provider(provider)
         self.provider = provider
+
+        own = getattr(provider, "param_names", None)
+        if param_names is None:
+            if own is None:
+                raise ValueError(
+                    "TabulatedLineshapeKernel needs param_names, or a provider "
+                    "that declares its own param_names"
+                )
+            param_names = own
+        elif own is not None and tuple(param_names) != tuple(own):
+            raise ValueError(
+                f"TabulatedLineshapeKernel: param_names {tuple(param_names)} "
+                f"disagree with the provider's {tuple(own)}"
+            )
+        self.param_names = tuple(param_names)
 
     def log_cf(self, values, t_abs):
         if self.provider is None:
@@ -255,7 +297,11 @@ class TabulatedLineshapeKernel(PhysicsKernel):
         return self.provider(values, t_abs)
 
     def config(self):
-        return {"type": self.kind, "param_names": list(self.param_names)}
+        cfg = {"type": self.kind, "param_names": list(self.param_names)}
+        provider_config = getattr(self.provider, "config", None)
+        if callable(provider_config):
+            cfg["provider"] = provider_config()
+        return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +896,46 @@ class MassCFTerm(UnbinnedTerm):
             "background": self.background.config(),
             "jac_params": list(self.jac_params),
         }
+
+
+def declare_params(term, declarations, default=(0.0, np.nan, 0.0, 0)):
+    """Fill a term's parameter declaration arrays from a name-keyed dict.
+
+    ``declarations`` maps a parameter name to
+    ``(starting value, Gaussian prior sigma, prior mean, is_poi)``; anything not
+    mentioned takes ``default`` (start at 0, free, not a POI). The arrays are
+    written back onto the term *in its own parameter order* and returned as the
+    four kwargs of :meth:`rabbit.tensorwriter.TensorWriter.add_unbinned_term`::
+
+        term = MassCFTerm("z", ..., kernel=TabulatedLineshapeKernel(provider=zls))
+        decl = unbinned.declare_params(term, {
+            **zls.param_declarations(gz_prior=2.3),   # m_Z, Gamma_Z as POIs
+            "alpha": (0.0, np.nan, 0.0, 1),
+        })
+        writer.add_unbinned_term(term.name, term.config(), term.param_names,
+                                 datasets, **decl)
+
+    Unknown names are an error -- a typo in a POI name would otherwise silently
+    leave the parameter free and unreported.
+    """
+    unknown = set(declarations) - set(term.param_names)
+    if unknown:
+        raise ValueError(
+            f"unbinned term '{term.name}': declarations for {sorted(unknown)} "
+            f"which are not among its parameters {list(term.param_names)}"
+        )
+    rows = [declarations.get(n, default) for n in term.param_names]
+    out = {
+        "param_defaults": np.array([float(r[0]) for r in rows]),
+        "param_prior_sigmas": np.array([float(r[1]) for r in rows]),
+        "param_prior_means": np.array([float(r[2]) for r in rows]),
+        "param_is_poi": np.array([int(r[3]) for r in rows], dtype=np.int8),
+    }
+    term.param_defaults = out["param_defaults"]
+    term.param_prior_sigmas = out["param_prior_sigmas"]
+    term.param_prior_means = out["param_prior_means"]
+    term.param_is_poi = out["param_is_poi"]
+    return out
 
 
 _TERM_KINDS = {"MassCF": MassCFTerm}
