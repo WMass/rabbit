@@ -102,6 +102,28 @@ next to the external terms, adds them in `_compute_nll`, and forces
 module docstring for the schema and `tests/test_unbinned_mass.py` for the
 validation against the standalone reference implementation.
 
+### External (quadratic) terms: `rabbit/external_likelihood.py`
+Additive `g^T x_sub + 0.5 x_sub^T H x_sub` contributions over a *named slice*
+of the fit parameter vector, written with
+`TensorWriter.add_external_likelihood_term(grad=, hess=, mean=)` (dense
+`hist.Hist` or sparse `wums.SparseHist` Hessian), read as
+`FitInputData.external_terms`. Like an unbinned term it consumes parameters by
+name but declares nothing, so something has to put those names in the fit
+vector: `--paramModel ExternalParams` (`rabbit/param_models/external_params.py`)
+reads the declarations — name, starting value, Gaussian prior, POI flag — from
+an `auxiliary` bundle (default `external_params`, override with
+`bundle:<name>`), mirroring what `UnbinnedParams` does for unbinned terms. Use
+both together (`--paramModel UnbinnedParams --paramModel ExternalParams
+bundle:...`) when a card has both kinds of term; their parameter names must be
+disjoint. `tests/test_global_term.py` is the joint test: a quadratic term and a
+Gaussian-equivalent unbinned mass term sharing parameters through the sparse
+`m_i(theta) = m_i^0 + D_i theta` rows, checked against the closed-form
+solution (minimum, covariance, priors, freezing, injection recovery).
+
+Note that a card whose only free parameters come from these terms has `npoi=0`
+and often `nsyst=0`; XLA has no gradient kernel for the resulting length-0
+slice/select in `get_x()`, so the Fitter disables `jit_compile` in that case.
+
 ### Auxiliary data: `rabbit/auxiliary.py`
 `TensorWriter.add_auxiliary(name, datasets)` stores a named bundle of arbitrary arrays (numeric ndarrays and/or 1-D string lists) under a top-level `auxiliary` HDF5 group, exposed on the read side as `FitInputData.auxiliary[name]`. It is not used by the fit itself; it is a side channel for param models to carry pre-computed inputs that must stay consistent with the datacard.
 
