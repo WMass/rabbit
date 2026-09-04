@@ -104,6 +104,20 @@ def parse_args():
     )
     p.add_argument("--k0", type=float, default=1.0, help="starting resolution scale")
     p.add_argument(
+        "--prior",
+        action="append",
+        default=[],
+        metavar="NAME:MEAN:SIGMA",
+        help="Gaussian prior on a parameter, e.g. --prior k_ms:1.0:0.005. "
+        "Applied by the Fitter through the ParamModel prior mechanism "
+        "(0.5 ((p - mean) / sigma)^2). Repeatable.",
+    )
+    p.add_argument(
+        "--poi",
+        default="alpha",
+        help="comma separated parameters reported as POIs (default: alpha)",
+    )
+    p.add_argument(
         "--phik-points", type=int, default=8192, help="kernel-CF tabulation points"
     )
     p.add_argument(
@@ -282,6 +296,16 @@ def main():
         channel=args.channel,
     )
 
+    priors = {}
+    for spec in args.prior:
+        name, mean, sigma = spec.split(":")
+        priors[name] = (float(mean), float(sigma))
+    unknown = set(priors) - set(term.param_names)
+    if unknown:
+        raise ValueError(f"--prior for unknown parameter(s) {sorted(unknown)}; "
+                         f"the term has {term.param_names}")
+    poi_names = [s for s in args.poi.split(",") if s]
+
     defaults = []
     is_poi = []
     for p in term.param_names:
@@ -297,7 +321,12 @@ def main():
         else:
             defaults.append(args.k0)
             is_poi.append(0)
+    is_poi = [1 if p in poi_names else 0 for p in term.param_names]
+    sigmas = [priors.get(p, (0.0, np.nan))[1] for p in term.param_names]
+    means = [priors.get(p, (d, 0.0))[0] for p, d in zip(term.param_names, defaults)]
     log(f"parameters {term.param_names} defaults {defaults} poi {is_poi}")
+    if priors:
+        log(f"priors {priors}")
 
     writer = tensorwriter.TensorWriter()
     writer.add_dummy_channel(name=f"{args.channel}_dummy")
@@ -307,6 +336,8 @@ def main():
         term.param_names,
         datasets,
         param_defaults=defaults,
+        param_prior_sigmas=sigmas,
+        param_prior_means=means,
         param_is_poi=is_poi,
     )
 

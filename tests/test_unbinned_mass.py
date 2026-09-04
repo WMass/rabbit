@@ -25,6 +25,8 @@ Checks, in order:
    hook against the same shift applied by hand.
 7. **two channels** -- one term's candidates split into two terms sharing the
    same parameters: the NLLs must add up and the fits must agree.
+8. **Gaussian priors** -- a prior declared with the term acts as
+   ``0.5 ((p - mu) / sigma)^2`` and constrains the postfit uncertainty.
 
 Quick mode builds a small datacard from the step-1 caches (default 20k
 candidates, a 20k-sample kernel CF on 2048 points) and runs in a few minutes.
@@ -723,6 +725,56 @@ def test_two_channels(args, card):
 
 
 # ---------------------------------------------------------------------------
+# 8. Gaussian priors on unbinned parameters
+# ---------------------------------------------------------------------------
+def test_priors(args):
+    """A prior declared with the term must act as 0.5 ((p - mu) / sigma)^2.
+
+    Priors travel with the term (``param_prior_sigmas`` / ``param_prior_means``
+    in the datacard), are declared by UnbinnedParams and applied by the Fitter
+    through the ordinary ParamModel prior mechanism -- there is no separate
+    code path for them here. This checks the arithmetic exactly and that the
+    postfit uncertainty on the priored parameter shrinks accordingly.
+    """
+    print("\n=== 8. Gaussian prior on an unbinned parameter ===")
+    mu, sigma = 1.0, 0.005
+    card = build_card(
+        args, "families",
+        os.path.join(args.workdir, f"unbinned_{args.tag}_prior.hdf5"),
+        extra=["--prior", f"k_ms:{mu}:{sigma}"],
+    )
+    f0 = make_fitter(
+        os.path.join(args.workdir, f"unbinned_{args.tag}_families.hdf5"))
+    f1 = make_fitter(card)
+    names = list(f1.parms.astype(str))
+    i = names.index("k_ms")
+    print(f"  prior on k_ms: mu = {mu}, sigma = {sigma}; "
+          f"constraint weight = {f1.cw.numpy()[i]:.1f} (1/sigma^2 = "
+          f"{1/sigma**2:.1f})")
+    ok = abs(f1.cw.numpy()[i] - 1.0 / sigma**2) < 1e-6
+
+    rng = np.random.default_rng(9)
+    for k in range(3):
+        x = f1.x.numpy() + rng.normal(0.0, 0.02, len(names))
+        d = loss_at(f1, x) - loss_at(f0, x)
+        expect = 0.5 * ((x[i] - mu) / sigma) ** 2
+        rel = abs(d - expect) / max(abs(expect), 1e-12)
+        ok &= rel < 1e-9
+        print(f"    dNLL(prior) = {d:14.6f}  expected {expect:14.6f}  "
+              f"rel {rel:.2e}")
+
+    f0.minimize()
+    f1.minimize()
+    e0 = np.sqrt(np.diag(cov_from_fitter(f0)[0]))[i]
+    e1 = np.sqrt(np.diag(cov_from_fitter(f1)[0]))[i]
+    ok &= e1 < e0 and e1 < sigma
+    print(f"    k_ms = {f0.x.numpy()[i]:.6f} +- {e0:.6f} (free) -> "
+          f"{f1.x.numpy()[i]:.6f} +- {e1:.6f} (priored)")
+    print("  PASS" if ok else "  FAIL")
+    return ok
+
+
+# ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -772,11 +824,11 @@ def main():
     which = (
         set(args.only.split(","))
         if args.only
-        else {"1", "2", "3", "4", "5", "6", "7"}
+        else {"1", "2", "3", "4", "5", "6", "7", "8"}
     )
     results = {}
 
-    if which & {"1", "2", "3", "7"}:
+    if which & {"1", "2", "3", "7", "8"}:
         cards = {}
         for model in ("families", "r"):
             cards[model] = build_card(
@@ -796,6 +848,8 @@ def main():
             results["3 fit (r)"] = test_fit(args, cards["r"], "r")
         if "7" in which:
             results["7 two channels"] = test_two_channels(args, cards["families"])
+        if "8" in which:
+            results["8 gaussian priors"] = test_priors(args)
     if "4" in which:
         results["4 breit-wigner"] = test_breit_wigner(args)
     if "5" in which:

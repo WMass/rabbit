@@ -147,9 +147,10 @@ class PhysicsKernel:
         a shift of the predicted mass (scalar tensor), e.g. a floating
         resonance mass relative to ``m_ref``.
 
-    Both take the term's full parameter vector plus the index map built by
-    :meth:`MassCFTerm._param_index`, so a kernel can own any subset of the
-    fit parameters by name.
+    Both are handed ``values``, the ``{name: scalar tensor}`` mapping that
+    :meth:`MassCFTerm._values` builds from the gathered parameter vector, so a
+    kernel owns whatever subset of the fit parameters it names in
+    ``param_names``.
     """
 
     kind = "base"
@@ -426,7 +427,9 @@ class UnbinnedTerm:
 class MassCFTerm(UnbinnedTerm):
     """Unbinned per-candidate mass likelihood built from characteristic functions.
 
-    See the module docstring for the physics. Parameters
+    See the module docstring for the physics.
+
+    Parameters
     ----------
     name : str
         Term name (the HDF5 subgroup name).
