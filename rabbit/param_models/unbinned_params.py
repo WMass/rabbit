@@ -109,9 +109,7 @@ class UnbinnedParams(ParamModel):
                     f"UnbinnedParams: poi:{sorted(unknown)} not among the "
                     f"unbinned parameters {order}"
                 )
-            decl = {
-                k: (v[0], v[1], v[2], int(k in poi_names)) for k, v in decl.items()
-            }
+            decl = {k: (v[0], v[1], v[2], int(k in poi_names)) for k, v in decl.items()}
 
         pois = [n for n in order if decl[n][3]]
         pous = [n for n in order if not decl[n][3]]

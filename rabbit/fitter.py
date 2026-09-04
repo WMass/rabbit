@@ -11,9 +11,9 @@ from tensorflow.python.ops.linalg.sparse import sparse_csr_matrix_ops as tf_spar
 from wums import logging
 
 from rabbit import external_likelihood, io_tools
-from rabbit import unbinned as unbinned_terms_mod
 from rabbit import preconditioner as precond
 from rabbit import tfhelpers as tfh
+from rabbit import unbinned as unbinned_terms_mod
 from rabbit.bbstat.bbstat import BinByBinStat
 from rabbit.callbacks import (
     RESTART_MIN_IMPROVEMENT,

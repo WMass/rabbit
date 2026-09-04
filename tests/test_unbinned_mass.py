@@ -23,6 +23,8 @@ Checks, in order:
    and the degree-0 / flat-coefficient limits.
 6. **sparse D rows** -- the per-candidate ``m_i(theta) = m_i^0 + D_i theta``
    hook against the same shift applied by hand.
+7. **two channels** -- one term's candidates split into two terms sharing the
+   same parameters: the NLLs must add up and the fits must agree.
 
 Quick mode builds a small datacard from the step-1 caches (default 20k
 candidates, a 20k-sample kernel CF on 2048 points) and runs in a few minutes.
@@ -119,18 +121,31 @@ def build_card(args, model, outfile, extra=()):
         return outfile
     cmd = [
         sys.executable,
-        os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                     "make_unbinned_mass_tensor.py"),
-        "--pairs-cache", args.pairs_cache,
-        "--kernel-cache", args.kernel_cache,
-        "--model", model,
-        "-o", outfile,
-        "--phik-cache", os.path.join(args.workdir, "phik_%s.npz" % args.tag),
-        "--chunk", str(args.chunk),
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "make_unbinned_mass_tensor.py"
+        ),
+        "--pairs-cache",
+        args.pairs_cache,
+        "--kernel-cache",
+        args.kernel_cache,
+        "--model",
+        model,
+        "-o",
+        outfile,
+        "--phik-cache",
+        os.path.join(args.workdir, "phik_%s.npz" % args.tag),
+        "--chunk",
+        str(args.chunk),
     ]
     if not args.full:
-        cmd += ["--maxn", str(args.maxn), "--maxk", str(args.maxk),
-                "--phik-points", str(args.phik_points)]
+        cmd += [
+            "--maxn",
+            str(args.maxn),
+            "--maxk",
+            str(args.maxk),
+            "--phik-points",
+            str(args.phik_points),
+        ]
     cmd += list(extra)
     print("  " + " ".join(cmd))
     t0 = time.time()
@@ -185,8 +200,10 @@ def test_identity(args, card, model):
     names = list(f.parms.astype(str))
     print(f"  fit parameters: {names}")
     if not {"ms", "ioni"} <= {fam["name"] for fam in term.families}:
-        print("  SKIP: the cache does not have exactly the hit/ms/ioni families "
-              "the reference implementation knows about")
+        print(
+            "  SKIP: the cache does not have exactly the hit/ms/ioni families "
+            "the reference implementation knows about"
+        )
         return True
 
     try:
@@ -196,9 +213,7 @@ def test_identity(args, card, model):
         return True
 
     # the reference parameter order is [alpha, r] / [alpha, k_hit, k_ms, k_ioni]
-    ref_order = ["alpha", "r"] if model == "r" else [
-        "alpha", "k_hit", "k_ms", "k_ioni"
-    ]
+    ref_order = ["alpha", "r"] if model == "r" else ["alpha", "k_hit", "k_ms", "k_ioni"]
     perm = [names.index(p) for p in ref_order]
 
     rng = np.random.default_rng(7)
@@ -210,8 +225,7 @@ def test_identity(args, card, model):
         [1.3] + [1.1] * (len(ref_order) - 1),
     ]
     points += [
-        list(rng.normal([0.2] + [1.0] * (len(ref_order) - 1), 0.05))
-        for _ in range(3)
+        list(rng.normal([0.2] + [1.0] * (len(ref_order) - 1), 0.05)) for _ in range(3)
     ]
 
     ok = True
@@ -228,8 +242,10 @@ def test_identity(args, card, model):
         rel = abs(v_rabbit - v_ref) / max(abs(v_ref), 1.0)
         flag = "" if rel < 1e-6 else "   <<< FAIL"
         ok &= rel < 1e-6
-        print(f"  {np.array2string(xr, precision=3):>34s} {v_rabbit:18.6f} "
-              f"{v_ref:18.6f} {rel:10.2e}{flag}")
+        print(
+            f"  {np.array2string(xr, precision=3):>34s} {v_rabbit:18.6f} "
+            f"{v_ref:18.6f} {rel:10.2e}{flag}"
+        )
     print("  PASS" if ok else "  FAIL")
     return ok
 
@@ -275,8 +291,10 @@ def test_fit(args, card, model):
     err = np.sqrt(np.diag(cov))
     val, grad = f.loss_val_grad()
     nll = float(val.numpy()) - args.dummy_offset
-    print(f"  {args.minimizer}: wall {wall:.1f} s, NLL = {nll:.6f}, "
-          f"|grad|inf = {np.max(np.abs(grad.numpy())):.3e}")
+    print(
+        f"  {args.minimizer}: wall {wall:.1f} s, NLL = {nll:.6f}, "
+        f"|grad|inf = {np.max(np.abs(grad.numpy())):.3e}"
+    )
     for i, nm in enumerate(names):
         print(f"    {nm:>10s} = {x[i]:12.6f} +- {err[i]:.6f}")
 
@@ -294,8 +312,10 @@ def test_fit(args, card, model):
             dv = abs(x[i] - v) / max(abs(v), 1e-12)
             de = abs(err[i] - e) / e
             ok &= dv < 0.01 and de < 0.01
-            print(f"    {nm:>10s}: {x[i]:.6f} +- {err[i]:.6f} vs {v:.6f} +- {e:.6f}"
-                  f"  (dval {dv:.2e}, derr {de:.2e})")
+            print(
+                f"    {nm:>10s}: {x[i]:.6f} +- {err[i]:.6f} vs {v:.6f} +- {e:.6f}"
+                f"  (dval {dv:.2e}, derr {de:.2e})"
+            )
     else:
         try:
             import cf_masslik_fit
@@ -304,12 +324,13 @@ def test_fit(args, card, model):
             return ok
         term = f.indata.unbinned_terms[0]
         obj = reference_objective(term, model)
-        ref_order = ["alpha", "r"] if model == "r" else [
-            "alpha", "k_hit", "k_ms", "k_ioni"
-        ]
+        ref_order = (
+            ["alpha", "r"] if model == "r" else ["alpha", "k_hit", "k_ms", "k_ioni"]
+        )
         x0 = [0.2] + [1.0] * (len(ref_order) - 1)
-        res = cf_masslik_fit.minimize(obj, x0, method="trust-exact",
-                                      log=lambda *a: None)
+        res = cf_masslik_fit.minimize(
+            obj, x0, method="trust-exact", log=lambda *a: None
+        )
         cref = np.linalg.inv(res["hess"])
         eref = np.sqrt(np.diag(cref))
         print("  vs the reference minimiser on the same sample:")
@@ -318,9 +339,11 @@ def test_fit(args, card, model):
             dsig = abs(x[i] - res["x"][j]) / max(eref[j], 1e-12)
             de = abs(err[i] - eref[j]) / eref[j]
             ok &= dsig < 1e-3 and de < 1e-3
-            print(f"    {nm:>10s}: {x[i]:.6f} +- {err[i]:.6f} vs "
-                  f"{res['x'][j]:.6f} +- {eref[j]:.6f}  "
-                  f"(d = {dsig:.2e} sigma, derr {de:.2e})")
+            print(
+                f"    {nm:>10s}: {x[i]:.6f} +- {err[i]:.6f} vs "
+                f"{res['x'][j]:.6f} +- {eref[j]:.6f}  "
+                f"(d = {dsig:.2e} sigma, derr {de:.2e})"
+            )
         d_nll = abs(nll - res["nll"])
         ok &= d_nll < 1e-4
         print(f"    {'NLL':>10s}: {nll:.6f} vs {res['nll']:.6f} (d = {d_nll:.2e})")
@@ -427,12 +450,16 @@ def test_breit_wigner(args):
             tf.constant([1.0, dm_true, gamma_true], tf.float64)
         ).numpy()
         devs[nt] = np.max(np.abs(li[core] - ref[core]) / ref[core])
-        print(f"  density vs scipy voigt_profile, {nt:5d} t points: "
-              f"max rel dev = {devs[nt]:.2e}")
+        print(
+            f"  density vs scipy voigt_profile, {nt:5d} t points: "
+            f"max rel dev = {devs[nt]:.2e}"
+        )
     ok &= devs[8192] < 1e-5
     ok &= devs[1024] / devs[8192] > 10  # O(dt^2): 64x expected, allow slack
-    print(f"  refinement factor {devs[1024]/devs[8192]:.1f} (O(dt^2) -> 64) "
-          f"{'PASS' if ok else 'FAIL'}")
+    print(
+        f"  refinement factor {devs[1024]/devs[8192]:.1f} (O(dt^2) -> 64) "
+        f"{'PASS' if ok else 'FAIL'}"
+    )
 
     # -- 4b. closure: recover the generated mass and width ---------------
     # A Breit-Wigner has an unbounded Cauchy tail, so any sample has to be cut
@@ -455,16 +482,18 @@ def test_breit_wigner(args):
     mobs = truth + sigma * rng.standard_normal(n)
     keep = np.abs(mobs) < half_window
     nkeep = int(keep.sum())
-    print(f"  generated {n} at sigma = {sig0*1e3:.0f} MeV, Gamma = "
-          f"{gamma_true:.0f} MeV; kept {nkeep} in |m - m_ref| < "
-          f"{half_window*1e3:.0f} MeV ({100*(1-keep.mean()):.2f} % outside, "
-          f"normalised out of the likelihood)")
+    print(
+        f"  generated {n} at sigma = {sig0*1e3:.0f} MeV, Gamma = "
+        f"{gamma_true:.0f} MeV; kept {nkeep} in |m - m_ref| < "
+        f"{half_window*1e3:.0f} MeV ({100*(1-keep.mean()):.2f} % outside, "
+        f"normalised out of the likelihood)"
+    )
     nt = 2048
-    term = _bw_term("bwfit", mobs[keep], sigma[keep], nt=nt, m_ref=m_ref,
-                    chunk=16384)
+    term = _bw_term("bwfit", mobs[keep], sigma[keep], nt=nt, m_ref=m_ref, chunk=16384)
     grid = np.linspace(-half_window, half_window, 4001)
-    norm_term = _bw_term("bwnorm", grid, np.full(len(grid), sig0), nt=nt,
-                         m_ref=m_ref, chunk=len(grid))
+    norm_term = _bw_term(
+        "bwnorm", grid, np.full(len(grid), sig0), nt=nt, m_ref=m_ref, chunk=len(grid)
+    )
     dgrid = tf.constant(np.diff(grid), tf.float64)
 
     def nll_truncated(x):
@@ -475,14 +504,18 @@ def test_breit_wigner(args):
     t0 = time.time()
     res, grad, hess = _trust_exact(nll_truncated, [1.0, 0.0, 30.0], 3)
     err = np.sqrt(np.diag(np.linalg.inv(hess)))
-    print(f"  fit in {time.time()-t0:.1f} s ({res.nit} iterations, "
-          f"|grad|inf = {np.max(np.abs(grad)):.2e})")
+    print(
+        f"  fit in {time.time()-t0:.1f} s ({res.nit} iterations, "
+        f"|grad|inf = {np.max(np.abs(grad)):.2e})"
+    )
     labels = ["k_res", "dm [MeV]", "gamma [MeV]"]
     truths = [1.0, dm_true, gamma_true]
     for lab, v, e, tv in zip(labels, res.x, err, truths):
         pull = (v - tv) / e
-        print(f"    {lab:>12s} = {v:9.4f} +- {e:.4f}   truth {tv:8.4f}   "
-              f"pull {pull:+.2f}")
+        print(
+            f"    {lab:>12s} = {v:9.4f} +- {e:.4f}   truth {tv:8.4f}   "
+            f"pull {pull:+.2f}"
+        )
         ok &= abs(pull) < 4.0
     print("  PASS" if ok else "  FAIL")
     return ok
@@ -508,8 +541,10 @@ def test_bernstein():
             neg = float(y.min())
             ok &= abs(integral - 1.0) < 1e-8 and neg >= 0.0
             if trial == 0:
-                print(f"  degree {deg}: integral = {integral:.12f}, "
-                      f"min pdf = {neg:.4e}")
+                print(
+                    f"  degree {deg}: integral = {integral:.12f}, "
+                    f"min pdf = {neg:.4e}"
+                )
         # flat coefficients must reproduce the uniform density
         flat = float(np.log(np.expm1(1.0)))
         values = {n: tf.constant(flat, tf.float64) for n in names}
@@ -556,8 +591,12 @@ def test_jacobian_rows():
         chunk=128,
     )
     t_jac = unbinned.MassCFTerm(
-        "withD", sigma=sigma, mobs=mobs,
-        jac=(idx, vals, (n, ntheta)), jac_params=["t0", "t1", "t2"], **common
+        "withD",
+        sigma=sigma,
+        mobs=mobs,
+        jac=(idx, vals, (n, ntheta)),
+        jac_params=["t0", "t1", "t2"],
+        **common,
     )
     assert t_jac.param_names == ["k", "t0", "t1", "t2"], t_jac.param_names
     t_ref = unbinned.MassCFTerm(
@@ -567,8 +606,10 @@ def test_jacobian_rows():
     v_ref = float(t_ref.nll(tf.constant([1.0], tf.float64)).numpy())
     rel = abs(v_jac - v_ref) / max(abs(v_ref), 1.0)
     ok = rel < 1e-12
-    print(f"  NLL with D contraction {v_jac:.9f} vs pre-shifted {v_ref:.9f} "
-          f"(rel {rel:.2e})")
+    print(
+        f"  NLL with D contraction {v_jac:.9f} vs pre-shifted {v_ref:.9f} "
+        f"(rel {rel:.2e})"
+    )
 
     # the gradient w.r.t. theta must be the sum of the per-candidate rows
     x = tf.constant([1.0, *theta], tf.float64)
@@ -594,26 +635,121 @@ def test_jacobian_rows():
 
 
 # ---------------------------------------------------------------------------
+# 7. two channels in one datacard, sharing parameters
+# ---------------------------------------------------------------------------
+def test_two_channels(args, card):
+    """Split one term's candidates into two terms sharing the same parameters.
+
+    This is the multi-channel case of the design (several resonance channels in
+    one likelihood, tied together by common parameters) reduced to something
+    with a known answer: the sum of the two terms' NLL must equal the single
+    term's, and the fit must land on the same minimum. It also exercises the
+    ``phik_grid`` storage variant (the already-interpolated per-candidate
+    kernel CF) and the merging of parameter declarations across terms in
+    UnbinnedParams.
+    """
+    print("\n=== 7. two unbinned terms in one datacard, shared parameters ===")
+    from rabbit import tensorwriter
+
+    f1 = make_fitter(card)
+    term = f1.indata.unbinned_terms[0]
+    names = list(f1.parms.astype(str))
+    n = term.n
+    half = n // 2
+
+    def sub(sl):
+        d = {
+            "sigma": term.sigma.numpy()[sl],
+            "mobs": term.mobs.numpy()[sl],
+            "vgf": term.vgf.numpy()[sl],
+            "tgrid": term.tgrid.numpy(),
+            "phik_grid_re": term.phik_re.numpy()[sl],
+            "phik_grid_im": term.phik_im.numpy()[sl],
+        }
+        for fam in term.families:
+            for comp in ("re", "im"):
+                if comp in fam:
+                    d[f"S_{comp}_{fam['name']}"] = fam[comp].numpy()[sl]
+        return d
+
+    writer = tensorwriter.TensorWriter()
+    writer.add_dummy_channel(name="dummy")
+    cfg = term.config()
+    for label, sl in (("first", slice(0, half)), ("second", slice(half, n))):
+        c = dict(cfg)
+        c["channel"] = label
+        writer.add_unbinned_term(
+            label,
+            c,
+            term.param_names,
+            sub(sl),
+            param_defaults=term.param_defaults,
+            param_is_poi=term.param_is_poi,
+        )
+    out = os.path.join(args.workdir, f"unbinned_{args.tag}_twoterm.hdf5")
+    if os.path.exists(out):
+        os.remove(out)
+    writer.write(outfolder=os.path.dirname(out),
+                 outfilename=os.path.basename(out)[: -len(".hdf5")])
+
+    f2 = make_fitter(out)
+    assert list(f2.parms.astype(str)) == names, (f2.parms, names)
+    print(f"  {len(f2.indata.unbinned_terms)} terms, "
+          f"{[t.n for t in f2.indata.unbinned_terms]} candidates, "
+          f"shared parameters {names}")
+
+    ok = True
+    rng = np.random.default_rng(4)
+    for k in range(3):
+        x = f1.x.numpy() + rng.normal(0.0, 0.02, len(names))
+        v1, v2 = loss_at(f1, x), loss_at(f2, x)
+        rel = abs(v1 - v2) / max(abs(v1), 1.0)
+        ok &= rel < 1e-12
+        print(f"    NLL(one term) {v1:.9f}  NLL(two terms) {v2:.9f}  "
+              f"rel {rel:.2e}")
+
+    f1.minimize()
+    f2.minimize()
+    x1, x2 = f1.x.numpy(), f2.x.numpy()
+    c1, _ = cov_from_fitter(f1)
+    e1 = np.sqrt(np.diag(c1))
+    for i, nm in enumerate(names):
+        d = abs(x1[i] - x2[i]) / max(e1[i], 1e-12)
+        ok &= d < 1e-4
+        print(f"    {nm:>10s}: {x1[i]:.6f} (1 term) vs {x2[i]:.6f} (2 terms)  "
+              f"d = {d:.1e} sigma")
+    print("  PASS" if ok else "  FAIL")
+    return ok
+
+
+# ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--full", action="store_true",
-                   help="use the complete caches and compare against the "
-                        "published step-1 numbers")
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help="use the complete caches and compare against the "
+        "published step-1 numbers",
+    )
     p.add_argument("--pairs-cache", default=GUN_PAIRS)
     p.add_argument("--kernel-cache", default=GUN_KERNEL)
-    p.add_argument("--workdir", default=None,
-                   help="where the datacards are built (default: a temporary "
-                        "directory; give a path to reuse them between runs)")
+    p.add_argument(
+        "--workdir",
+        default=None,
+        help="where the datacards are built (default: a temporary "
+        "directory; give a path to reuse them between runs)",
+    )
     p.add_argument("--maxn", type=int, default=20000)
     p.add_argument("--maxk", type=int, default=20000)
     p.add_argument("--phik-points", type=int, default=2048)
     p.add_argument("--chunk", type=int, default=8192)
     p.add_argument("--minimizer", default="trust-exact")
     p.add_argument("--threads", type=int, default=32)
-    p.add_argument("--only", default=None,
-                   help="comma separated subset of tests to run (1..6)")
+    p.add_argument(
+        "--only", default=None, help="comma separated subset of tests to run (1..6)"
+    )
     return p.parse_args()
 
 
@@ -633,25 +769,33 @@ def main():
     os.makedirs(args.workdir, exist_ok=True)
     print(f"work directory {args.workdir}")
 
-    which = set(args.only.split(",")) if args.only else {"1", "2", "3", "4", "5", "6"}
+    which = (
+        set(args.only.split(","))
+        if args.only
+        else {"1", "2", "3", "4", "5", "6", "7"}
+    )
     results = {}
 
-    if which & {"1", "2", "3"}:
+    if which & {"1", "2", "3", "7"}:
         cards = {}
         for model in ("families", "r"):
             cards[model] = build_card(
-                args, model,
+                args,
+                model,
                 os.path.join(args.workdir, f"unbinned_{args.tag}_{model}.hdf5"),
             )
         if "1" in which:
             results["1 identity (families)"] = test_identity(
-                args, cards["families"], "families")
+                args, cards["families"], "families"
+            )
             results["1 identity (r)"] = test_identity(args, cards["r"], "r")
         if "2" in which:
             results["2 gradient"] = test_gradient(args, cards["families"])
         if "3" in which:
             results["3 fit (families)"] = test_fit(args, cards["families"], "families")
             results["3 fit (r)"] = test_fit(args, cards["r"], "r")
+        if "7" in which:
+            results["7 two channels"] = test_two_channels(args, cards["families"])
     if "4" in which:
         results["4 breit-wigner"] = test_breit_wigner(args)
     if "5" in which:

@@ -85,6 +85,23 @@ Built-in models:
 - `ExtendedABCD`: 6-region ABCD using two sideband bins in the x direction (Ax, Bx further from signal, A/B in the middle). Fake rate is log-linearly extrapolated: `D = C·Ax·B² / (Bx·A²)`. `npoi=0`, `npou=5·n_bins`. CLI: `--paramModel ExtendedABCD <process> <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] <ch_A> [ax:val ...] <ch_B> [ax:val ...] <ch_C> [ax:val ...] <ch_D> [ax:val ...]`.
 - `SmoothExtendedABCD`: like `ExtendedABCD` but all five free-parameter regions (A, B, C, Ax, Bx) are parameterised with an exponential Chebyshev polynomial along one smoothing axis (same basis as `SmoothABCD`). `npoi=0`, `npou=5·n_outer·(order+1)`. CLI: `--paramModel SmoothExtendedABCD <axis> [params:<src> | order:N] <process> <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] <ch_A> [ax:val ...] <ch_B> [ax:val ...] <ch_C> [ax:val ...] <ch_D> [ax:val ...]`. `params:aux:<name>` reads initial coefficients and order from an auxiliary bundle of the input file, `params:<file.hdf5>` from a standalone file. `SmoothExtendedABCDIsoMT` falls back to the bundle `initial_params_SmoothExtendedABCDIsoMT_<process>_<channel>` when neither token is given.
 
+### Unbinned terms: `rabbit/unbinned.py`
+Additive `-sum_i log L_i(x)` contributions over *candidates* rather than bins,
+evaluated inside the same `tf.function` as the binned likelihood (so gradient,
+Hessian and HVP come from the existing tapes). `UnbinnedTerm` is the base class
+(`param_names` + `nll(params)`); `MassCFTerm` is the CVH mass likelihood built
+from characteristic functions, with pluggable `PhysicsKernel`
+(`DeltaKernel` / `BreitWignerKernel` / `TabulatedLineshapeKernel`) and
+`BackgroundPdf` (`UniformBackground` / `BernsteinBackground`) components, a
+data-driven list of resolution *families*, and an optional sparse
+`m_i(theta) = m_i^0 + D_i theta` hook. Written with
+`TensorWriter.add_unbinned_term`, read as `FitInputData.unbinned_terms`,
+declared to the fit by the `UnbinnedParams` param model. `Fitter` builds them
+next to the external terms, adds them in `_compute_nll`, and forces
+`is_linear = False` / `jit_compile = False` when they are present. See the
+module docstring for the schema and `tests/test_unbinned_mass.py` for the
+validation against the standalone reference implementation.
+
 ### Auxiliary data: `rabbit/auxiliary.py`
 `TensorWriter.add_auxiliary(name, datasets)` stores a named bundle of arbitrary arrays (numeric ndarrays and/or 1-D string lists) under a top-level `auxiliary` HDF5 group, exposed on the read side as `FitInputData.auxiliary[name]`. It is not used by the fit itself; it is a side channel for param models to carry pre-computed inputs that must stay consistent with the datacard.
 

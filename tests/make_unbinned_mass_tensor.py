@@ -86,7 +86,9 @@ def parse_args():
     )
     p.add_argument("--mref", type=float, default=MJPSI, help="reference mass [GeV]")
     p.add_argument("--window", type=float, default=MWIN, help="mass window [GeV]")
-    p.add_argument("--maxn", type=int, default=0, help="use only the first N candidates")
+    p.add_argument(
+        "--maxn", type=int, default=0, help="use only the first N candidates"
+    )
     p.add_argument(
         "--maxk",
         type=int,
@@ -255,8 +257,14 @@ def main():
         mobs=mobs,
         tgrid=tgrid,
         families=[
-            dict(f, **{c: datasets[f"S_{c}_{f['name']}"] for c in ("re", "im")
-                       if f"S_{c}_{f['name']}" in datasets})
+            dict(
+                f,
+                **{
+                    c: datasets[f"S_{c}_{f['name']}"]
+                    for c in ("re", "im")
+                    if f"S_{c}_{f['name']}" in datasets
+                },
+            )
             for f in families
         ],
         vgf=vgf,

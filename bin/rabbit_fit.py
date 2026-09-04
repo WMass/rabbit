@@ -708,7 +708,20 @@ def fit(args, fitter, ws, dofit=True):
         - fitter.indata.nsystnoconstraint
     ).numpy()
 
-    chi2_val = 2.0 * nllvalreduced
+    # 2 * nllvalreduced is a saturated chi2 only for the *binned* likelihood,
+    # whose reduced form carries the offset that makes it vanish at the
+    # saturated model. An unbinned term has no such offset (it is a plain
+    # -sum log density), so it is removed from the test statistic here; its
+    # parameters are still counted in ndfsat, so with unbinned terms the
+    # number quoted is the binned goodness of fit at a reduced ndof.
+    nll_unbinned = 0.0
+    if getattr(fitter, "unbinned_terms", []):
+        nll_unbinned = float(fitter._compute_unbinned_nll().numpy())
+        logger.info(
+            f"Unbinned likelihood terms contribute {nll_unbinned:.6f} to the "
+            "NLL; the saturated chi2 below is for the binned likelihood only"
+        )
+    chi2_val = 2.0 * (nllvalreduced - nll_unbinned)
     p_val = chi2.sf(chi2_val, ndfsat)
 
     logger.info("Saturated chi2:")

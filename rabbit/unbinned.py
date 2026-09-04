@@ -199,9 +199,7 @@ class BreitWignerKernel(PhysicsKernel):
         self.mass_param = mass_param
         self.width_unit = float(width_unit)
         self.mass_unit = float(mass_unit)
-        self.param_names = tuple(
-            p for p in (mass_param, width_param) if p is not None
-        )
+        self.param_names = tuple(p for p in (mass_param, width_param) if p is not None)
 
     def log_cf(self, values, t_abs):
         gamma = values[self.width_param] * self.width_unit
@@ -795,9 +793,7 @@ class MassCFTerm(UnbinnedTerm):
         if fb is None:
             total = lp
         else:
-            bkg = self.background.pdf(
-                values, self.mobs[lo:hi] + self.npdt(self.m_ref)
-            )
+            bkg = self.background.pdf(values, self.mobs[lo:hi] + self.npdt(self.m_ref))
             total = (tf.constant(1.0, dtype) - fb) * lp + fb * bkg
 
         logl = tf.math.log(total)
@@ -828,7 +824,6 @@ class MassCFTerm(UnbinnedTerm):
         return tf.concat(
             [self._chunk_li(values, ci) for ci in range(self.nchunk)], axis=0
         )
-
 
     def config(self):
         """JSON-serialisable structural description (written to the datacard)."""
@@ -922,8 +917,11 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
         if kind not in _TERM_KINDS:
             raise RuntimeError(f"unknown unbinned term kind '{kind}' for '{name}'")
         params = _read_str(g["params"])
-        data = {k: np.asarray(maketensor(g[k])) for k in g.keys() if k not in
-                ("config", "params")}
+        data = {
+            k: np.asarray(maketensor(g[k]))
+            for k in g.keys()
+            if k not in ("config", "params")
+        }
 
         families = []
         for fam in cfg.pop("families"):

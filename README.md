@@ -191,6 +191,61 @@ auxiliary bundle `initial_params_SmoothExtendedABCDIsoMT_<process>_<channel>` an
 it if the datacard carries one, so the tool that writes the datacard can ship starting
 values that are guaranteed to match its binning.
 
+### Unbinned likelihood terms
+
+Besides the binned likelihood and the quadratic
+[external terms](rabbit/external_likelihood.py), the fit can contain
+**unbinned terms**: additive `- sum_i log L_i(x)` contributions evaluated over
+*candidates* instead of bins. A term is a differentiable TF function of a named
+slice of the fit parameter vector, so the minimizer, covariance, impacts and
+likelihood scans all work through the existing machinery.
+
+The implementation lives in `rabbit/unbinned.py`; see its module docstring for
+the physics, the class layout and the on-disk schema. The concrete term is
+`MassCFTerm`, the CVH per-candidate mass likelihood: the inverse Fourier
+transform of a product of characteristic functions (a constant kernel CF, a
+physics kernel for the resonance lineshape, and a per-candidate resolution CF
+built from a data-driven list of *families*, each with its own free scale),
+mixed with an analytic background pdf. Available pieces:
+
+* physics kernels: `DeltaKernel` (zero width), `BreitWignerKernel` (analytic
+  CF `exp(i m t - Gamma |t| / 2)`), `TabulatedLineshapeKernel` (interface for a
+  numerical Z/gamma* lineshape CF);
+* backgrounds: `UniformBackground`, `BernsteinBackground` (normalised on the
+  fit window, non-negative by construction);
+* an optional sparse per-candidate dependence on global parameters,
+  `m_i(theta) = m_i^0 + D_i theta`, for the CVH track-fit Jacobian rows.
+
+Terms are written into the datacard with
+`TensorWriter.add_unbinned_term(name, config, params, datasets, ...)` and read
+back as `FitInputData.unbinned_terms`. Their parameters (name, starting value,
+Gaussian prior, POI flag) travel with them and are declared to the fit by the
+`UnbinnedParams` param model:
+
+```bash
+rabbit_fit.py mass.hdf5 -o results/ -t 0 --paramModel UnbinnedParams \
+    --minimizerMethod trust-exact --doImpacts --scan alpha
+```
+
+A fit made only of unbinned terms still needs the binned inputs `FitInputData`
+requires; `TensorWriter.add_dummy_channel()` adds a 1-bin, zero-variance
+Asimov channel whose Poisson term is a parameter-independent constant.
+
+`tests/make_unbinned_mass_tensor.py` converts the CVH `cf_masspairs` /
+`cf_masskernel` caches into such a datacard, and `tests/test_unbinned_mass.py`
+validates the term against the standalone reference implementation.
+
+Notes:
+* the likelihood is never linear when an unbinned term is present, so the
+  Cholesky shortcut of `Fitter.minimize()` is disabled and `jitCompile` defaults
+  to off (the per-candidate `(n, nt)` blocks are large constants that XLA clones
+  per fusion);
+* `-t 0` (fit to data) is the meaningful mode. Toys and the Asimov dataset
+  randomize/replace the *binned* observation only; the candidates are the data;
+* the saturated chi2 is a binned goodness-of-fit; with unbinned terms present
+  `rabbit_fit.py` subtracts their NLL from it (its ndof still counts all
+  ParamModel parameters).
+
 ### Auxiliary data
 
 `TensorWriter.add_auxiliary(name, {key: array | list[str]})` stores a named bundle of
