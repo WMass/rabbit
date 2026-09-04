@@ -11,6 +11,7 @@ from tensorflow.python.ops.linalg.sparse import sparse_csr_matrix_ops as tf_spar
 from wums import logging
 
 from rabbit import external_likelihood, io_tools
+from rabbit import unbinned as unbinned_terms_mod
 from rabbit import preconditioner as precond
 from rabbit import tfhelpers as tfh
 from rabbit.bbstat.bbstat import BinByBinStat
@@ -121,6 +122,7 @@ class Fitter:
             raise ValueError(
                 f"jitCompile must be one of 'auto', 'on', 'off'; got {_jit_opt!r}"
             )
+        _has_unbinned = bool(getattr(self.indata, "unbinned_terms", []))
         if _jit_opt == "off":
             self.jit_compile = False
         elif _jit_opt == "on":
@@ -131,10 +133,18 @@ class Fitter:
                     "sparse mode, so jit_compile will be disabled."
                 )
                 self.jit_compile = False
+            elif _has_unbinned:
+                logger.warning(
+                    "--jitCompile=on requested but the input has unbinned "
+                    "likelihood terms; their per-candidate (n x nt) blocks "
+                    "are large constants that XLA clones per fusion, so "
+                    "jit_compile will be disabled."
+                )
+                self.jit_compile = False
             else:
                 self.jit_compile = True
         else:  # "auto"
-            self.jit_compile = not self.indata.sparse
+            self.jit_compile = not self.indata.sparse and not _has_unbinned
         # When --noHessian is requested the postfit Hessian is never
         # computed, so the dense [npar, npar] covariance matrix should
         # not be allocated. self.cov is set to None in that case and
@@ -411,6 +421,15 @@ class Fitter:
             self.indata.dtype,
         )
 
+        # Unbinned likelihood terms (per-candidate -sum log L contributions).
+        # The term objects are built by FitInputData (they own large constant
+        # tensors); here only their parameter names are resolved against the
+        # fit parameter vector. See rabbit.unbinned.
+        self.unbinned_terms = unbinned_terms_mod.build_tf_unbinned_terms(
+            getattr(self.indata, "unbinned_terms", []),
+            self.parms,
+        )
+
         # for freezing parameters
         self.frozen_params = []
         self.frozen_params_mask = tf.Variable(
@@ -425,13 +444,23 @@ class Fitter:
         # quadratic-solver path; the user is responsible for ensuring the
         # resulting Gaussian step is meaningful (e.g. via an outer iteration
         # that re-anchors the linearization point).
+        # An unbinned term is never quadratic in the parameters, so the
+        # single-Cholesky-step shortcut below would return a Gaussian step
+        # from the starting point rather than the minimum.
         self.is_linear = self.force_linear or (
             (self.chisqFit or self.covarianceFit)
             and self.param_model.is_linear
             and self.indata.symmetric_tensor
             and self.indata.systematic_type == "normal"
             and self.bbstat.is_linear
+            and not self.unbinned_terms
         )
+        if self.force_linear and self.unbinned_terms:
+            logger.warning(
+                "--forceLinear with unbinned likelihood terms: the unbinned "
+                "NLL is not quadratic, so the single Gaussian step is only a "
+                "linearization of it around the current point."
+            )
         if self.force_linear:
             logger.info(
                 "--forceLinear set: solving by a single Gaussian (Cholesky / "
@@ -2112,6 +2141,19 @@ class Fitter:
             self.external_terms, self.x, self.indata.dtype, full_nll=full_nll
         )
 
+    def _compute_unbinned_nll(self, full_nll=False):
+        """Sum of the unbinned likelihood terms' contributions.
+
+        Each term contributes ``- sum_i log L_i`` over its own candidates,
+        evaluated at the *effective* parameter vector ``get_x()`` (not the raw
+        ``self.x``) so that frozen parameters really are frozen -- likelihood
+        scans and contour scans rely on the ``stop_gradient`` that ``get_x``
+        applies. See :mod:`rabbit.unbinned`.
+        """
+        return unbinned_terms_mod.compute_unbinned_nll(
+            self.unbinned_terms, self.get_x(), self.indata.dtype, full_nll=full_nll
+        )
+
     def _compute_nll(self, profile=True, full_nll=False):
         ln, lc, lbeta, lpenalty, beta = self._compute_nll_components(
             profile=profile, full_nll=full_nll
@@ -2127,6 +2169,10 @@ class Fitter:
         lext = self._compute_external_nll(full_nll=full_nll)
         if lext is not None:
             l = l + lext
+
+        lunb = self._compute_unbinned_nll(full_nll=full_nll)
+        if lunb is not None:
+            l = l + lunb
         return l
 
     def _compute_loss(self, profile=True):

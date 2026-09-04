@@ -199,6 +199,16 @@ class FitInputData:
 
             self.external_terms = read_external_terms_from_h5(f.get("external_terms"))
 
+            # Load unbinned likelihood terms (optional). Unlike external
+            # terms these are constructed here rather than in the Fitter:
+            # they own large constant tensors and the Fitter only needs to
+            # resolve their parameter names. See rabbit.unbinned.
+            from rabbit.unbinned import read_unbinned_terms_from_h5
+
+            self.unbinned_terms = read_unbinned_terms_from_h5(
+                f.get("unbinned_terms"), dtype=self.dtype
+            )
+
             # Load generic auxiliary array bundles (optional). See rabbit.auxiliary.
             from rabbit.auxiliary import read_auxiliary_from_h5
 
