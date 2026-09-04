@@ -113,16 +113,16 @@ which reads the declarations above straight out of the datacard.
 """
 
 import json
-import logging
 import math
 
 import numpy as np
 import tensorflow as tf
+from wums import logging
 
 from rabbit import h5pyutils_write
 from rabbit.h5pyutils_read import maketensor
 
-logger = logging.getLogger(__name__)
+logger = logging.child_logger(__name__)
 
 # Default preconditioning units, see module docstring.
 ALPHA_UNIT = 1e-3
