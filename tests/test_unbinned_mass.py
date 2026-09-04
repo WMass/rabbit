@@ -156,11 +156,36 @@ def build_card(args, model, outfile, extra=()):
     return outfile
 
 
+def reference_families(term):
+    """``{name: family}`` if the reference implementation knows this family set.
+
+    ``cf_masslik_fit`` hard-codes the hit / ms / ioni split, optionally plus a
+    radiative family; a cache with any other family cannot be compared against
+    it, and the caller skips.
+    """
+    fams = {f["name"]: f for f in term.families}
+    if not {"hit", "ms", "ioni"} <= set(fams):
+        return None
+    if set(fams) - {"hit", "ms", "ioni", "rad"}:
+        return None
+    return fams
+
+
+def reference_order(term, model):
+    """Parameter order of ``cf_masslik_fit.MassNLL`` for this term."""
+    if model == "r":
+        return ["alpha", "r"]
+    order = ["alpha", "k_hit", "k_ms", "k_ioni"]
+    if any(f["name"] == "rad" for f in term.families):
+        order.append("k_rad")
+    return order
+
+
 def reference_objective(term, model, float_bkg=False):
     """A ``cf_masslik_fit.MassNLL`` fed from the term's own arrays."""
     import cf_masslik_fit
 
-    fams = {f["name"]: f for f in term.families}
+    fams = reference_families(term)
     inp = dict(
         n=term.n,
         TG=term.tgrid.numpy(),
@@ -174,6 +199,17 @@ def reference_objective(term, model, float_bkg=False):
         phiK_im=term.phik_im.numpy(),
         folded=False,
     )
+    kwargs = {}
+    if "rad" in fams:
+        # the radiative family the parallel step-1 work adds: MassNLL picks it
+        # up from has_rad and puts k_rad after k_ioni (and shares the single r
+        # with every family in the 'r' model), which is the layout the
+        # converter writes.
+        inp["Srad_re"] = fams["rad"]["re"].numpy()
+        inp["Srad_im"] = fams["rad"]["im"].numpy()
+        inp["has_rad"] = True
+        if model != "r":
+            kwargs["float_krad"] = True
     return cf_masslik_fit.MassNLL(
         inp,
         model=model,
@@ -183,6 +219,7 @@ def reference_objective(term, model, float_bkg=False):
         chunk=term.chunk,
         fbkg0=term.bkg_frac,
         log=lambda *a: None,
+        **kwargs,
     )
 
 
@@ -201,10 +238,11 @@ def test_identity(args, card, model):
     term = f.indata.unbinned_terms[0]
     names = list(f.parms.astype(str))
     print(f"  fit parameters: {names}")
-    if not {"ms", "ioni"} <= {fam["name"] for fam in term.families}:
+    if reference_families(term) is None:
         print(
-            "  SKIP: the cache does not have exactly the hit/ms/ioni families "
-            "the reference implementation knows about"
+            "  SKIP: the reference implementation only knows the "
+            "hit/ms/ioni(/rad) families; this cache has "
+            f"{[fam['name'] for fam in term.families]}"
         )
         return True
 
@@ -214,21 +252,19 @@ def test_identity(args, card, model):
         print(f"  SKIP: cf_masslik_fit not importable (add {REF_DIR} to PYTHONPATH)")
         return True
 
-    # the reference parameter order is [alpha, r] / [alpha, k_hit, k_ms, k_ioni]
-    ref_order = ["alpha", "r"] if model == "r" else ["alpha", "k_hit", "k_ms", "k_ioni"]
+    ref_order = reference_order(term, model)
     perm = [names.index(p) for p in ref_order]
 
     rng = np.random.default_rng(7)
+    npar = len(ref_order)
     points = [
-        [0.0] + [1.0] * (len(ref_order) - 1),
-        [0.2] + [1.0] * (len(ref_order) - 1),
-        [0.25, 0.94, 1.01, 0.69][: len(ref_order)],
-        [-0.4] + [0.9] * (len(ref_order) - 1),
-        [1.3] + [1.1] * (len(ref_order) - 1),
+        [0.0] + [1.0] * (npar - 1),
+        [0.2] + [1.0] * (npar - 1),
+        ([0.25, 0.94, 1.01, 0.69, 1.05] + [1.0] * npar)[:npar],
+        [-0.4] + [0.9] * (npar - 1),
+        [1.3] + [1.1] * (npar - 1),
     ]
-    points += [
-        list(rng.normal([0.2] + [1.0] * (len(ref_order) - 1), 0.05)) for _ in range(3)
-    ]
+    points += [list(rng.normal([0.2] + [1.0] * (npar - 1), 0.05)) for _ in range(3)]
 
     ok = True
     print(f"  {'point':>34s} {'rabbit NLL':>18s} {'reference':>18s} {'rel':>10s}")
@@ -326,10 +362,14 @@ def test_fit(args, card, model):
             print("  SKIP reference comparison: cf_masslik_fit not importable")
             return ok
         term = f.indata.unbinned_terms[0]
+        if reference_families(term) is None:
+            print(
+                "  SKIP reference comparison: unsupported family set "
+                f"{[fam['name'] for fam in term.families]}"
+            )
+            return ok
         obj = reference_objective(term, model)
-        ref_order = (
-            ["alpha", "r"] if model == "r" else ["alpha", "k_hit", "k_ms", "k_ioni"]
-        )
+        ref_order = reference_order(term, model)
         x0 = [0.2] + [1.0] * (len(ref_order) - 1)
         res = cf_masslik_fit.minimize(
             obj, x0, method="trust-exact", log=lambda *a: None
@@ -692,14 +732,18 @@ def test_two_channels(args, card):
     out = os.path.join(args.workdir, f"unbinned_{args.tag}_twoterm.hdf5")
     if os.path.exists(out):
         os.remove(out)
-    writer.write(outfolder=os.path.dirname(out),
-                 outfilename=os.path.basename(out)[: -len(".hdf5")])
+    writer.write(
+        outfolder=os.path.dirname(out),
+        outfilename=os.path.basename(out)[: -len(".hdf5")],
+    )
 
     f2 = make_fitter(out)
     assert list(f2.parms.astype(str)) == names, (f2.parms, names)
-    print(f"  {len(f2.indata.unbinned_terms)} terms, "
-          f"{[t.n for t in f2.indata.unbinned_terms]} candidates, "
-          f"shared parameters {names}")
+    print(
+        f"  {len(f2.indata.unbinned_terms)} terms, "
+        f"{[t.n for t in f2.indata.unbinned_terms]} candidates, "
+        f"shared parameters {names}"
+    )
 
     ok = True
     rng = np.random.default_rng(4)
@@ -708,8 +752,7 @@ def test_two_channels(args, card):
         v1, v2 = loss_at(f1, x), loss_at(f2, x)
         rel = abs(v1 - v2) / max(abs(v1), 1.0)
         ok &= rel < 1e-12
-        print(f"    NLL(one term) {v1:.9f}  NLL(two terms) {v2:.9f}  "
-              f"rel {rel:.2e}")
+        print(f"    NLL(one term) {v1:.9f}  NLL(two terms) {v2:.9f}  " f"rel {rel:.2e}")
 
     f1.minimize()
     f2.minimize()
@@ -719,8 +762,10 @@ def test_two_channels(args, card):
     for i, nm in enumerate(names):
         d = abs(x1[i] - x2[i]) / max(e1[i], 1e-12)
         ok &= d < 1e-4
-        print(f"    {nm:>10s}: {x1[i]:.6f} (1 term) vs {x2[i]:.6f} (2 terms)  "
-              f"d = {d:.1e} sigma")
+        print(
+            f"    {nm:>10s}: {x1[i]:.6f} (1 term) vs {x2[i]:.6f} (2 terms)  "
+            f"d = {d:.1e} sigma"
+        )
     print("  PASS" if ok else "  FAIL")
     return ok
 
@@ -740,18 +785,20 @@ def test_priors(args):
     print("\n=== 8. Gaussian prior on an unbinned parameter ===")
     mu, sigma = 1.0, 0.005
     card = build_card(
-        args, "families",
+        args,
+        "families",
         os.path.join(args.workdir, f"unbinned_{args.tag}_prior.hdf5"),
         extra=["--prior", f"k_ms:{mu}:{sigma}"],
     )
-    f0 = make_fitter(
-        os.path.join(args.workdir, f"unbinned_{args.tag}_families.hdf5"))
+    f0 = make_fitter(os.path.join(args.workdir, f"unbinned_{args.tag}_families.hdf5"))
     f1 = make_fitter(card)
     names = list(f1.parms.astype(str))
     i = names.index("k_ms")
-    print(f"  prior on k_ms: mu = {mu}, sigma = {sigma}; "
-          f"constraint weight = {f1.cw.numpy()[i]:.1f} (1/sigma^2 = "
-          f"{1/sigma**2:.1f})")
+    print(
+        f"  prior on k_ms: mu = {mu}, sigma = {sigma}; "
+        f"constraint weight = {f1.cw.numpy()[i]:.1f} (1/sigma^2 = "
+        f"{1/sigma**2:.1f})"
+    )
     ok = abs(f1.cw.numpy()[i] - 1.0 / sigma**2) < 1e-6
 
     rng = np.random.default_rng(9)
@@ -761,16 +808,19 @@ def test_priors(args):
         expect = 0.5 * ((x[i] - mu) / sigma) ** 2
         rel = abs(d - expect) / max(abs(expect), 1e-12)
         ok &= rel < 1e-9
-        print(f"    dNLL(prior) = {d:14.6f}  expected {expect:14.6f}  "
-              f"rel {rel:.2e}")
+        print(
+            f"    dNLL(prior) = {d:14.6f}  expected {expect:14.6f}  " f"rel {rel:.2e}"
+        )
 
     f0.minimize()
     f1.minimize()
     e0 = np.sqrt(np.diag(cov_from_fitter(f0)[0]))[i]
     e1 = np.sqrt(np.diag(cov_from_fitter(f1)[0]))[i]
     ok &= e1 < e0 and e1 < sigma
-    print(f"    k_ms = {f0.x.numpy()[i]:.6f} +- {e0:.6f} (free) -> "
-          f"{f1.x.numpy()[i]:.6f} +- {e1:.6f} (priored)")
+    print(
+        f"    k_ms = {f0.x.numpy()[i]:.6f} +- {e0:.6f} (free) -> "
+        f"{f1.x.numpy()[i]:.6f} +- {e1:.6f} (priored)"
+    )
     print("  PASS" if ok else "  FAIL")
     return ok
 
