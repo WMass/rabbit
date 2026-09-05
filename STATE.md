@@ -272,6 +272,48 @@ python /work/submit/david_w/ZMass/rabbit-zlineshape/rabbit/lineshapes/make_lumi_
 * `tau_max=40` is generous: a Z term with `sigma >= 1 GeV` and `tmax = 8` needs
   only 8 GeV^-1. Lowering it shrinks the tabulation but not the gather cost.
 
+## Follow-up: the truncated likelihood (`norm_window`), commit `93f74f4`
+
+The last section's *"a mass window on `m_obs`* needs the truncated-likelihood
+normalisation" is now done, in `MassCFTerm` itself rather than around it.
+
+`norm_window=(lo, hi)` divides the density by its own integral over the window,
+`L_i -> L_i / Z_i`, which is the correct likelihood for a sample *selected* in
+that window. `Z` is evaluated on a mass grid for a handful of resolution
+*classes* (`norm={"sigma", "vgf", "class", "families"}`, `norm_nodes` grid
+points) and gathered per candidate; the datasets round-trip through the
+datacard as `norm_sigma` / `norm_vgf` / `norm_class` / `S_<c>_<f>_norm`.
+
+Why a mass grid and not the Fourier identity
+`Z = (1/pi) Int Im[phi(u)(e^{-iu d_lo} - e^{-iu d_hi})]/u du`: that integrand
+oscillates at the window *half-width* (~30 GeV for a Z), needing a `t` grid an
+order of magnitude finer than the density itself does -- and the family
+exponents only exist on the term's own `tgrid`.
+
+`_chunk_li` was split into a reusable `_density()` so the normalisation runs
+the identical model; the per-candidate path is untouched.
+
+`tests/test_unbinned_norm.py`, all five pass:
+
+| test | result |
+|---|---|
+| 1 Gaussian `Z` vs the error function | PASS -- 2.9e-7 at 1025 nodes (the O(h^2) mass quadrature), `Z` in 0.60-0.99 on a +-2 GeV window |
+| 2 convergence in `norm_nodes` | PASS -- 257 vs 4097 nodes agree to 2.9e-7 relative on a Voigt over 60-120 GeV |
+| 3 cost of the class approximation | PASS -- exact to 2e-16 at 16 classes for a +-30 GeV window; 1.6e-2 at 32 classes when the edge sits 1-4 sigma away |
+| 4 vs the hand-rolled `- sum log L + n log Z` | PASS -- NLL 2e-16, gradient 1.6e-14 |
+| 5 closure on a truncated Voigt | PASS -- see below |
+
+Test 5 is the reason this exists. 400k Voigt candidates cut to 60-120 GeV,
+only **2.67 %** outside:
+
+| | `k_res` | `Gamma` [MeV] | pull on `Gamma` |
+|---|---|---|---|
+| with `norm_window` | 1.00620 +- 0.01356 | 2483.79 +- 11.44 | **-0.8** |
+| without | 1.45564 +- 0.01422 | 2014.65 +- 9.82 | **-48.7** |
+
+i.e. a 2.7 % truncation, ignored, costs 479 MeV on the width and 46 % on the
+resolution scale.
+
 ## What a data Z channel still needs
 
 * **FSR kernel** — `phi_K` tabulated from the generator
@@ -291,7 +333,8 @@ python /work/submit/david_w/ZMass/rabbit-zlineshape/rabbit/lineshapes/make_lumi_
 * **Theory nuisances** — PDF (regenerate the table per replica/eigenvector and
   add a luminosity-shape nuisance), EW corrections, the running-vs-fixed width
   convention, running alpha and sin^2.
-* **A mass window on `m_obs`** needs the truncated-likelihood normalisation.
+* ~~A mass window on `m_obs` needs the truncated-likelihood normalisation.~~
+  Done -- `norm_window`, see the section above.
 * `m_Z` and the momentum-scale parameter `alpha` are exactly degenerate in a
   single-resonance fit — a Z channel measures `m_Z` only jointly with the
   J/psi (or another) channel that pins the scale.
