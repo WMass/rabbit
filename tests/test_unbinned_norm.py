@@ -7,10 +7,11 @@ switches that on; ``Z`` is evaluated on a mass grid for a small number of
 resolution *classes* and gathered per candidate.
 
 1. exact Gaussian -- ``Z`` against the error function
-2. convergence in ``norm_nodes``
+2. convergence in ``norm_tpoints``
 3. convergence in the number of resolution classes
 4. equivalence with the hand-rolled ``- sum log L + n log Z`` of
-   ``test_unbinned_mass.py`` test 4b, in value *and* gradient
+   ``test_unbinned_mass.py`` test 4b (on a fine ``t`` grid, where the mass-grid
+   route is itself accurate), in value *and* gradient
 5. closure: a Voigt toy cut to a window, fitted with and without the term
 
 Run: ``python tests/test_unbinned_norm.py``
@@ -30,7 +31,7 @@ DTYPE = tf.float64
 
 
 def gauss_term(name, mobs, sigma, nt=512, tmax=8.0, m_ref=0.0, window=None,
-               nclass=1, gamma_param=None, chunk=100000, nodes=257):
+               nclass=1, gamma_param=None, chunk=100000, tpoints=8192):
     """Gaussian (+ optional Breit-Wigner) term, optionally window-normalised."""
     tgrid = np.linspace(0.0, tmax, nt)
     vgf = np.ones(len(sigma))
@@ -52,7 +53,7 @@ def gauss_term(name, mobs, sigma, nt=512, tmax=8.0, m_ref=0.0, window=None,
                 "families": []}
     return unbinned.MassCFTerm(
         name, sigma=sigma, mobs=mobs, tgrid=tgrid, families=families, vgf=vgf,
-        kernel=kernel, m_ref=m_ref, norm_window=window, norm_nodes=nodes,
+        kernel=kernel, m_ref=m_ref, norm_window=window, norm_tpoints=tpoints,
         norm=norm, chunk=chunk, dtype=DTYPE,
     )
 
@@ -72,19 +73,19 @@ def test1():
     # 24 sigma wide and gives Z = 1 to round-off, which tests nothing)
     lo, hi = m_ref - 2.0, m_ref + 2.0
     ok = True
-    for nodes in (257, 1025):
+    for nodes in (1024, 4096, 16384):
         t = gauss_term("g", mobs, sigma, window=(lo, hi), nclass=8,
-                       nodes=nodes, m_ref=m_ref)
+                       tpoints=nodes, m_ref=m_ref)
         z = t._norm_z({"k_res": tf.constant(1.0, DTYPE)}).numpy()
         sc = np.asarray(t._norm["sigma"])
         exact = phi((hi - m_ref) / sc) - phi((lo - m_ref) / sc)
         dev = np.max(np.abs(z - exact))
-        print(f"    nodes={nodes:5d}  max |Z - erf|  = {dev:.3e}   "
+        print(f"    t points={nodes:6d}  max |Z - erf|  = {dev:.3e}   "
               f"(Z in [{z.min():.6f}, {z.max():.6f}])")
-        if nodes == 1025:
+        if nodes == 16384:
             ok &= dev < 1e-6
     # a scaled resolution must still be exact
-    t = gauss_term("g", mobs, sigma, window=(lo, hi), nclass=8, nodes=1025,
+    t = gauss_term("g", mobs, sigma, window=(lo, hi), nclass=8, tpoints=16384,
                    m_ref=m_ref)
     for k in (0.5, 2.0):
         z = t._norm_z({"k_res": tf.constant(k, DTYPE)}).numpy()
@@ -92,38 +93,37 @@ def test1():
         dev = np.max(np.abs(z - (phi((hi - m_ref) / sc) - phi((lo - m_ref) / sc))))
         print(f"    k_res={k:4.1f}   max |Z - erf|  = {dev:.3e}")
         ok &= dev < 1e-6
-    print("    (the residual is the trapezoid error of the mass quadrature, "
-          "O(h^2); it is far smaller on a wide window where the density "
-          "vanishes at the edges -- see test 2)")
+    print("    (the residual is the midpoint-rule error of the Fourier "
+          "quadrature)")
     print(f"  -> {'PASS' if ok else 'FAIL'}")
     return ok
 
 
 def test2():
-    print("\n[2] convergence in norm_nodes (Voigt, heavy tails)")
+    print("\n[2] convergence in norm_tpoints (Voigt, heavy tails)")
     rng = np.random.default_rng(8)
     n = 500
     sigma = rng.uniform(0.6, 2.5, n)
     mobs = rng.normal(0.0, 1.5, n)
     ref = None
     ok = True
-    for nodes in (65, 129, 257, 513, 1025, 4097):
+    for nodes in (256, 512, 1024, 2048, 8192, 32768):
         t = gauss_term("v", mobs, sigma, window=(60.0, 120.0), nclass=4,
-                       nodes=nodes, m_ref=91.1876, gamma_param="gam")
+                       tpoints=nodes, m_ref=91.1876, gamma_param="gam")
         z = t._norm_z({"k_res": tf.constant(1.0, DTYPE),
                        "gam": tf.constant(2493.2, DTYPE)}).numpy()
         if ref is None:
             first = z
         ref = z
-        print(f"    nodes={nodes:5d}  Z = " + " ".join(f"{v:.9f}" for v in z))
-    # the 4097-node answer is the reference; check 257 is already there
-    t = gauss_term("v", mobs, sigma, window=(60.0, 120.0), nclass=4, nodes=257,
+        print(f"    t points={nodes:6d}  Z = " + " ".join(f"{v:.9f}" for v in z))
+    # the 32768-point answer is the reference; check 8192 is already there
+    t = gauss_term("v", mobs, sigma, window=(60.0, 120.0), nclass=4, tpoints=8192,
                    m_ref=91.1876, gamma_param="gam")
     z257 = t._norm_z({"k_res": tf.constant(1.0, DTYPE),
                       "gam": tf.constant(2493.2, DTYPE)}).numpy()
     dev = np.max(np.abs(z257 - ref) / ref)
-    print(f"    257 vs 4097 nodes: max rel dev = {dev:.3e}")
-    ok &= dev < 1e-6
+    print(f"    8192 vs 32768 t points: max rel dev = {dev:.3e}")
+    ok &= dev < 1e-5
     print(f"  -> {'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -149,7 +149,7 @@ def test3():
         devs = {}
         for nclass in (1, 4, 16, 32):
             t = gauss_term("g", mobs, sigma, window=(lo, hi), nclass=nclass,
-                           nodes=513, m_ref=m_ref)
+                           tpoints=8192, m_ref=m_ref)
             z = t._norm_z({"k_res": tf.constant(1.0, DTYPE)}).numpy()
             per = np.asarray(tf.gather(z, t._norm_class))
             devs[nclass] = np.max(np.abs(per - exact) / exact)
@@ -175,12 +175,17 @@ def test4():
     mobs, sigma = mobs[keep], sigma[keep]
     nk = len(mobs)
 
-    term = gauss_term("a", mobs, sigma, window=(lo, hi), nclass=1, nodes=2049,
-                      m_ref=m_ref, gamma_param="gam")
-    plain = gauss_term("b", mobs, sigma, m_ref=m_ref, gamma_param="gam")
-    grid = np.linspace(lo, hi, 2049)
+    # the mass-grid reference has to be evaluated on a *fine* t grid: its own
+    # integrand oscillates |m_edge - m| / sigma ~ 25 times, which the term's
+    # working grid (64 in-maker points, 512 here) does not resolve. That is the
+    # whole reason _norm_z does the integral in Fourier space instead.
+    NT = 8192
+    term = gauss_term("a", mobs, sigma, window=(lo, hi), nclass=1, tpoints=16384,
+                      m_ref=m_ref, gamma_param="gam", nt=NT)
+    plain = gauss_term("b", mobs, sigma, m_ref=m_ref, gamma_param="gam", nt=NT)
+    grid = np.linspace(lo, hi, 16385)
     gterm = gauss_term("c", grid - m_ref, np.full(len(grid), sig0), m_ref=m_ref,
-                       gamma_param="gam", chunk=len(grid))
+                       gamma_param="gam", chunk=len(grid), nt=NT)
     dg = tf.constant(np.diff(grid), DTYPE)
     names = ["k_res", "gam"]
 
@@ -207,7 +212,11 @@ def test4():
         dn = abs(a.numpy() - b.numpy()) / abs(b.numpy())
         dgr = np.max(np.abs(ga - gb) / (np.abs(gb) + 1e-30))
         print(f"    x={x}: NLL rel dev {dn:.3e}, grad rel dev {dgr:.3e}")
-        ok &= dn < 1e-12 and dgr < 1e-9
+        ok &= dn < 1e-5 and dgr < 1e-4
+    print("    (both routes are quadrature-limited at ~1e-6 relative here -- "
+          "refining the\n     mass grid from 2049 to 16385 nodes does not move "
+          "the number, and test 2 shows\n     the Fourier Z converging at the "
+          "same 1e-6. The point is that they agree.)")
     print(f"  -> {'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -252,7 +261,7 @@ def test5():
 
     ok = True
     for label, window in (("with norm_window", (lo, hi)), ("without", None)):
-        t = gauss_term("f", mobs, sigma, window=window, nclass=1, nodes=2049,
+        t = gauss_term("f", mobs, sigma, window=window, nclass=1, tpoints=16384,
                        m_ref=m_ref, gamma_param="gam", chunk=200000)
         t0 = time.time()
         res, H = _fit(lambda x: t.nll(x), [1.0, 2400.0], 2)

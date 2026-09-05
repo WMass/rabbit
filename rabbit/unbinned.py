@@ -548,9 +548,11 @@ class MassCFTerm(UnbinnedTerm):
         mass grid for a handful of resolution *classes* rather than per
         candidate (see ``norm``); the class assignment is stored in
         ``norm_class``. Omit for an untruncated sample.
-    norm_nodes : int
-        Number of (uniform) mass-grid nodes across ``norm_window`` used for the
-        trapezoid ``Z``.
+    norm_tpoints : int
+        Number of points of the (midpoint) ``t`` grid the truncation integral
+        uses. It has to resolve oscillations at the window half-width, so it is
+        much finer than the term's own ``tgrid``; the family exponents are
+        resampled onto it with a cubic spline when the term is built.
     norm : dict, optional
         The resolution classes, ``{"sigma": (K,), "vgf": (K,), "class": (n,),
         "families": [...]}``; the family entries mirror ``families`` but carry
@@ -586,7 +588,7 @@ class MassCFTerm(UnbinnedTerm):
         chunk=32768,
         weights=None,
         norm_window=None,
-        norm_nodes=257,
+        norm_tpoints=8192,
         norm=None,
         channel=None,
         dtype=tf.float64,
@@ -699,7 +701,7 @@ class MassCFTerm(UnbinnedTerm):
         # ---- truncation normalisation -------------------------------------
         self.norm_window = None if norm_window is None else (
             float(norm_window[0]), float(norm_window[1]))
-        self.norm_nodes = int(norm_nodes)
+        self.norm_tpoints = int(norm_tpoints)
         self._norm = None
         if self.norm_window is not None:
             if norm is None:
@@ -884,37 +886,89 @@ class MassCFTerm(UnbinnedTerm):
 
         The truncated likelihood of a sample selected in ``norm_window`` is
         ``prod_i L_i(m_i) / Z_i``. ``Z_i`` is a very flat function of the
-        candidate's resolution -- the density near the window edges is smooth
-        on the ``sigma`` scale -- so it is evaluated once per resolution
-        *class* on a mass grid and gathered per candidate, rather than
-        integrated for each of ``n`` candidates.
+        candidate's resolution, so it is evaluated once per resolution *class*
+        and gathered per candidate rather than integrated for each of ``n``.
 
-        The mass-grid quadrature is deliberate: the Fourier identity
-        ``Z = (1/pi) Int Im[phi(u)(e^{-iu d_lo} - e^{-iu d_hi})]/u du`` needs
-        the ``t`` grid to resolve oscillations at the *window half-width*
-        (~30 GeV for a Z), an order of magnitude finer than the grid the
-        density itself needs, and the family exponents are only tabulated on
-        the term's own ``tgrid``.
+        The integral is done in Fourier space (Gil-Pelaez), not by sampling
+        the density on a mass grid::
+
+            Z = (1/pi) Int_0^inf Im[ phi(u) (e^{-i u d_lo} - e^{-i u d_hi}) ]/u du
+
+        with ``d_x = x - mu_c``. Both routes need a ``t`` grid fine enough to
+        resolve oscillations at the *window half-width* rather than at the
+        candidate's own pull -- for a Z that is ``|d|/sigma ~ 30/1 = 30``, i.e.
+        ~35 periods across the term's own ``tgrid``, which the 64-point in-maker
+        grid samples 1.8 times per period. Upsampling is therefore unavoidable;
+        doing it in Fourier space costs a ``(K, nt_norm)`` tensor, while the
+        mass-grid route costs ``(K, n_mass, nt_norm)``. Hence
+        :attr:`norm_tpoints` is large (thousands) and cheap.
+
+        The exponents are resampled onto that grid when the term is built (they
+        are smooth in ``t``: the largest second difference is <2 % of the range,
+        and a cubic spline through every other in-maker point reproduces them to
+        ~1e-4 absolute).
+
+        The integrand ``G(t)/t`` is evaluated on a *midpoint* grid, which avoids
+        the removable singularity at ``t = 0`` entirely.
         """
-        li = self._density(
-            values,
-            self._norm_sigma,
-            self._norm_mobs,
-            self._norm_families,
-            self._norm_vgf,
-            self._norm_phik_re,
-            self._norm_phik_im,
-        )
-        li = tf.reshape(li, (self._nclass, self.norm_nodes))
-        return tf.reduce_sum(
-            self._norm_dm[None, :] * (li[:, 1:] + li[:, :-1]) * self.npdt(0.5), axis=1
+        dtype = self.dtype
+        lo, hi = self.norm_window
+        t = self._norm_tgrid
+        sigma = self._norm_sigma
+        t_abs = t[None, :] / sigma[:, None]
+
+        s_re = None
+        s_im = None
+        for f in self._norm_families:
+            k = values[f["param"]]
+            if f["kind"] == "gauss":
+                contrib = k * (
+                    self.npdt(-0.5) * self._norm_vgf[:, None] * t[None, :] ** 2
+                )
+                s_re = contrib if s_re is None else s_re + contrib
+                continue
+            if "re" in f:
+                contrib = k * tf.cast(f["re"], dtype)
+                s_re = contrib if s_re is None else s_re + contrib
+            if "im" in f:
+                contrib = k * tf.cast(f["im"], dtype)
+                s_im = contrib if s_im is None else s_im + contrib
+
+        k_re, k_im = self.kernel.log_cf(values, t_abs)
+        if k_re is not None:
+            s_re = k_re if s_re is None else s_re + k_re
+        if k_im is not None:
+            s_im = k_im if s_im is None else s_im + k_im
+
+        shift = self._mass_shift(values)
+        d_lo = tf.constant(lo - self.m_ref, dtype)
+        d_hi = tf.constant(hi - self.m_ref, dtype)
+        if shift is not None:
+            d_lo = d_lo - shift
+            d_hi = d_hi - shift
+
+        def edge(d):
+            psi = -t_abs * d
+            if s_im is not None:
+                psi = psi + s_im
+            if self._norm_phik_re is not None:
+                return self._norm_phik_re * tf.sin(psi) + self._norm_phik_im * tf.cos(
+                    psi
+                )
+            return tf.sin(psi)
+
+        g = edge(d_lo) - edge(d_hi)
+        if s_re is not None:
+            g = tf.exp(s_re) * g
+        return tf.reduce_sum(g / t[None, :], axis=1) * self.npdt(
+            self._norm_dt / np.pi
         )
 
     def _build_norm(self, norm, phik):
         """Tabulate the resolution classes of the truncation normalisation."""
         lo, hi = self.norm_window
-        if self.norm_nodes < 3:
-            raise ValueError("norm_nodes must be at least 3")
+        if self.norm_tpoints < 16:
+            raise ValueError("norm_tpoints must be at least 16")
         sig_c = np.asarray(norm["sigma"], dtype=np.float64).ravel()
         self._nclass = len(sig_c)
         cls = np.asarray(norm["class"], dtype=np.int64).ravel()
@@ -925,24 +979,25 @@ class MassCFTerm(UnbinnedTerm):
         if cls.min() < 0 or cls.max() >= self._nclass:
             raise ValueError("norm class index out of range")
         self._norm_class = tf.constant(cls, tf.int32)
+        self._norm_sigma = tf.constant(sig_c, self.dtype)
 
-        ng = self.norm_nodes
-        mgrid = np.linspace(lo, hi, ng)
-        self._norm_dm = tf.constant(np.diff(mgrid), self.dtype)
-        sig_rep = np.repeat(sig_c, ng)
-        self._norm_sigma = tf.constant(sig_rep, self.dtype)
-        self._norm_mobs = tf.constant(np.tile(mgrid - self.m_ref, self._nclass),
-                                      self.dtype)
+        tmax = float(np.asarray(self.tgrid)[-1])
+        nt = self.norm_tpoints
+        self._norm_dt = tmax / nt
+        tmid = (np.arange(nt) + 0.5) * self._norm_dt
+        self._norm_tgrid = tf.constant(tmid, self.dtype)
 
         vgf_c = norm.get("vgf")
         self._norm_vgf = (
             None
             if vgf_c is None
-            else tf.constant(
-                np.repeat(np.asarray(vgf_c, dtype=np.float64).ravel(), ng), self.dtype
-            )
+            else tf.constant(np.asarray(vgf_c, dtype=np.float64).ravel(), self.dtype)
         )
 
+        # resample the family exponents from the term's tgrid onto tmid
+        from scipy.interpolate import CubicSpline
+
+        tsrc = np.asarray(self.tgrid, dtype=np.float64)
         by_name = {f["name"]: f for f in norm.get("families", [])}
         self._norm_families = []
         for f in self.families:
@@ -950,21 +1005,26 @@ class MassCFTerm(UnbinnedTerm):
             if entry["kind"] != "gauss":
                 src = by_name.get(f["name"])
                 if src is None:
-                    raise ValueError(
-                        f"norm block is missing family '{f['name']}'"
-                    )
+                    raise ValueError(f"norm block is missing family '{f['name']}'")
                 for comp in ("re", "im"):
                     if comp in f:
-                        arr = np.asarray(src[comp])
-                        if arr.shape != (self._nclass, self.nt):
+                        arr = np.asarray(src[comp], dtype=np.float64)
+                        if arr.shape[0] != self._nclass:
                             raise ValueError(
                                 f"norm family '{f['name']}' component '{comp}' has "
                                 f"shape {arr.shape}, expected "
-                                f"{(self._nclass, self.nt)}"
+                                f"({self._nclass}, {self.nt})"
                             )
-                        entry[comp] = tf.constant(
-                            np.repeat(arr, ng, axis=0), dtype=tf.as_dtype(arr.dtype)
-                        )
+                        if arr.shape[1] == nt:
+                            up = arr
+                        elif arr.shape[1] == self.nt:
+                            up = CubicSpline(tsrc, arr, axis=1)(tmid)
+                        else:
+                            raise ValueError(
+                                f"norm family '{f['name']}' component '{comp}' has "
+                                f"{arr.shape[1]} t points, expected {self.nt} or {nt}"
+                            )
+                        entry[comp] = tf.constant(up, self.dtype)
             self._norm_families.append(entry)
 
         if phik is None and self.phik_re is not None:
@@ -974,7 +1034,12 @@ class MassCFTerm(UnbinnedTerm):
             )
         if phik is not None:
             t_tab, re_tab, im_tab = (np.asarray(a, dtype=np.float64) for a in phik)
-            tgi = np.asarray(self.tgrid)[None, :] / sig_rep[:, None]
+            tgi = tmid[None, :] / sig_c[:, None]
+            if tgi.max() > t_tab[-1] * (1 + 1e-9):
+                raise ValueError(
+                    f"the kernel CF is tabulated to t = {t_tab[-1]:.3f} but the "
+                    f"truncation normalisation needs {tgi.max():.3f} 1/GeV"
+                )
             self._norm_phik_re = tf.constant(np.interp(tgi, t_tab, re_tab), self.dtype)
             self._norm_phik_im = tf.constant(np.interp(tgi, t_tab, im_tab), self.dtype)
         else:
@@ -1056,7 +1121,7 @@ class MassCFTerm(UnbinnedTerm):
             "floor_scale": self.floor_scale,
             "chunk": self.chunk,
             "norm_window": None if self.norm_window is None else list(self.norm_window),
-            "norm_nodes": self.norm_nodes,
+            "norm_tpoints": self.norm_tpoints,
             "families": [
                 {"name": f["name"], "param": f["param"], "kind": f["kind"]}
                 for f in self.families
