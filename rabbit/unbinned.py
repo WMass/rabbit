@@ -553,6 +553,16 @@ class MassCFTerm(UnbinnedTerm):
         uses. It has to resolve oscillations at the window half-width, so it is
         much finer than the term's own ``tgrid``; the family exponents are
         resampled onto it with a cubic spline when the term is built.
+    upsample : int
+        Integrate the density on a ``tau`` grid this many times finer than the
+        stored ``tgrid``, expanding the tabulated family exponents inside the
+        graph with a fixed cubic-spline matrix. The density is an inverse
+        Fourier transform whose integrand oscillates ``|m_i - m_pred|/sigma_i``
+        times across the grid; over a Z window that reaches ~60 periods, which
+        the in-maker's 64 exported points do not resolve. The exponents are
+        smooth in ``tau``, so the expansion is faithful, and doing it in the
+        graph keeps the *datacard* at the stored resolution -- only the
+        per-chunk intermediates grow.
     norm : dict, optional
         The resolution classes, ``{"sigma": (K,), "vgf": (K,), "class": (n,),
         "families": [...]}``; the family entries mirror ``families`` but carry
@@ -589,6 +599,7 @@ class MassCFTerm(UnbinnedTerm):
         weights=None,
         norm_window=None,
         norm_tpoints=8192,
+        upsample=1,
         norm=None,
         channel=None,
         dtype=tf.float64,
@@ -633,6 +644,22 @@ class MassCFTerm(UnbinnedTerm):
 
         self.sigma = tf.constant(sigma, dtype)
         self.mobs = tf.constant(mobs, dtype)
+        self.upsample = int(upsample)
+        if self.upsample < 1:
+            raise ValueError("upsample must be >= 1")
+        self.tgrid_stored = tgrid
+        if self.upsample > 1:
+            from scipy.interpolate import CubicSpline
+
+            tfine = np.linspace(tgrid[0], tgrid[-1],
+                                (self.nt - 1) * self.upsample + 1)
+            self._upmat = tf.constant(
+                CubicSpline(tgrid, np.eye(self.nt), axis=0)(tfine), dtype
+            )
+            tgrid = tfine
+        else:
+            self._upmat = None
+        self.nt_int = len(tgrid)
         self.tgrid = tf.constant(tgrid, dtype)
         # trapezoid weights: d = diff(t); trapz = sum(d * (y[1:] + y[:-1]) / 2)
         self.dtgrid = tf.constant(np.diff(tgrid), dtype)
@@ -682,6 +709,8 @@ class MassCFTerm(UnbinnedTerm):
 
         # ---- kernel CF ----------------------------------------------------
         self.phik_tab = None
+        self._phik_re_tab = None
+        self._phik_im_tab = None
         if phik_grid is not None:
             pk_re, pk_im = phik_grid
             self.phik_re = tf.constant(np.asarray(pk_re), dtype)
@@ -689,11 +718,28 @@ class MassCFTerm(UnbinnedTerm):
         elif phik is not None:
             t_tab, re_tab, im_tab = (np.asarray(a, dtype=np.float64) for a in phik)
             self.phik_tab = (t_tab, re_tab, im_tab)
-            # absolute t per candidate, interpolated exactly as the reference
-            tgi = tgrid[None, :] / sigma[:, None]
-            self.phik_re = tf.constant(np.interp(tgi, t_tab, re_tab), dtype)
-            self.phik_im = tf.constant(np.interp(tgi, t_tab, im_tab), dtype)
-            del tgi
+            if self.upsample > 1:
+                # (n, nt_int) would be `upsample` times the stored arrays; keep
+                # the tabulation and blend it per chunk inside the graph. The
+                # tabulation is uniform, so the "interpolation" is one gather.
+                d = np.diff(t_tab)
+                if not np.allclose(d, d[0]):
+                    raise ValueError(
+                        "upsample > 1 needs a uniformly spaced kernel CF "
+                        "tabulation"
+                    )
+                self._phik_t0 = float(t_tab[0])
+                self._phik_dt = float(d[0])
+                self._phik_re_tab = tf.constant(re_tab, dtype)
+                self._phik_im_tab = tf.constant(im_tab, dtype)
+                self.phik_re = None
+                self.phik_im = None
+            else:
+                # absolute t per candidate, interpolated exactly as the reference
+                tgi = tgrid[None, :] / sigma[:, None]
+                self.phik_re = tf.constant(np.interp(tgi, t_tab, re_tab), dtype)
+                self.phik_im = tf.constant(np.interp(tgi, t_tab, im_tab), dtype)
+                del tgi
         else:
             self.phik_re = None
             self.phik_im = None
@@ -811,16 +857,20 @@ class MassCFTerm(UnbinnedTerm):
         dtype = self.dtype
         t_abs = self.tgrid[None, :] / sigma[:, None]
 
-        # resolution CF exponent: sum over families, S = sum_f k_f S_f
+        # resolution CF exponent: sum over families, S = sum_f k_f S_f.
+        # The tabulated families are summed on their *stored* grid and the sum
+        # is expanded once (the spline is linear, so that is exact); the
+        # analytic Gaussian family and the physics kernel are evaluated on the
+        # integration grid directly.
         s_re = None
         s_im = None
+        gauss = None
         for f in families:
             k = values[f["param"]]
             if f["kind"] == "gauss":
-                contrib = k * (
+                gauss = k * (
                     self.npdt(-0.5) * vgf[:, None] * self.tgrid[None, :] ** 2
                 )
-                s_re = contrib if s_re is None else s_re + contrib
                 continue
             if "re" in f:
                 contrib = k * tf.cast(f["re"], dtype)
@@ -828,6 +878,13 @@ class MassCFTerm(UnbinnedTerm):
             if "im" in f:
                 contrib = k * tf.cast(f["im"], dtype)
                 s_im = contrib if s_im is None else s_im + contrib
+        if self._upmat is not None:
+            if s_re is not None:
+                s_re = tf.matmul(s_re, self._upmat, transpose_b=True)
+            if s_im is not None:
+                s_im = tf.matmul(s_im, self._upmat, transpose_b=True)
+        if gauss is not None:
+            s_re = gauss if s_re is None else s_re + gauss
 
         # physics-kernel CF (delta: nothing; Breit-Wigner: -Gamma |t| / 2)
         k_re, k_im = self.kernel.log_cf(values, t_abs)
@@ -851,6 +908,8 @@ class MassCFTerm(UnbinnedTerm):
         psi = -t_abs * delta[:, None]
         if s_im is not None:
             psi = psi + s_im
+        if phik_re is None and self._phik_re_tab is not None:
+            phik_re, phik_im = self._interp_phik(t_abs)
         if phik_re is not None:
             integ = phik_re * tf.cos(psi) - phik_im * tf.sin(psi)
         else:
@@ -862,6 +921,28 @@ class MassCFTerm(UnbinnedTerm):
             self.dtgrid[None, :] * (integ[:, 1:] + integ[:, :-1]) * self.npdt(0.5),
             axis=1,
         ) / (self.npdt(np.pi) * sigma)
+
+    def _interp_phik(self, t_abs):
+        """Linear blend of the (uniform) kernel-CF tabulation at ``t_abs``.
+
+        Numerically identical to the ``np.interp`` the non-upsampled path does
+        once at construction, but evaluated per chunk so that no ``(n, nt_int)``
+        array has to exist.
+        """
+        n = tf.shape(self._phik_re_tab)[0]
+        x = (t_abs - self.npdt(self._phik_t0)) / self.npdt(self._phik_dt)
+        x = tf.clip_by_value(x, self.npdt(0.0), tf.cast(n - 1, self.dtype))
+        i0 = tf.cast(tf.floor(x), tf.int32)
+        i0 = tf.minimum(i0, n - 2)
+        w = x - tf.cast(i0, self.dtype)
+        i1 = i0 + 1
+        re = (1.0 - w) * tf.gather(self._phik_re_tab, i0) + w * tf.gather(
+            self._phik_re_tab, i1
+        )
+        im = (1.0 - w) * tf.gather(self._phik_im_tab, i0) + w * tf.gather(
+            self._phik_im_tab, i1
+        )
+        return re, im
 
     def _chunk_li(self, values, ci):
         """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
@@ -981,7 +1062,7 @@ class MassCFTerm(UnbinnedTerm):
         self._norm_class = tf.constant(cls, tf.int32)
         self._norm_sigma = tf.constant(sig_c, self.dtype)
 
-        tmax = float(np.asarray(self.tgrid)[-1])
+        tmax = float(np.asarray(self.tgrid_stored)[-1])
         nt = self.norm_tpoints
         self._norm_dt = tmax / nt
         tmid = (np.arange(nt) + 0.5) * self._norm_dt
@@ -997,7 +1078,7 @@ class MassCFTerm(UnbinnedTerm):
         # resample the family exponents from the term's tgrid onto tmid
         from scipy.interpolate import CubicSpline
 
-        tsrc = np.asarray(self.tgrid, dtype=np.float64)
+        tsrc = np.asarray(self.tgrid_stored, dtype=np.float64)
         by_name = {f["name"]: f for f in norm.get("families", [])}
         self._norm_families = []
         for f in self.families:
@@ -1027,7 +1108,8 @@ class MassCFTerm(UnbinnedTerm):
                         entry[comp] = tf.constant(up, self.dtype)
             self._norm_families.append(entry)
 
-        if phik is None and self.phik_re is not None:
+        if phik is None and (self.phik_re is not None
+                             or self._phik_re_tab is not None):
             raise ValueError(
                 "norm_window needs the kernel CF *tabulation* (phik=(t, re, im)); "
                 "it cannot be rebuilt from the per-candidate phik_grid"
@@ -1122,6 +1204,7 @@ class MassCFTerm(UnbinnedTerm):
             "chunk": self.chunk,
             "norm_window": None if self.norm_window is None else list(self.norm_window),
             "norm_tpoints": self.norm_tpoints,
+            "upsample": self.upsample,
             "families": [
                 {"name": f["name"], "param": f["param"], "kind": f["kind"]}
                 for f in self.families

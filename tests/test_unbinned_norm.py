@@ -13,6 +13,8 @@ resolution *classes* and gathered per candidate.
    ``test_unbinned_mass.py`` test 4b (on a fine ``t`` grid, where the mass-grid
    route is itself accurate), in value *and* gradient
 5. closure: a Voigt toy cut to a window, fitted with and without the term
+6. ``upsample``: in-graph expansion of the exponents equals building the term
+   on the finer grid, and the density converges in the integration grid
 
 Run: ``python tests/test_unbinned_norm.py``
 """
@@ -278,12 +280,68 @@ def test5():
     return ok
 
 
+def test6():
+    print("\n[6] in-graph upsampling")
+    from scipy.interpolate import CubicSpline
+
+    rng = np.random.default_rng(12)
+    n, nt = 400, 64
+    m_ref = 91.1876
+    tmax = 7.8926
+    t0 = np.linspace(0.0, tmax, nt)
+    sigma = rng.uniform(0.5, 3.0, n)
+    mobs = rng.uniform(-31.0, 29.0, n)
+    vgf = rng.uniform(0.1, 0.5, n)
+    # a smooth, physical-looking tabulated family plus an odd imaginary part
+    v = rng.uniform(0.3, 0.9, n)[:, None]
+    sre = -0.5 * v * t0[None, :] ** 2 * np.exp(-0.03 * t0[None, :])
+    sim = 0.02 * v * t0[None, :] ** 3 / (1.0 + t0[None, :])
+    ttab = np.linspace(0.0, 20.0, 4001)
+    dmk = -np.abs(rng.standard_cauchy(4000)) * 0.5
+    phik = np.mean(np.exp(1j * np.outer(ttab, dmk)), axis=1)
+
+    def build(tg, sr, si, ups):
+        return unbinned.MassCFTerm(
+            "u", sigma=sigma, mobs=mobs, tgrid=tg, vgf=vgf,
+            families=[{"name": "hit", "param": "k_hit", "kind": "gauss"},
+                      {"name": "ms", "param": "k_ms", "kind": "tab",
+                       "re": sr, "im": si}],
+            phik=(ttab, phik.real.copy(), phik.imag.copy()),
+            m_ref=m_ref, upsample=ups, chunk=n, dtype=DTYPE)
+
+    vals = tf.constant([1.0, 1.0], DTYPE)
+    ok = True
+    for f in (4, 16):
+        t1 = np.linspace(0.0, tmax, (nt - 1) * f + 1)
+        pre = build(t1, CubicSpline(t0, sre, axis=1)(t1),
+                    CubicSpline(t0, sim, axis=1)(t1), 1)
+        ing = build(t0, sre, sim, f)
+        a = pre.raw_density(vals).numpy()
+        b = ing.raw_density(vals).numpy()
+        dev = np.max(np.abs(a - b) / np.abs(a))
+        print(f"    upsample {f:3d}: in-graph vs pre-splined density, "
+              f"max rel dev = {dev:.3e}   (NLL {pre.nll(vals).numpy():.9f} vs "
+              f"{ing.nll(vals).numpy():.9f})")
+        ok &= dev < 1e-8
+    base = build(t0, sre, sim, 1)
+    prev = base.raw_density(vals).numpy()
+    print("    convergence of the density with the integration grid "
+          "(median |rel change|):")
+    for f in (2, 4, 8, 16, 32):
+        cur = build(t0, sre, sim, f).raw_density(vals).numpy()
+        print(f"      {f:3d}x ({(nt-1)*f+1:5d} points): "
+              f"{np.median(np.abs(cur - prev) / np.abs(cur)):.3e}")
+        prev = cur
+    print(f"  -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 if __name__ == "__main__":
     skip = set()
     if "--skip" in sys.argv:
         skip = {int(a) for a in sys.argv[sys.argv.index("--skip") + 1:]}
     results = {}
-    for i, f in enumerate((test1, test2, test3, test4, test5), 1):
+    for i, f in enumerate((test1, test2, test3, test4, test5, test6), 1):
         if i in skip:
             continue
         results[i] = f()
