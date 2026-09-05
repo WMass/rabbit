@@ -314,6 +314,65 @@ only **2.67 %** outside:
 i.e. a 2.7 % truncation, ignored, costs 479 MeV on the width and 46 % on the
 resolution scale.
 
+## Follow-up 2: the quadrature. Two bugs, one cause. `0940e43`, `a5a1df3`
+
+Both were found by pointing the machinery at the real Z smoke (459 candidates
+of `dymc_8p5M_260905`) rather than at a toy.
+
+**The density is an inverse Fourier transform, and its integrand oscillates
+`|m_obs - m_pred| / sigma` times across `tgrid`.** For a J/psi in a +-0.35 GeV
+window that is a few periods. For a Z in a 60-120 GeV window it reaches 61,
+against the 64 points the in-maker exports (`tau=stride4of448<=8`).
+
+1. **`_norm_z` was sampling the density on a mass grid.** The window edge is
+   30 GeV from the model centre, so every one of those samples was in the
+   unresolved regime. It showed up as `Z` between 0.75 and **2.8** -- an
+   integral of a density over a sub-interval, larger than one. Replaced by the
+   Gil-Pelaez form, which needs the same fine `t` grid but only a `(K, nt)`
+   tensor rather than `(K, n_mass, nt)`, so it can afford to be fine
+   (`norm_tpoints`, default 8192). `Z` on the smoke is now in [0.748, 0.967]:
+   3.4 % mean leakage out of the window, 25 % for the worst-resolved pairs.
+
+2. **The candidate density itself is under-resolved on 64 points.** Rebuilding
+   the same term on a 16x finer grid moves the NLL by **-33.7** over 449
+   candidates and individual densities by up to 270 %; the fitted `m_Z` moves
+   by **-29.3 MeV**, which is 20 sigma at 3.9 M candidates. `MassCFTerm` now
+   takes `upsample=N` and expands the tabulated exponents with a fixed
+   cubic-spline matrix **inside the graph** -- the exponents are smooth in tau
+   (largest second difference <2 % of the range), so the expansion is faithful,
+   and keeping it in the graph leaves the datacard at 64 points where a
+   16x-finer stored array would be a 79 GB card at 3.9 M candidates.
+   4x and 16x agree to 0.4 MeV on `m_Z`, so 4x is already converged.
+
+`tests/test_unbinned_norm.py` (six tests, all pass):
+
+| test | result |
+|---|---|
+| 1 Gaussian `Z` vs the error function | PASS -- 2.9e-7 on a +-2 GeV window where `Z` is 0.60-0.99 |
+| 2 convergence in `norm_tpoints` | PASS -- 8192 vs 32768 agree to 1.2e-6 |
+| 3 cost of the class approximation | PASS -- exact to 4e-16 on a +-30 GeV window |
+| 4 vs the hand-rolled `- sum log L + n log Z` | PASS -- 6.8e-7 / 9.1e-6, both routes quadrature-limited there |
+| 5 closure on a truncated Voigt | PASS -- pull -0.2 with the term, -34.5 without |
+| 6 in-graph upsampling | PASS -- 1.2e-11 vs a pre-splined term; density converges 7.4e-2 -> 2.4e-4 from 2x to 32x |
+
+### Z channel status
+
+The channel itself lives in
+`/work/submit/david_w/ZMass/calibration_studies/zchannel` (FSR kernel from the
+MiniAOD gen record, datacard builder, fit driver, systematics scan, README).
+On the 459-candidate smoke, resolution scales fixed:
+
+    m_Z     = -107.7 +- 142.0 MeV      (truth 0 in the fixed-width scheme)
+    Gamma_Z = +332.5 +- 293.5 MeV
+
+projecting to **sigma(m_Z) = 1.45 MeV, sigma(Gamma_Z) = 2.76 MeV** at 3.9 M
+candidates -- against 1.42 / 3.33 MeV from test 4's 200k toy scaled by sqrt(N).
+`rho(m_Z, Gamma_Z) = -0.01`. Floating the four resolution scales *freely*
+leaves the information indefinite at 449 candidates: the Z alone does not
+determine them. Constrained at 1e-2 or 1e-3 -- which is what the J/psi channel
+supplies -- the errors are unchanged from holding them fixed, so profiling the
+resolution costs the Z nothing *given* an external constraint.
+
 ## What a data Z channel still needs
 
 * **FSR kernel** — `phi_K` tabulated from the generator
