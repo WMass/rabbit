@@ -51,6 +51,13 @@ fraction,
 with ``B`` uniform on the fit window (:class:`UniformBackground`) or a
 Bernstein polynomial (:class:`BernsteinBackground`).
 
+When the candidates were *selected* in a mass window -- as a Z channel's are
+-- the density has to be renormalised over it, ``L_i -> L_i / Z_i`` with
+``Z_i = Int_window L_i(m) dm``; ``norm_window`` switches that on. Omitting it
+is not a constant offset: ``Z`` moves with the resonance mass, so the missing
+term biases it (order 10 MeV on ``m_Z`` for a 60-120 GeV window, whose lower
+edge sits in the FSR tail).
+
 Reference implementation
 ------------------------
 The J/psi objective reproduced here bit-for-bit (up to float64 summation
@@ -96,6 +103,10 @@ group, one subgroup per term, mirroring ``external_terms``. Written by
 ``phik_re``/``phik_im``      float64 (nk,) the kernel CF on that grid
 ``jac_indices``/``_values``  int64 (nnz, 2) / float64 (nnz,) optional sparse
                              ``D`` (n x n_jacparams) in row-major order
+``norm_sigma``/``norm_vgf``  float64 (K,) resolution classes of the truncation
+                             normalisation (present iff ``norm_window`` is set)
+``norm_class``               int64 (n,) class index of every candidate
+``S_re_<f>_norm`` etc.       float32 (K, nt) the classes' family exponents
 ===========================  =================================================
 
 The per-candidate kernel CF ``phi_K(t/sigma_i)`` is *not* stored: it is
@@ -529,6 +540,21 @@ class MassCFTerm(UnbinnedTerm):
         Number of candidates per accumulation chunk.
     weights : ndarray (n,), optional
         Per-candidate weights.
+    norm_window : (float, float), optional
+        Mass window the candidates were *selected* in. When given, the density
+        is divided by its own integral over the window,
+        ``L_i -> L_i / Z_i`` with ``Z_i = Int_lo^hi L_i(m) dm``, i.e. the
+        likelihood becomes the correct truncated one. ``Z`` is evaluated on a
+        mass grid for a handful of resolution *classes* rather than per
+        candidate (see ``norm``); the class assignment is stored in
+        ``norm_class``. Omit for an untruncated sample.
+    norm_nodes : int
+        Number of (uniform) mass-grid nodes across ``norm_window`` used for the
+        trapezoid ``Z``.
+    norm : dict, optional
+        The resolution classes, ``{"sigma": (K,), "vgf": (K,), "class": (n,),
+        "families": [...]}``; the family entries mirror ``families`` but carry
+        ``(K, nt)`` arrays. Required with ``norm_window``.
     dtype : tf.DType
         Graph dtype for the real arithmetic (float64 recommended).
     """
@@ -559,6 +585,9 @@ class MassCFTerm(UnbinnedTerm):
         floor_scale=FLOOR_SCALE,
         chunk=32768,
         weights=None,
+        norm_window=None,
+        norm_nodes=257,
+        norm=None,
         channel=None,
         dtype=tf.float64,
         param_defaults=None,
@@ -667,6 +696,18 @@ class MassCFTerm(UnbinnedTerm):
             self.phik_re = None
             self.phik_im = None
 
+        # ---- truncation normalisation -------------------------------------
+        self.norm_window = None if norm_window is None else (
+            float(norm_window[0]), float(norm_window[1]))
+        self.norm_nodes = int(norm_nodes)
+        self._norm = None
+        if self.norm_window is not None:
+            if norm is None:
+                raise ValueError(
+                    "norm_window given without the 'norm' resolution classes"
+                )
+            self._build_norm(norm, phik)
+
         # ---- sparse per-candidate parameter dependence D ------------------
         self._jac_chunks = None
         if jac is not None and len(self.jac_params):
@@ -756,31 +797,34 @@ class MassCFTerm(UnbinnedTerm):
             shift = dm if shift is None else shift + dm
         return shift
 
-    def _chunk_li(self, values, ci):
-        """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
-        lo, hi = self._chunks[ci]
+    def _density(
+        self, values, sigma, mobs, families, vgf, phik_re, phik_im, jac_sp=None
+    ):
+        """Density ``L(m)`` of one block of rows, before the positivity floor.
+
+        Shared by the per-candidate chunks (:meth:`_chunk_li`) and by the
+        truncation normalisation (:meth:`_norm_z`), which evaluates exactly the
+        same model on a mass grid.
+        """
         dtype = self.dtype
-        sigma = self.sigma[lo:hi]
         t_abs = self.tgrid[None, :] / sigma[:, None]
 
         # resolution CF exponent: sum over families, S = sum_f k_f S_f
         s_re = None
         s_im = None
-        for f in self.families:
+        for f in families:
             k = values[f["param"]]
             if f["kind"] == "gauss":
                 contrib = k * (
-                    self.npdt(-0.5)
-                    * self.vgf[lo:hi][:, None]
-                    * self.tgrid[None, :] ** 2
+                    self.npdt(-0.5) * vgf[:, None] * self.tgrid[None, :] ** 2
                 )
                 s_re = contrib if s_re is None else s_re + contrib
                 continue
             if "re" in f:
-                contrib = k * tf.cast(f["re"][lo:hi], dtype)
+                contrib = k * tf.cast(f["re"], dtype)
                 s_re = contrib if s_re is None else s_re + contrib
             if "im" in f:
-                contrib = k * tf.cast(f["im"][lo:hi], dtype)
+                contrib = k * tf.cast(f["im"], dtype)
                 s_im = contrib if s_im is None else s_im + contrib
 
         # physics-kernel CF (delta: nothing; Breit-Wigner: -Gamma |t| / 2)
@@ -792,12 +836,11 @@ class MassCFTerm(UnbinnedTerm):
 
         # predicted mass: m_ref alpha + dm_res + (D theta)_i
         shift = self._mass_shift(values)
-        delta = self.mobs[lo:hi] if shift is None else self.mobs[lo:hi] - shift
-        if self._jac_chunks is not None:
+        delta = mobs if shift is None else mobs - shift
+        if jac_sp is not None:
             theta = tf.stack([values[p] for p in self.jac_params])
             dj = tf.squeeze(
-                tf.sparse.sparse_dense_matmul(self._jac_chunks[ci], theta[:, None]),
-                axis=-1,
+                tf.sparse.sparse_dense_matmul(jac_sp, theta[:, None]), axis=-1
             )
             delta = delta - dj
 
@@ -806,10 +849,8 @@ class MassCFTerm(UnbinnedTerm):
         psi = -t_abs * delta[:, None]
         if s_im is not None:
             psi = psi + s_im
-        if self.phik_re is not None:
-            integ = self.phik_re[lo:hi] * tf.cos(psi) - self.phik_im[lo:hi] * tf.sin(
-                psi
-            )
+        if phik_re is not None:
+            integ = phik_re * tf.cos(psi) - phik_im * tf.sin(psi)
         else:
             integ = tf.cos(psi)
         if s_re is not None:
@@ -819,6 +860,127 @@ class MassCFTerm(UnbinnedTerm):
             self.dtgrid[None, :] * (integ[:, 1:] + integ[:, :-1]) * self.npdt(0.5),
             axis=1,
         ) / (self.npdt(np.pi) * sigma)
+
+    def _chunk_li(self, values, ci):
+        """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
+        lo, hi = self._chunks[ci]
+        families = [
+            dict(f, **{c: f[c][lo:hi] for c in ("re", "im") if c in f})
+            for f in self.families
+        ]
+        return self._density(
+            values,
+            self.sigma[lo:hi],
+            self.mobs[lo:hi],
+            families,
+            None if self.vgf is None else self.vgf[lo:hi],
+            None if self.phik_re is None else self.phik_re[lo:hi],
+            None if self.phik_im is None else self.phik_im[lo:hi],
+            None if self._jac_chunks is None else self._jac_chunks[ci],
+        )
+
+    def _norm_z(self, values):
+        """``Z_c = Int_lo^hi L(m; class c) dm`` for every resolution class.
+
+        The truncated likelihood of a sample selected in ``norm_window`` is
+        ``prod_i L_i(m_i) / Z_i``. ``Z_i`` is a very flat function of the
+        candidate's resolution -- the density near the window edges is smooth
+        on the ``sigma`` scale -- so it is evaluated once per resolution
+        *class* on a mass grid and gathered per candidate, rather than
+        integrated for each of ``n`` candidates.
+
+        The mass-grid quadrature is deliberate: the Fourier identity
+        ``Z = (1/pi) Int Im[phi(u)(e^{-iu d_lo} - e^{-iu d_hi})]/u du`` needs
+        the ``t`` grid to resolve oscillations at the *window half-width*
+        (~30 GeV for a Z), an order of magnitude finer than the grid the
+        density itself needs, and the family exponents are only tabulated on
+        the term's own ``tgrid``.
+        """
+        li = self._density(
+            values,
+            self._norm_sigma,
+            self._norm_mobs,
+            self._norm_families,
+            self._norm_vgf,
+            self._norm_phik_re,
+            self._norm_phik_im,
+        )
+        li = tf.reshape(li, (self._nclass, self.norm_nodes))
+        return tf.reduce_sum(
+            self._norm_dm[None, :] * (li[:, 1:] + li[:, :-1]) * self.npdt(0.5), axis=1
+        )
+
+    def _build_norm(self, norm, phik):
+        """Tabulate the resolution classes of the truncation normalisation."""
+        lo, hi = self.norm_window
+        if self.norm_nodes < 3:
+            raise ValueError("norm_nodes must be at least 3")
+        sig_c = np.asarray(norm["sigma"], dtype=np.float64).ravel()
+        self._nclass = len(sig_c)
+        cls = np.asarray(norm["class"], dtype=np.int64).ravel()
+        if cls.shape != (self.n,):
+            raise ValueError(
+                f"norm class index has shape {cls.shape}, expected {(self.n,)}"
+            )
+        if cls.min() < 0 or cls.max() >= self._nclass:
+            raise ValueError("norm class index out of range")
+        self._norm_class = tf.constant(cls, tf.int32)
+
+        ng = self.norm_nodes
+        mgrid = np.linspace(lo, hi, ng)
+        self._norm_dm = tf.constant(np.diff(mgrid), self.dtype)
+        sig_rep = np.repeat(sig_c, ng)
+        self._norm_sigma = tf.constant(sig_rep, self.dtype)
+        self._norm_mobs = tf.constant(np.tile(mgrid - self.m_ref, self._nclass),
+                                      self.dtype)
+
+        vgf_c = norm.get("vgf")
+        self._norm_vgf = (
+            None
+            if vgf_c is None
+            else tf.constant(
+                np.repeat(np.asarray(vgf_c, dtype=np.float64).ravel(), ng), self.dtype
+            )
+        )
+
+        by_name = {f["name"]: f for f in norm.get("families", [])}
+        self._norm_families = []
+        for f in self.families:
+            entry = {"name": f["name"], "param": f["param"], "kind": f["kind"]}
+            if entry["kind"] != "gauss":
+                src = by_name.get(f["name"])
+                if src is None:
+                    raise ValueError(
+                        f"norm block is missing family '{f['name']}'"
+                    )
+                for comp in ("re", "im"):
+                    if comp in f:
+                        arr = np.asarray(src[comp])
+                        if arr.shape != (self._nclass, self.nt):
+                            raise ValueError(
+                                f"norm family '{f['name']}' component '{comp}' has "
+                                f"shape {arr.shape}, expected "
+                                f"{(self._nclass, self.nt)}"
+                            )
+                        entry[comp] = tf.constant(
+                            np.repeat(arr, ng, axis=0), dtype=tf.as_dtype(arr.dtype)
+                        )
+            self._norm_families.append(entry)
+
+        if phik is None and self.phik_re is not None:
+            raise ValueError(
+                "norm_window needs the kernel CF *tabulation* (phik=(t, re, im)); "
+                "it cannot be rebuilt from the per-candidate phik_grid"
+            )
+        if phik is not None:
+            t_tab, re_tab, im_tab = (np.asarray(a, dtype=np.float64) for a in phik)
+            tgi = np.asarray(self.tgrid)[None, :] / sig_rep[:, None]
+            self._norm_phik_re = tf.constant(np.interp(tgi, t_tab, re_tab), self.dtype)
+            self._norm_phik_im = tf.constant(np.interp(tgi, t_tab, im_tab), self.dtype)
+        else:
+            self._norm_phik_re = None
+            self._norm_phik_im = None
+        self._norm = norm
 
     def _mix(self, values, li, ci):
         """Positivity floor + background mixture + ``-sum log`` for chunk ``ci``."""
@@ -859,9 +1021,14 @@ class MassCFTerm(UnbinnedTerm):
         exact ``-sum log(density)``, with no dropped normalisation constant.
         """
         values = self._values(params)
+        z = None if self._norm is None else self._norm_z(values)
         total = None
         for ci in range(self.nchunk):
-            v = self._mix(values, self._chunk_li(values, ci), ci)
+            li = self._chunk_li(values, ci)
+            if z is not None:
+                lo, hi = self._chunks[ci]
+                li = li / tf.gather(z, self._norm_class[lo:hi])
+            v = self._mix(values, li, ci)
             total = v if total is None else total + v
         if total is None:
             return tf.constant(0.0, self.dtype)
@@ -888,6 +1055,8 @@ class MassCFTerm(UnbinnedTerm):
             "floor": self.floor,
             "floor_scale": self.floor_scale,
             "chunk": self.chunk,
+            "norm_window": None if self.norm_window is None else list(self.norm_window),
+            "norm_nodes": self.norm_nodes,
             "families": [
                 {"name": f["name"], "param": f["param"], "kind": f["kind"]}
                 for f in self.families
@@ -1022,6 +1191,24 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
                         entry[comp] = data.pop(key)
             families.append(entry)
 
+        norm = None
+        if "norm_sigma" in data:
+            norm = {
+                "sigma": data.pop("norm_sigma"),
+                "class": data.pop("norm_class"),
+                "vgf": data.pop("norm_vgf", None),
+                "families": [],
+            }
+            for fam in families:
+                if fam.get("kind", "tab") == "gauss":
+                    continue
+                entry = {"name": fam["name"]}
+                for comp in ("re", "im"):
+                    key = f"S_{comp}_{fam['name']}_norm"
+                    if key in data:
+                        entry[comp] = data.pop(key)
+                norm["families"].append(entry)
+
         phik = None
         if "phik_t" in data:
             phik = (data.pop("phik_t"), data.pop("phik_re"), data.pop("phik_im"))
@@ -1047,6 +1234,7 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
             weights=data.pop("weights", None),
             phik=phik,
             phik_grid=phik_grid,
+            norm=norm,
             kernel=_make_kernel(cfg.pop("kernel", None)),
             background=_make_background(cfg.pop("background", None)),
             jac=jac,
