@@ -655,6 +655,9 @@ class MassCFTerm(UnbinnedTerm):
         for f in self.families:
             if f["param"] not in names:
                 names.append(f["param"])
+        for p in self._extra_param_names():
+            if p not in names:
+                names.append(p)
         for p in self.kernel.param_names:
             if p not in names:
                 names.append(p)
@@ -700,6 +703,10 @@ class MassCFTerm(UnbinnedTerm):
                 )
 
     # -- internals ---------------------------------------------------------
+    def _extra_param_names(self):
+        """Parameter names a subclass contributes (see ``MaterialCFTerm``)."""
+        return ()
+
     def _mass_shift(self, values):
         """Predicted mass minus ``m_ref``: the scalar (candidate-independent) part."""
         shift = None
@@ -710,14 +717,16 @@ class MassCFTerm(UnbinnedTerm):
             shift = dm if shift is None else shift + dm
         return shift
 
-    def _chunk_li(self, values, ci):
-        """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
+    def _chunk_resolution(self, values, ci):
+        """Resolution log-CF exponent ``(Re S, Im S)`` of chunk ``ci``.
+
+        ``S = sum_f k_f S_f`` over the per-family scale knobs.  Subclasses
+        override this and only this to change the PARAMETERISATION of the
+        resolution; the quadrature, the kernel, the mass shift and the
+        background mixture in ``_chunk_li`` are untouched.
+        """
         lo, hi = self._chunks[ci]
         dtype = self.dtype
-        sigma = self.sigma[lo:hi]
-        t_abs = self.tgrid[None, :] / sigma[:, None]
-
-        # resolution CF exponent: sum over families, S = sum_f k_f S_f
         s_re = None
         s_im = None
         for f in self.families:
@@ -736,6 +745,16 @@ class MassCFTerm(UnbinnedTerm):
             if "im" in f:
                 contrib = k * tf.cast(f["im"][lo:hi], dtype)
                 s_im = contrib if s_im is None else s_im + contrib
+        return s_re, s_im
+
+    def _chunk_li(self, values, ci):
+        """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
+        lo, hi = self._chunks[ci]
+        dtype = self.dtype
+        sigma = self.sigma[lo:hi]
+        t_abs = self.tgrid[None, :] / sigma[:, None]
+
+        s_re, s_im = self._chunk_resolution(values, ci)
 
         # physics-kernel CF (delta: nothing; Breit-Wigner: -Gamma |t| / 2)
         k_re, k_im = self.kernel.log_cf(values, t_abs)
@@ -852,7 +871,285 @@ class MassCFTerm(UnbinnedTerm):
         }
 
 
-_TERM_KINDS = {"MassCF": MassCFTerm}
+class MaterialCFTerm(MassCFTerm):
+    """Mass likelihood whose resolution is parameterised by the PHYSICAL
+    material and hit-resolution parameters of the CVH fit, not by ad-hoc
+    per-family scale knobs.
+
+    Physics
+    -------
+    The CVH propagator applies the parmtype-15 material-group parameter
+    ``k_g`` to the AMOUNT of material of every Geant4 step:
+
+        mean loss                dE      = exp(k_g) (dE/dx)_0 ds
+        MS covariance            errMS  *= exp(k_g)
+        ionization variance      errI   *= exp(k_g)
+
+    Every step-level log-CF exponent of the resolution model is linear in that
+    amount at fixed composition (Moliere ``chi_c^2 ~ x``, Urban ``a_j ~ x``,
+    radiative mean emissions ``~ x``, delta-recoil ``xi ~ x``).  With the fit's
+    influence weights held fixed -- the two-step convention the in-fit CGF
+    block already uses -- the resolution exponent is therefore EXACTLY
+
+        S_f(tau; k) = S_f^fix(tau) + sum_g A(k_g) S_{f,g}(tau)
+
+    with ``A(k) = exp(k)`` (``amount_mode="exp"``, the convention of the C++
+    ``matStepFact``) or ``A(k) = 1 + k`` (``"linear"``, its first-order form),
+    and ``S^fix`` the pruned groups whose weight is pinned to 1.  ``k = 0``
+    reproduces the production's own exponents bit-for-bit.
+
+    The Gaussian hit share is split the same way but per HIT CLASS,
+
+        v_i(eps) = v_other,i + sum_c H(eps_c) v_{c,i} ,
+        Re S    += -0.5 v_i tau^2 ,
+
+    with ``H(eps) = 1 + eps`` (``hit_mode="linear"``) or ``exp(eps)``.
+    ``v_{c,i}`` is the summed exported influence variance ``resinfvarv`` of the
+    candidate's parmtype-8/9 blocks of class ``c``, in units of ``sigma_i^2``,
+    and ``v_other`` the Gaussian remainder (beamspot / vertex constraint) that
+    no parameter scales.
+
+    Field and alignment parameters enter this term ONLY through the mean, via
+    the sparse ``D`` rows of :class:`MassCFTerm` -- they move where the mass
+    sits, not how wide it is.
+
+    Storage
+    -------
+    The per-group exponents are block-sparse (a candidate touches ~20 of the
+    42 groups).  ``grp_ptr`` is a CSR row pointer over candidates into a flat
+    ``nnz`` axis, ``grp_id`` the group index of each row, and each family's
+    ``re`` / ``im`` arrays are ``(nnz, nt)``.
+
+    Parameters
+    ----------
+    group_params : list[str]
+        One parameter name per material group, in group-index order.  MUST be
+        the names the quadratic external term uses (``material_<group>`` from
+        ``make_global_term.name_params``) so that a joint fit floats one set.
+    group_families : list[dict]
+        ``{"name", "re"?, "im"?, "fix_re"?, "fix_im"?}``; ``re``/``im`` are
+        ``(nnz, nt)``, the optional ``fix_*`` are ``(n, nt)`` baselines.
+    grp_ptr : ndarray (n+1,)
+    grp_id : ndarray (nnz,)
+    group_units : ndarray (ngroups,), optional
+        ``k_g = value * group_units[g]``.  1 by default; set to the whitening
+        scale when the card is whitened, so both terms see the same physical k.
+    hit_params : list[str]
+        One parameter name per hit class, in class-index order.
+    hit_share : (hit_ptr, hit_cls, hit_v, vg_other), optional
+    hit_units : ndarray (ncls,), optional
+    amount_mode, hit_mode : {"exp", "linear"}
+    """
+
+    kind = "MaterialCF"
+
+    def __init__(
+        self,
+        name,
+        *args,
+        group_params=(),
+        group_families=(),
+        grp_ptr=None,
+        grp_id=None,
+        group_units=None,
+        hit_params=(),
+        hit_share=None,
+        hit_units=None,
+        amount_mode="exp",
+        hit_mode="linear",
+        **kwargs,
+    ):
+        if amount_mode not in ("exp", "linear"):
+            raise ValueError(f"amount_mode {amount_mode!r} is not exp/linear")
+        if hit_mode not in ("exp", "linear"):
+            raise ValueError(f"hit_mode {hit_mode!r} is not exp/linear")
+        self.group_params = list(group_params)
+        self.hit_params = list(hit_params)
+        self.amount_mode = amount_mode
+        self.hit_mode = hit_mode
+        # set BEFORE super().__init__, which calls _extra_param_names()
+        super().__init__(name, *args, **kwargs)
+
+        npdt = self.npdt
+        self.group_units = (
+            np.ones(len(self.group_params))
+            if group_units is None
+            else np.asarray(group_units, dtype=np.float64)
+        )
+        if self.group_units.shape != (len(self.group_params),):
+            raise ValueError("group_units must have one entry per group parameter")
+        self.hit_units = (
+            np.ones(len(self.hit_params))
+            if hit_units is None
+            else np.asarray(hit_units, dtype=np.float64)
+        )
+        if self.hit_units.shape != (len(self.hit_params),):
+            raise ValueError("hit_units must have one entry per hit parameter")
+        self._gunits = tf.constant(self.group_units, self.dtype)
+        self._hunits = tf.constant(self.hit_units, self.dtype)
+
+        # ---- block-sparse per-group exponents ----------------------------
+        self.g_ptr = None
+        self.group_families = []
+        if len(self.group_params):
+            if grp_ptr is None or grp_id is None:
+                raise ValueError("group_params given without grp_ptr / grp_id")
+            g_ptr = np.asarray(grp_ptr, dtype=np.int64).ravel()
+            if g_ptr.shape != (self.n + 1,):
+                raise ValueError(
+                    f"grp_ptr has shape {g_ptr.shape}, expected {(self.n + 1,)}"
+                )
+            g_id = np.asarray(grp_id, dtype=np.int64).ravel()
+            nnz = int(g_ptr[-1])
+            if len(g_id) != nnz:
+                raise ValueError(
+                    f"grp_id has {len(g_id)} rows but grp_ptr ends at {nnz}"
+                )
+            if nnz and (g_id.min() < 0 or g_id.max() >= len(self.group_params)):
+                raise ValueError("grp_id out of range of group_params")
+            self.g_ptr = g_ptr
+            self._g_id = tf.constant(g_id, tf.int32)
+            self._g_seg = tf.constant(
+                np.repeat(np.arange(self.n, dtype=np.int64), np.diff(g_ptr)),
+                tf.int32,
+            )
+            for f in group_families:
+                entry = {"name": f["name"]}
+                for comp in ("re", "im"):
+                    arr = f.get(comp)
+                    if arr is not None:
+                        arr = np.asarray(arr)
+                        if arr.shape != (nnz, self.nt):
+                            raise ValueError(
+                                f"group family '{f['name']}' component '{comp}' "
+                                f"has shape {arr.shape}, expected "
+                                f"{(nnz, self.nt)}"
+                            )
+                        entry[comp] = tf.constant(arr, tf.as_dtype(arr.dtype))
+                    fx = f.get("fix_" + comp)
+                    if fx is not None:
+                        fx = np.asarray(fx)
+                        if fx.shape != (self.n, self.nt):
+                            raise ValueError(
+                                f"group family '{f['name']}' baseline "
+                                f"'fix_{comp}' has shape {fx.shape}, expected "
+                                f"{(self.n, self.nt)}"
+                            )
+                        entry["fix_" + comp] = tf.constant(
+                            fx, tf.as_dtype(fx.dtype)
+                        )
+                if len(entry) == 1:
+                    raise ValueError(
+                        f"group family '{f['name']}' has no re/im/fix component"
+                    )
+                self.group_families.append(entry)
+        elif len(group_families):
+            raise ValueError("group_families given without group_params")
+
+        # ---- per-class Gaussian hit share --------------------------------
+        self.h_ptr = None
+        self.vg_other = None
+        if len(self.hit_params):
+            if hit_share is None:
+                raise ValueError("hit_params given without hit_share")
+            h_ptr, h_cls, h_v, vg_other = hit_share
+            h_ptr = np.asarray(h_ptr, dtype=np.int64).ravel()
+            if h_ptr.shape != (self.n + 1,):
+                raise ValueError(
+                    f"hit_ptr has shape {h_ptr.shape}, expected {(self.n + 1,)}"
+                )
+            h_cls = np.asarray(h_cls, dtype=np.int64).ravel()
+            h_v = np.asarray(h_v, dtype=np.float64).ravel()
+            if len(h_cls) != int(h_ptr[-1]) or len(h_v) != len(h_cls):
+                raise ValueError("hit_cls / hit_v inconsistent with hit_ptr")
+            if len(h_cls) and (h_cls.min() < 0 or h_cls.max() >= len(self.hit_params)):
+                raise ValueError("hit_cls out of range of hit_params")
+            self.h_ptr = h_ptr
+            self._h_cls = tf.constant(h_cls, tf.int32)
+            self._h_v = tf.constant(h_v, self.dtype)
+            self._h_seg = tf.constant(
+                np.repeat(np.arange(self.n, dtype=np.int64), np.diff(h_ptr)),
+                tf.int32,
+            )
+            self.vg_other = tf.constant(
+                np.asarray(vg_other, dtype=np.float64).ravel(), self.dtype
+            )
+        elif hit_share is not None:
+            raise ValueError("hit_share given without hit_params")
+        del npdt
+
+    # -- internals ---------------------------------------------------------
+    def _extra_param_names(self):
+        return list(self.group_params) + list(self.hit_params)
+
+    def _amount(self, values):
+        k = tf.stack([values[p] for p in self.group_params]) * self._gunits
+        return tf.exp(k) if self.amount_mode == "exp" else tf.constant(1.0, self.dtype) + k
+
+    def _hitscale(self, values):
+        e = tf.stack([values[p] for p in self.hit_params]) * self._hunits
+        return tf.exp(e) if self.hit_mode == "exp" else tf.constant(1.0, self.dtype) + e
+
+    def _chunk_resolution(self, values, ci):
+        # any LEGACY per-family knobs first (empty in the physical model)
+        s_re, s_im = super()._chunk_resolution(values, ci)
+        lo, hi = self._chunks[ci]
+        dtype = self.dtype
+
+        if self.g_ptr is not None and len(self.group_families):
+            a, b = int(self.g_ptr[lo]), int(self.g_ptr[hi])
+            w = self._amount(values)
+            wrow = tf.gather(w, self._g_id[a:b])[:, None]
+            seg = self._g_seg[a:b] - np.int32(lo)
+            nseg = hi - lo
+            for f in self.group_families:
+                for comp, tgt in (("re", 0), ("im", 1)):
+                    arr = f.get(comp)
+                    fx = f.get("fix_" + comp)
+                    contrib = None
+                    if arr is not None:
+                        contrib = tf.math.unsorted_segment_sum(
+                            wrow * tf.cast(arr[a:b], dtype), seg, nseg
+                        )
+                    if fx is not None:
+                        c2 = tf.cast(fx[lo:hi], dtype)
+                        contrib = c2 if contrib is None else contrib + c2
+                    if contrib is None:
+                        continue
+                    if tgt == 0:
+                        s_re = contrib if s_re is None else s_re + contrib
+                    else:
+                        s_im = contrib if s_im is None else s_im + contrib
+
+        if self.h_ptr is not None:
+            a, b = int(self.h_ptr[lo]), int(self.h_ptr[hi])
+            hw = self._hitscale(values)
+            v = tf.math.unsorted_segment_sum(
+                tf.gather(hw, self._h_cls[a:b]) * self._h_v[a:b],
+                self._h_seg[a:b] - np.int32(lo),
+                hi - lo,
+            )
+            v = v + self.vg_other[lo:hi]
+            contrib = self.npdt(-0.5) * v[:, None] * self.tgrid[None, :] ** 2
+            s_re = contrib if s_re is None else s_re + contrib
+
+        return s_re, s_im
+
+    def config(self):
+        cfg = super().config()
+        cfg.update(
+            {
+                "group_params": list(self.group_params),
+                "hit_params": list(self.hit_params),
+                "amount_mode": self.amount_mode,
+                "hit_mode": self.hit_mode,
+                "group_families": [{"name": f["name"]} for f in self.group_families],
+            }
+        )
+        return cfg
+
+
+_TERM_KINDS = {"MassCF": MassCFTerm, "MaterialCF": MaterialCFTerm}
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +1240,29 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
         if "phik_grid_re" in data:
             phik_grid = (data.pop("phik_grid_re"), data.pop("phik_grid_im"))
 
+        extra = {}
+        if kind == "MaterialCF":
+            gfam = []
+            for fam in cfg.pop("group_families", []):
+                entry = {"name": fam["name"]}
+                for comp in ("re", "im"):
+                    for pref, key in (("", f"Sg_{comp}_{fam['name']}"),
+                                      ("fix_", f"Sgfix_{comp}_{fam['name']}")):
+                        if key in data:
+                            entry[pref + comp] = data.pop(key)
+                gfam.append(entry)
+            extra["group_families"] = gfam
+            for k in ("grp_ptr", "grp_id", "group_units", "hit_units"):
+                if k in data:
+                    extra[k] = data.pop(k)
+            if "hit_ptr" in data:
+                extra["hit_share"] = (
+                    data.pop("hit_ptr"),
+                    data.pop("hit_cls"),
+                    data.pop("hit_v"),
+                    data.pop("vg_other"),
+                )
+
         jac = None
         if "jac_indices" in data:
             jac = (
@@ -969,6 +1289,7 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
             param_prior_means=data.pop("param_prior_means"),
             param_is_poi=data.pop("param_is_poi"),
             dtype=dtype,
+            **extra,
             **cfg,
         )
         if list(term.param_names) != list(params):
