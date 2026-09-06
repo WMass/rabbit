@@ -135,9 +135,26 @@ the exponent `-inf`, its `exp()` 0, and the gradient `inf*0 = NaN`.
 region and steps back. A fit that ENDS on the clip is telling you something
 else is wrong.
 
+### `2047b07` — the self-consistent-resolution correction (MASSCFTERM_SPEC)
+
+`sigma_i` as exported is the FIT's own error at the converged state, so it is a
+monotone function of the fitted mass — of the very fluctuation the likelihood is
+measuring.  `s_i(theta) = max(sigma_i - a_i delta_i(theta), 0.2 sigma_i)`
+recovers the unconditional resolution from observed quantities alone and enters
+the `1/(pi s)` prefactor, `t_abs = tgrid/s` and `phi_K(t_abs)`; the exponents
+are untouched; the `-ln s(theta)` log-Jacobian rides in the prefactor.
+`a_res` is the new per-candidate input, `self_consistent_sigma=True` the
+default, `False` reproduces the old behaviour off the same card, and an
+absent/all-zero `a_res` takes the static path — exact, not a shortcut, since
+`a = 0` makes `s == sigma` identically.  Plus `_chunk_mean_shift`, a no-op hook
+for the second-order Jensen term.  The spec, derivation and toy gates are
+another agent's
+(`calibration_studies/resolution/oddmoment/MASSCFTERM_SPEC.md`); only the
+implementation is here.
+
 ---
 
-## Tests — `tests/test_material_cf.py`, ALL EIGHT PASS
+## Tests — `tests/test_material_cf.py`, ALL NINE PASS
 
 | # | check | result |
 |---|---|---|
@@ -150,6 +167,10 @@ else is wrong.
 | 6 | injection of 5 % more material in one group | `A(k_1)` ratio **1.045765** vs 1.05 injected (**-0.40 %**), identical in both amount modes; the other two groups move by <6e-4 against a 0.11 stat sigma |
 | 7 | degeneracy, two collinear groups | eigenvalue 4.3e-7 vs 268 (**1.6e-9**), softest direction exactly `(-0.707, +0.707, 0, 0)` = `k_0 - k_1`; independent case rank 4/4, cond 7.4 |
 | 8 | HDF5 round trip through a datacard | **bit-identical NLL** |
+| 9a | G1: `a_res` None / all-zero / non-zero with the switch off | all three **bit-identical** to the pre-spec NLL |
+| 9b | the DYNAMIC sigma path at `a = 1e-300` vs the static one | **rel 0.0** (`_interp_phik` reproduces `np.interp` exactly) |
+| 9c | `d(NLL)/d(alpha)` vs central FD with `s(alpha)` in all three places | rel **5.4e-9** |
+| 9d | the formula and its sign | `s == max(sigma - a delta, 0.2 sigma)` exactly, `corr(delta, s - sigma) = -1` |
 
 Test 6 measures a SHIFT: the injected and un-injected toys share their
 standard-normal draw, so what is left after the difference is the estimator's
