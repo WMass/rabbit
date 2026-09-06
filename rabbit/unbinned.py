@@ -612,6 +612,11 @@ class MassCFTerm(UnbinnedTerm):
         elif phik is not None:
             t_tab, re_tab, im_tab = (np.asarray(a, dtype=np.float64) for a in phik)
             self.phik_tab = (t_tab, re_tab, im_tab)
+            # kept as tensors too, so a parameter-dependent sigma can
+            # re-interpolate the kernel CF inside the graph
+            self._pk_t = tf.constant(t_tab, dtype)
+            self._pk_re = tf.constant(re_tab, dtype)
+            self._pk_im = tf.constant(im_tab, dtype)
             # absolute t per candidate, interpolated exactly as the reference
             tgi = tgrid[None, :] / sigma[:, None]
             self.phik_re = tf.constant(np.interp(tgi, t_tab, re_tab), dtype)
@@ -722,6 +727,34 @@ class MassCFTerm(UnbinnedTerm):
         """
         return None
 
+    def _chunk_sigma(self, values, ci):
+        """Optional per-candidate ``(nchunk,)`` resolution that DEPENDS on the
+        parameters, replacing the stored constant ``sigma_i``.
+
+        ``sigma_i`` as exported is the FIT's own error, assembled from the block
+        variances at the converged state, so it is a function of the very
+        fluctuation the likelihood is measuring
+        (``sigma_i = sigma_bar_i (1 + a_i x_i)``).  Treating it as a known
+        constant fits a density whose width is correlated with its residual.
+        The truth-free repair is to make the absolute scale a function of the
+        parameters, ``s_i(theta) = sigma_i - a_i delta_i(theta)``, which is what
+        a subclass returns here.
+
+        Returning ``None`` means the stored, parameter-independent ``sigma`` --
+        and then the pre-interpolated kernel CF grid is used, which is both the
+        cheap path and bit-identical to the code before this hook existed.
+
+        When it is NOT None, ``s_i`` enters in the three places it appears:
+        the ``1/(pi s_i)`` prefactor, the standardized-to-absolute map
+        ``t_abs = tgrid / s_i``, and the kernel CF argument ``phi_K(t_abs)``,
+        which is then interpolated IN GRAPH from ``phik_tab``.  The resolution
+        EXPONENTS are functions of the standardized ``t`` and are untouched:
+        they describe the shape, only the absolute scale is corrected.  The
+        ``-ln s_i(theta)`` in ``log L_i`` becomes parameter-dependent and
+        autodiff picks it up from the prefactor -- it must not be dropped.
+        """
+        return None
+
     def _chunk_residual(self, values, ci):
         """Residual ``delta_i`` fed to the inverse-Fourier integral.
 
@@ -796,7 +829,10 @@ class MassCFTerm(UnbinnedTerm):
         """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
         lo, hi = self._chunks[ci]
         dtype = self.dtype
-        sigma = self.sigma[lo:hi]
+        sigma = self._chunk_sigma(values, ci)
+        dyn_sigma = sigma is not None
+        if not dyn_sigma:
+            sigma = self.sigma[lo:hi]
         t_abs = self.tgrid[None, :] / sigma[:, None]
 
         s_re, s_im = self._chunk_resolution(values, ci)
@@ -823,7 +859,12 @@ class MassCFTerm(UnbinnedTerm):
         psi = -t_abs * delta[:, None]
         if s_im is not None:
             psi = psi + s_im
-        if self.phik_re is not None:
+        if dyn_sigma and self.phik_tab is not None:
+            # sigma moved, so the kernel CF has to be read at the NEW absolute
+            # t; the table is on a regular grid, so this is a gather + lerp
+            pk_re, pk_im = self._interp_phik(t_abs)
+            integ = pk_re * tf.cos(psi) - pk_im * tf.sin(psi)
+        elif self.phik_re is not None:
             integ = self.phik_re[lo:hi] * tf.cos(psi) - self.phik_im[lo:hi] * tf.sin(
                 psi
             )
@@ -836,6 +877,30 @@ class MassCFTerm(UnbinnedTerm):
             self.dtgrid[None, :] * (integ[:, 1:] + integ[:, :-1]) * self.npdt(0.5),
             axis=1,
         ) / (self.npdt(np.pi) * sigma)
+
+    def _interp_phik(self, t_abs):
+        """Linear interpolation of the tabulated kernel CF at arbitrary
+        absolute ``t``, differentiable in ``t``.
+
+        ``build_phik_table`` tabulates on ``np.linspace(0, tmax, npoints)``, so
+        the grid is regular and the lookup is ``floor(t/dt)`` plus a weight --
+        no retabulation per parameter point, and the same numbers ``np.interp``
+        would give.  Out of range is clamped to the last sample, where the
+        kernel CF has long decayed.
+        """
+        t_tab = self.phik_tab[0]
+        t0 = self.npdt(t_tab[0])
+        dt = self.npdt((t_tab[-1] - t_tab[0]) / (len(t_tab) - 1))
+        n = len(t_tab)
+        u = (tf.clip_by_value(t_abs, t0, self.npdt(t_tab[-1])) - t0) / dt
+        i0 = tf.clip_by_value(tf.cast(tf.floor(u), tf.int32), 0, n - 2)
+        w = u - tf.cast(i0, self.dtype)
+        out = []
+        for tab in (self._pk_re, self._pk_im):
+            a = tf.gather(tab, i0)
+            b = tf.gather(tab, i0 + 1)
+            out.append(a + (b - a) * w)
+        return out[0], out[1]
 
     def _mix(self, values, li, ci):
         """Positivity floor + background mixture + ``-sum log`` for chunk ``ci``."""
