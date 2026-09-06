@@ -1004,6 +1004,8 @@ class MaterialCFTerm(MassCFTerm):
         hit_units=None,
         amount_mode="exp",
         hit_mode="linear",
+        amount_clip=5.0,
+        hit_clip=50.0,
         **kwargs,
     ):
         if amount_mode not in ("exp", "linear"):
@@ -1014,6 +1016,16 @@ class MaterialCFTerm(MassCFTerm):
         self.hit_params = list(hit_params)
         self.amount_mode = amount_mode
         self.hit_mode = hit_mode
+        # FINITENESS GUARD, not a physics choice.  A trust-region step early in
+        # a fit can throw k to O(100); exp(k) is then +inf, the exponent -inf,
+        # its exp() 0, and the GRADIENT inf*0 = NaN -- which is not a diverging
+        # fit but a dead one (rabbit's Cholesky of the Hessian fails and the
+        # covariance is lost).  Clipping k has a well-defined subgradient (0
+        # outside), so the minimizer sees a flat region and steps back.
+        # e^5 = 148x the material of a group: nothing physical is near it, and
+        # a fit that ends ON the clip is telling you something is wrong.
+        self.amount_clip = float(amount_clip)
+        self.hit_clip = float(hit_clip)
         # set BEFORE super().__init__, which calls _extra_param_names()
         super().__init__(name, *args, **kwargs)
 
@@ -1093,12 +1105,16 @@ class MaterialCFTerm(MassCFTerm):
         elif len(group_families):
             raise ValueError("group_families given without group_params")
 
-        # ---- per-class Gaussian hit share --------------------------------
+        # ---- Gaussian hit share ------------------------------------------
+        # `hit_share` is required whenever the candidate has ANY Gaussian
+        # variance, even with no floating class: `vg_other` alone is the hit +
+        # beamspot remainder, which in the flat MassCFTerm rides as the `gauss`
+        # family and IS the dominant part of the mass CF.  Dropping it makes
+        # the model far too narrow, the density underflows, and log(0) = -inf
+        # takes the gradient and the Hessian with it.
         self.h_ptr = None
         self.vg_other = None
-        if len(self.hit_params):
-            if hit_share is None:
-                raise ValueError("hit_params given without hit_share")
+        if hit_share is not None:
             h_ptr, h_cls, h_v, vg_other = hit_share
             h_ptr = np.asarray(h_ptr, dtype=np.int64).ravel()
             if h_ptr.shape != (self.n + 1,):
@@ -1121,8 +1137,8 @@ class MaterialCFTerm(MassCFTerm):
             self.vg_other = tf.constant(
                 np.asarray(vg_other, dtype=np.float64).ravel(), self.dtype
             )
-        elif hit_share is not None:
-            raise ValueError("hit_share given without hit_params")
+        elif len(self.hit_params):
+            raise ValueError("hit_params given without hit_share")
         del npdt
 
     # -- internals ---------------------------------------------------------
@@ -1131,11 +1147,21 @@ class MaterialCFTerm(MassCFTerm):
 
     def _amount(self, values):
         k = tf.stack([values[p] for p in self.group_params]) * self._gunits
-        return tf.exp(k) if self.amount_mode == "exp" else tf.constant(1.0, self.dtype) + k
+        if self.amount_clip > 0.0:
+            k = tf.clip_by_value(k, self.npdt(-self.amount_clip),
+                                 self.npdt(self.amount_clip))
+        if self.amount_mode == "exp":
+            return tf.exp(k)
+        return tf.maximum(tf.constant(1.0, self.dtype) + k, self.npdt(0.0))
 
     def _hitscale(self, values):
         e = tf.stack([values[p] for p in self.hit_params]) * self._hunits
-        return tf.exp(e) if self.hit_mode == "exp" else tf.constant(1.0, self.dtype) + e
+        if self.hit_clip > 0.0:
+            e = tf.clip_by_value(e, self.npdt(-self.hit_clip),
+                                 self.npdt(self.hit_clip))
+        if self.hit_mode == "exp":
+            return tf.exp(e)
+        return tf.maximum(tf.constant(1.0, self.dtype) + e, self.npdt(0.0))
 
     def _chunk_resolution(self, values, ci):
         # any LEGACY per-family knobs first (empty in the physical model)
@@ -1169,14 +1195,15 @@ class MaterialCFTerm(MassCFTerm):
                         s_im = contrib if s_im is None else s_im + contrib
 
         if self.h_ptr is not None:
-            a, b = int(self.h_ptr[lo]), int(self.h_ptr[hi])
-            hw = self._hitscale(values)
-            v = tf.math.unsorted_segment_sum(
-                tf.gather(hw, self._h_cls[a:b]) * self._h_v[a:b],
-                self._h_seg[a:b] - np.int32(lo),
-                hi - lo,
-            )
-            v = v + self.vg_other[lo:hi]
+            v = self.vg_other[lo:hi]
+            if len(self.hit_params):
+                a, b = int(self.h_ptr[lo]), int(self.h_ptr[hi])
+                hw = self._hitscale(values)
+                v = v + tf.math.unsorted_segment_sum(
+                    tf.gather(hw, self._h_cls[a:b]) * self._h_v[a:b],
+                    self._h_seg[a:b] - np.int32(lo),
+                    hi - lo,
+                )
             contrib = self.npdt(-0.5) * v[:, None] * self.tgrid[None, :] ** 2
             s_re = contrib if s_re is None else s_re + contrib
 
@@ -1190,6 +1217,8 @@ class MaterialCFTerm(MassCFTerm):
                 "hit_params": list(self.hit_params),
                 "amount_mode": self.amount_mode,
                 "hit_mode": self.hit_mode,
+                "amount_clip": self.amount_clip,
+                "hit_clip": self.hit_clip,
                 "group_families": [{"name": f["name"]} for f in self.group_families],
             }
         )
