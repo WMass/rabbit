@@ -172,6 +172,27 @@ implementation is here.
 | 9c | `d(NLL)/d(alpha)` vs central FD with `s(alpha)` in all three places | rel **5.4e-9** |
 | 9d | the formula and its sign | `s == max(sigma - a delta, 0.2 sigma)` exactly, `corr(delta, s - sigma) = -1` |
 
+**The gate on the real gun** (two cards over the same 24k J/psi-gun candidates,
+identical but for `self_consistent_sigma`, with `alpha` the ONLY parameter that
+moves the mean — `--no-jac`, so the 50 field modes cannot absorb the shift):
+
+| | alpha [1e-3] |
+|---|---|
+| naive | -0.026120 ± 0.058680 |
+| corrected | +0.121160 ± 0.058677 |
+| **shift** | **+0.147280** against the spec's **+0.146 ± 0.01** |
+
+A first attempt on a card that ALSO floated the field modes gave +0.0121, and
+that was the setup being wrong rather than the term: `alpha` is nearly
+degenerate with `bfield_mode0`, which took +0.068e-3 of the shift. A gate on a
+scale parameter has to be run where that parameter is the only scale.
+
+`a_i` has a median of 0.011527 on this sample — exactly the spec's 0.011 — and
+a maximum of 1.8e5, because `Jpsi_sigmamass` itself reaches 2.7e5 GeV on 26 of
+24,000 candidates. The card builder clips `|a_i|` at `--max-ares` (0.5); the
+real conclusion is that the mass-term selection wants a `Jpsi_sigmamass` cut,
+which none of `chi2/ndof`, `hessmax` or `gradmax` supplies.
+
 Test 6 measures a SHIFT: the injected and un-injected toys share their
 standard-normal draw, so what is left after the difference is the estimator's
 own non-linearity, not a fluctuation. The amount factor `A(k)` is the
