@@ -108,6 +108,21 @@ touching the quadrature that evaluates it:
 All three return `None` / the previous expression, so `MassCFTerm` is
 unchanged: tests 1, 2, 4 and 5 report a **bit-identical** NLL.
 
+### `d051c54` — hook for a parameter-dependent per-candidate sigma
+
+`_chunk_sigma(values, ci)`; `None` (the default) means the stored, constant
+`sigma`, which is the cheap and bit-identical path.  `Jpsi_sigmamass` is the
+FIT's own error, assembled at the converged state, so it is a function of the
+very fluctuation the likelihood is measuring — treating it as known constant
+fits a density whose width is correlated with its residual.  When the hook is
+overridden, `s_i` enters the `1/(pi s_i)` prefactor, `t_abs = tgrid/s_i` AND
+the kernel CF argument, so `_interp_phik` re-reads the tabulated `phi_K` in
+graph (regular grid → gather + lerp, differentiable in `t`, the same numbers
+`np.interp` gives).  The exponents are functions of the standardized `t` and
+stay untouched.  The correction itself is another agent's
+(`calibration_studies/resolution/oddmoment/MASSCFTERM_SPEC.md`) and is NOT
+implemented here.
+
 ### `ca6f732` — the Gaussian remainder, and two finiteness guards
 
 `hit_share` is honoured whenever it is given, even with zero floating classes
@@ -170,6 +185,17 @@ candidates of the same production, on the SAME 92 parameters (50 field modes +
 The hit chi2 measures the material and is nearly blind to the overall scale;
 the masses measure the scale and add 2-22 % on the material. `bfield_mode0`
 moves from +1.36 sigma to -0.30 sigma, i.e. onto zero, as it must on MC.
+A mass-only fit of the same 24k candidates gives dB/B 1.02e-4 on the scale --
+**87x better than the hit chi2 on 299k candidates** -- and 1.0-2.1x WORSE than
+it on every material group, so the joint fit beats both everywhere.
+
+**Injection through both terms**, `k = ln(1.05)` (5 % more material) into
+`material_tib_support`, applied to the quadratic gradient (`G -> G - K dtheta`),
+the mass mean (via the D rows) and the mass-term exponents of that group:
+recovered at **pull -0.505** vs truth, shift 88.7 % of the injection
+(+4.42 % material against +5.00 %), with the residual absorbed by the
+correlated `bpix_support` (-0.37 sigma).  Leakage onto the other 91 parameters:
+**rms 0.057 sigma**, and the momentum scale moves 0.31 sigma.
 
 ---
 
