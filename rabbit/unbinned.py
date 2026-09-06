@@ -129,6 +129,13 @@ ALPHA_UNIT = 1e-3
 FBKG_UNIT = 1e-3
 # Default softplus floor scale of the reference implementation.
 FLOOR_SCALE = 1e-9
+# Lower bound on the self-consistent per-candidate resolution, as a fraction
+# of the exported sigma_i: `s_i = max(sigma_i - a_i delta_i, SIGMA_FLOOR sigma_i)`.
+# The linearisation sigma = sigma_bar (1 + a x) is only meaningful while
+# 1 + a x > 0; far in the tail the floor keeps s positive and the density finite
+# without touching anything within several sigma of the peak (a_i ~ 0.011 at
+# J/psi momenta, so the floor binds only beyond |x| ~ 70).
+SIGMA_FLOOR = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +520,9 @@ class MassCFTerm(UnbinnedTerm):
         floor_scale=FLOOR_SCALE,
         chunk=32768,
         weights=None,
+        a_res=None,
+        self_consistent_sigma=True,
+        sigma_floor=SIGMA_FLOOR,
         channel=None,
         dtype=tf.float64,
         param_defaults=None,
@@ -531,6 +541,8 @@ class MassCFTerm(UnbinnedTerm):
         self.bkg_frac_unit = float(bkg_frac_unit)
         self.floor = floor
         self.floor_scale = float(floor_scale)
+        self.self_consistent_sigma = bool(self_consistent_sigma)
+        self.sigma_floor = float(sigma_floor)
         self.kernel = kernel if kernel is not None else DeltaKernel()
         self.background = (
             background
@@ -563,6 +575,26 @@ class MassCFTerm(UnbinnedTerm):
             None
             if weights is None
             else tf.constant(np.asarray(weights, dtype=np.float64), dtype)
+        )
+
+        # SELF-CONSISTENT RESOLUTION (see `_chunk_sigma`).  `a_res` is the
+        # per-candidate coefficient of the exported sigma's dependence on the
+        # candidate's own fluctuation; an all-zero (or absent) `a_res` means the
+        # correction is off and the STATIC path is taken, which is then
+        # bit-identical to the code before it existed.
+        self.a_res = None
+        if a_res is not None:
+            arr = np.asarray(a_res, dtype=np.float64).ravel()
+            if arr.shape != (self.n,):
+                raise ValueError(
+                    f"a_res has shape {arr.shape}, expected {(self.n,)}"
+                )
+            self.a_res = tf.constant(arr, dtype)
+            self._a_res_np = arr
+        self._dyn_sigma = (
+            self.a_res is not None
+            and self.self_consistent_sigma
+            and bool(np.any(self._a_res_np != 0.0))
         )
 
         # ---- families -----------------------------------------------------
@@ -727,9 +759,18 @@ class MassCFTerm(UnbinnedTerm):
         """
         return None
 
-    def _chunk_sigma(self, values, ci):
-        """Optional per-candidate ``(nchunk,)`` resolution that DEPENDS on the
-        parameters, replacing the stored constant ``sigma_i``.
+    def _chunk_mean_shift(self, values, ci):
+        """Optional per-candidate ``(nchunk,)`` ADDITIVE shift of the model mean.
+
+        Reserved for a deterministic per-candidate offset of the predicted mass
+        that is not a global parameter -- e.g. the second-order Jensen term of
+        the mass functional, ``0.5 tr(H Sigma)``.  ``None`` means zero.
+        """
+        return None
+
+    def _chunk_sigma(self, values, ci, delta):
+        """Per-candidate ``(nchunk,)`` resolution, which DEPENDS on the
+        parameters when the self-consistent correction is on.
 
         ``sigma_i`` as exported is the FIT's own error, assembled from the block
         variances at the converged state, so it is a function of the very
@@ -740,9 +781,37 @@ class MassCFTerm(UnbinnedTerm):
         parameters, ``s_i(theta) = sigma_i - a_i delta_i(theta)``, which is what
         a subclass returns here.
 
+        THE DEFECT.  ``sigma_i`` as exported is the FIT's own error, assembled
+        from the block variances at the converged state, and the process noise
+        that dominates it scales with the momenta -- so it is a monotone
+        function of the FITTED mass, i.e. of the very fluctuation the
+        likelihood is measuring.  Writing ``sigma_i = sigma_bar_i (1 + a_i
+        x_i)`` with ``x_i`` the truth-referenced standardized residual gives
+        ``z_i = x_i/(1 + a_i x_i)`` and ``E[z_i] = -a_i``, so a likelihood that
+        treats ``sigma_i`` as a known constant fits a density whose width is
+        correlated with its residual.  The bias on a mass-scale parameter is
+        ``-a_m F sigma_bar_eff / M`` with ``F = 1.624`` measured on the J/psi
+        gun CF model (F = 2 for a Gaussian): ``-0.146e-3`` on the gun, and
+        ``-24 to -43 MeV`` on ``m_Z`` at Z momenta.
+
+        THE REPAIR, with no truth anywhere.  ``sigma_i = sigma_bar_i + a_i
+        (m_i - mu_i)`` is the DEFINITION of ``a_i``, so
+
+            s_i(theta) = max(sigma_i - a_i delta_i(theta), SIGMA_FLOOR sigma_i)
+
+        recovers the unconditional resolution from observed quantities alone.
+        At the true parameters it equals ``sigma_bar_i`` exactly, so the score
+        has zero expectation and the estimator is unbiased to first order.
+
         Returning ``None`` means the stored, parameter-independent ``sigma`` --
         and then the pre-interpolated kernel CF grid is used, which is both the
-        cheap path and bit-identical to the code before this hook existed.
+        cheap path and bit-identical to the code before this hook existed.  That
+        is what an absent or all-zero ``a_res`` selects, and it is exact rather
+        than an approximation: ``a = 0`` makes ``s_i == sigma_i`` identically,
+        so the two paths compute the same function.
+
+        Spec, derivation and acceptance gates:
+        ``calibration_studies/resolution/oddmoment/MASSCFTERM_SPEC.md``.
 
         When it is NOT None, ``s_i`` enters in the three places it appears:
         the ``1/(pi s_i)`` prefactor, the standardized-to-absolute map
@@ -753,7 +822,12 @@ class MassCFTerm(UnbinnedTerm):
         ``-ln s_i(theta)`` in ``log L_i`` becomes parameter-dependent and
         autodiff picks it up from the prefactor -- it must not be dropped.
         """
-        return None
+        if not self._dyn_sigma:
+            return None
+        lo, hi = self._chunks[ci]
+        sig = self.sigma[lo:hi]
+        return tf.maximum(sig - self.a_res[lo:hi] * delta,
+                          self.npdt(self.sigma_floor) * sig)
 
     def _chunk_residual(self, values, ci):
         """Residual ``delta_i`` fed to the inverse-Fourier integral.
@@ -774,6 +848,9 @@ class MassCFTerm(UnbinnedTerm):
                 axis=-1,
             )
             delta = delta - dj
+        ms = self._chunk_mean_shift(values, ci)
+        if ms is not None:
+            delta = delta - ms
         return delta
 
     def _chunk_logjac(self, values, ci):
@@ -829,7 +906,9 @@ class MassCFTerm(UnbinnedTerm):
         """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
         lo, hi = self._chunks[ci]
         dtype = self.dtype
-        sigma = self._chunk_sigma(values, ci)
+        # the residual first: the self-consistent resolution is a function of it
+        delta = self._chunk_residual(values, ci)
+        sigma = self._chunk_sigma(values, ci, delta)
         dyn_sigma = sigma is not None
         if not dyn_sigma:
             sigma = self.sigma[lo:hi]
@@ -849,10 +928,6 @@ class MassCFTerm(UnbinnedTerm):
             s_re = k_re if s_re is None else s_re + k_re
         if k_im is not None:
             s_im = k_im if s_im is None else s_im + k_im
-
-        # residual: m_i^0 - m_ref - (m_ref alpha + dm_kernel) - (D theta)_i,
-        # or whatever a subclass makes of it (see _chunk_residual)
-        delta = self._chunk_residual(values, ci)
 
         # Re[phi_K e^S e^{-i t delta}] = e^{Sre} (Re phi_K cos psi - Im phi_K sin psi)
         # with psi = Sim - t delta; all-real arithmetic, no complex gradients.
@@ -972,6 +1047,8 @@ class MassCFTerm(UnbinnedTerm):
             "bkg_frac_unit": self.bkg_frac_unit,
             "floor": self.floor,
             "floor_scale": self.floor_scale,
+            "self_consistent_sigma": self.self_consistent_sigma,
+            "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,
             "families": [
                 {"name": f["name"], "param": f["param"], "kind": f["kind"]}
@@ -1420,6 +1497,7 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
             families=families,
             vgf=data.pop("vgf", None),
             weights=data.pop("weights", None),
+            a_res=data.pop("a_res", None),
             phik=phik,
             phik_grid=phik_grid,
             kernel=_make_kernel(cfg.pop("kernel", None)),

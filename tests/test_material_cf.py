@@ -574,13 +574,100 @@ def test_hdf5_roundtrip():
     print("  PASS")
 
 
+def test_self_consistent_sigma():
+    """The MASSCFTERM_SPEC correction: sigma is the fit's own error, so it is a
+    function of the residual it is measuring.
+
+    Gate G1 of the spec -- ``a_i = 0`` reproduces the term bit-identically --
+    plus the two things only a unit test can check: that the DYNAMIC path
+    agrees with the static one at a = 0 (so the shortcut is not hiding a bug in
+    the interpolator), and that the gradient in alpha is right when s depends
+    on alpha through the prefactor, the tau grid AND the kernel CF.
+    """
+    print("\n=== 9. self-consistent sigma (MASSCFTERM_SPEC) ===")
+    inp = make_inputs(n=400, seed=51)
+    flat = flatten(inp)
+    # keep the residuals inside the model's core: make_inputs draws `mobs` from
+    # a width of its own invention, and a candidate parked at 3.5 sigma of THAT
+    # sits where the truncated inverse-Fourier integral is small enough that a
+    # few-% change of s can push it through zero.  That is a property of the
+    # toy, not of the correction, and it would hide the thing being tested.
+    inp["mobs"] = 0.3 * inp["sigma"] * np.random.default_rng(77).standard_normal(
+        inp["n"])
+    # a mass term with a scale parameter, so `delta` actually moves
+    tab = np.linspace(0.0, 400.0, 4096)
+    pk = np.exp(-0.5 * (0.004 * tab) ** 2)
+    common = dict(sigma=inp["sigma"], mobs=inp["mobs"], tgrid=inp["tgrid"],
+                  families=[{"name": "hit", "param": "k_hit", "kind": "gauss"}],
+                  # softplus, the production default: with floor="none" a
+                  # candidate whose truncated inverse-Fourier integral dips
+                  # negative in the tail gives log(<=0) = NaN, and moving s by
+                  # 1 % is enough to flip one
+                  vgf=flat["vgf"], floor="softplus", m_ref=3.0969,
+                  scale_param="alpha",
+                  phik=(tab, pk, np.zeros_like(pk)),
+                  param_defaults=np.zeros(2))
+    base = unbinned.MassCFTerm("b", **common)
+    zero = unbinned.MassCFTerm("z", a_res=np.zeros(inp["n"]), **common)
+    off = unbinned.MassCFTerm("o", a_res=0.011 * np.ones(inp["n"]),
+                              self_consistent_sigma=False, **common)
+    on = unbinned.MassCFTerm("c", a_res=0.011 * np.ones(inp["n"]), **common)
+    v = {"alpha": 0.3, "k_hit": 1.0}
+    nb, nz, no, nc = (nll_at(t, v) for t in (base, zero, off, on))
+    print(f"  a=None      {nb!r}")
+    print(f"  a=0         {nz!r}   identical: {nb == nz}")
+    print(f"  a!=0, off   {no!r}   identical: {nb == no}")
+    print(f"  a!=0, on    {nc!r}   d = {nc-nb:+.6f}")
+    assert nb == nz, (nb, nz)          # G1
+    assert nb == no, (nb, no)          # the switch
+    assert nc != nb                    # the correction does something
+
+    # the dynamic path at a = 0 must agree with the static one: this is the
+    # in-graph kernel-CF interpolation against np.interp
+    forced = unbinned.MassCFTerm("f", a_res=1e-300 * np.ones(inp["n"]), **common)
+    nf = nll_at(forced, v)
+    print(f"  a=1e-300 (dynamic path) {nf!r}  rel {abs(nf-nb)/abs(nb):.3e}")
+    assert abs(nf - nb) / abs(nb) < 1e-12, (nf, nb)
+
+    # gradient in alpha with s depending on alpha
+    g = grad_at(on, v)
+    h = 1e-6
+    up, dn = dict(v), dict(v)
+    up["alpha"] += h
+    dn["alpha"] -= h
+    fd = (nll_at(on, up) - nll_at(on, dn)) / (2 * h)
+    i = list(on.param_names).index("alpha")
+    print(f"  d(NLL)/d(alpha)  ana {g[i]:+.6f}  fd {fd:+.6f}  "
+          f"rel {abs(fd-g[i])/max(abs(fd),1e-9):.2e}")
+    assert abs(fd - g[i]) / max(abs(fd), 1e-9) < 1e-5
+
+    # THE SIGN.  s_i = sigma_i - a_i delta_i, so a candidate whose observed
+    # mass sits ABOVE the prediction must be given a SMALLER unconditional
+    # resolution (its exported sigma was inflated by its own upward
+    # fluctuation), and one below a larger.  Checked directly, because the
+    # direction of the resulting alpha shift is what gates G2/G3 of the spec
+    # measure on a toy generated WITH the defect -- this toy has no defect to
+    # correct, so a fit here would test the toy, not the term.
+    d = on._chunk_residual(on._values(tf.constant(
+        [v[p] for p in on.param_names], tf.float64)), 0).numpy()
+    ss = on._chunk_sigma(on._values(tf.constant(
+        [v[p] for p in on.param_names], tf.float64)), 0, tf.constant(d)).numpy()
+    sig = np.asarray(on.sigma.numpy())[: len(d)]
+    a = 0.011
+    print(f"  s vs sigma: max |s/sigma - 1| = {np.abs(ss/sig - 1).max():.4e}, "
+          f"corr(sign) = {np.sign(np.corrcoef(d, ss - sig)[0,1]):+.0f}")
+    assert np.allclose(ss, np.maximum(sig - a * d, on.sigma_floor * sig)), "s formula"
+    assert np.corrcoef(d, ss - sig)[0, 1] < -0.99, "s must shrink where delta > 0"
+    print("  PASS")
+
+
 if __name__ == "__main__":
     tf.config.threading.set_intra_op_parallelism_threads(
         int(os.environ.get("OMP_NUM_THREADS", "8")))
     only = sys.argv[1:] or None
     tests = [test_reduction, test_legacy_families, test_gradient, test_units,
              test_pruned_baseline, test_injection, test_degeneracy,
-             test_hdf5_roundtrip]
+             test_hdf5_roundtrip, test_self_consistent_sigma]
     for fn in tests:
         if only and not any(o in fn.__name__ for o in only):
             continue
