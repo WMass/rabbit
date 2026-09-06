@@ -9,9 +9,11 @@ Goal: a Z→μμ channel fitted for `m_Z` and `Γ_Z` with the same machinery as 
 J/ψ channel, i.e. a physics kernel supplying the characteristic function of the
 Z/γ* lineshape to `rabbit.unbinned.MassCFTerm`.
 
-**Status: complete and all six tests pass.** What is left is not this kernel but
-the rest of a data channel (FSR, acceptance, background, CVH resolution,
-theory nuisances) — see the last section.
+**Status: complete and all seven tests pass.** FSR and the acceptance are now
+*inside* the provider and closed at generator level against the real sample (see
+the 2026-09-05 section at the end); what is left is not this kernel but the rest
+of a data channel (background, CVH resolution, EW nuisances) plus the one thing
+the generator-level study added: the card must float a smooth `K(m)`.
 
 ---
 
@@ -171,6 +173,7 @@ python tests/test_zgamma_kernel.py
 | 4 toy closure, 200k | PASS — pulls +0.03 / +0.79 / +0.90 |
 | 5 Breit-Wigner-only kernel | PASS — mass biased by −43.2 MeV (7 sigma_stat) |
 | 6 datacard round trip | PASS — 2 POIs, NLL 6e-17, prior weight exact |
+| 7 terms / acceptance / FSR fold | PASS — all six checks at float64 round-off |
 
 ### Test 4 — 200k toy closure
 
@@ -506,3 +509,7 @@ error.
    inasmuch as it is *not* smooth);
 4. everything above is *in addition to* the resolution, the background and the
    `m_Z`–`alpha` degeneracy already listed.
+
+All seven tests re-run and pass against the final code
+(`tests/test_zgamma_kernel.py`; test 4's 200 k toy is unchanged at pulls
++0.03 / +0.79 / +0.90, and test 7's six checks are at float64 round-off).
