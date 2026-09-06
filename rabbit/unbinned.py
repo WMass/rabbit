@@ -27,7 +27,8 @@ with
 * ``phi_res``   the *physics* kernel of the resonance: a delta function
                 (J/psi, K_S), a Breit-Wigner (Upsilon; analytic CF
                 ``e^{i m t - Gamma |t| / 2}``), or a numerical lineshape CF
-                (Z/gamma*, a function of m_Z, Gamma_Z, ...) -- see
+                (Z/gamma*, a function of m_Z, Gamma_Z, ..., supplied by a
+                provider from :mod:`rabbit.lineshapes`) -- see
                 :class:`PhysicsKernel`;
 * ``S_i(t)``    the per-candidate resolution CF exponent, a sum over
                 *families* ``S_i(t) = sum_f k_f S_{f,i}(t)``, each family a
@@ -49,6 +50,13 @@ fraction,
 
 with ``B`` uniform on the fit window (:class:`UniformBackground`) or a
 Bernstein polynomial (:class:`BernsteinBackground`).
+
+When the candidates were *selected* in a mass window -- as a Z channel's are
+-- the density has to be renormalised over it, ``L_i -> L_i / Z_i`` with
+``Z_i = Int_window L_i(m) dm``; ``norm_window`` switches that on. Omitting it
+is not a constant offset: ``Z`` moves with the resonance mass, so the missing
+term biases it (order 10 MeV on ``m_Z`` for a 60-120 GeV window, whose lower
+edge sits in the FSR tail).
 
 Reference implementation
 ------------------------
@@ -95,6 +103,24 @@ group, one subgroup per term, mirroring ``external_terms``. Written by
 ``phik_re``/``phik_im``      float64 (nk,) the kernel CF on that grid
 ``jac_indices``/``_values``  int64 (nnz, 2) / float64 (nnz,) optional sparse
                              ``D`` (n x n_jacparams) in row-major order
+``norm_sigma``/``norm_vgf``  float64 (K,) resolution classes of the truncation
+                             normalisation (present iff ``norm_window`` is set)
+``norm_class``               int64 (n,) class index of every candidate
+``S_re_<f>_norm`` etc.       float32 (K, nt) the classes' family exponents
+``a_res``                    float64 (n,) optional coefficient of the exported
+                             sigma's own dependence on the candidate's
+                             fluctuation, ``sigma_i = sigma_bar_i (1 + a_i
+                             x_i)``; drives the self-consistent resolution
+``grp_ptr``/``grp_id``       int64 (n+1,) / (nnz,) CSR block-sparse index of a
+                             ``MaterialCF`` term's per-material-group exponents
+``Sg_re_<f>``/``Sg_im_<f>``  float32 (nnz, nt) those exponents
+``Sgfix_re_<f>``/``_im_<f>`` float32 (n, nt) their pinned baselines
+``group_units``              float64 (ngroups,) units of the group parameters
+``hit_units``                float64 (ncls,) units of the hit-class parameters
+``hit_ptr``/``hit_cls``      int64 (n+1,) / (nnz,) CSR index of the Gaussian
+                             hit-class variance shares
+``hit_v``/``vg_other``       float64 (nnz,) / (n,) those shares and the
+                             Gaussian remainder no parameter scales
 ===========================  =================================================
 
 The per-candidate kernel CF ``phi_K(t/sigma_i)`` is *not* stored: it is
@@ -244,13 +270,54 @@ class TabulatedLineshapeKernel(PhysicsKernel):
     channel abstraction is real: it is a drop-in for any other
     :class:`PhysicsKernel`, and :class:`MassCFTerm` needs no change to use
     it.
+
+    A provider is any object with
+
+    * ``provider(values, t_abs) -> (re, im)``, the additive complex exponent
+      ``(log|phi|, arg phi)`` broadcast to the shape of ``t_abs``;
+    * ``param_names``, the fit parameters it consumes;
+    * optionally ``config()``, a JSON-serialisable dict with a ``"type"`` key,
+      which is what lets the kernel survive the round trip through the
+      datacard: :func:`rabbit.lineshapes.make_provider` rebuilds it from that
+      dict on the read side.
+
+    :class:`rabbit.lineshapes.zgamma.ZGammaLineshape` is the reference
+    implementation (Z/gamma*, POIs ``m_Z`` and ``Gamma_Z``).
+
+    Parameters
+    ----------
+    param_names : sequence of str, optional
+        Fit parameters the kernel consumes. Defaults to the provider's own
+        ``param_names``; giving both is allowed but they must agree.
+    provider : callable or dict, optional
+        The provider object, or its ``config()`` dict (as stored in the
+        datacard), which is instantiated through
+        :func:`rabbit.lineshapes.make_provider`.
     """
 
     kind = "tabulated"
 
-    def __init__(self, param_names, provider=None):
-        self.param_names = tuple(param_names)
+    def __init__(self, param_names=None, provider=None):
+        if isinstance(provider, dict):
+            from rabbit.lineshapes import make_provider
+
+            provider = make_provider(provider)
         self.provider = provider
+
+        own = getattr(provider, "param_names", None)
+        if param_names is None:
+            if own is None:
+                raise ValueError(
+                    "TabulatedLineshapeKernel needs param_names, or a provider "
+                    "that declares its own param_names"
+                )
+            param_names = own
+        elif own is not None and tuple(param_names) != tuple(own):
+            raise ValueError(
+                f"TabulatedLineshapeKernel: param_names {tuple(param_names)} "
+                f"disagree with the provider's {tuple(own)}"
+            )
+        self.param_names = tuple(param_names)
 
     def log_cf(self, values, t_abs):
         if self.provider is None:
@@ -262,7 +329,11 @@ class TabulatedLineshapeKernel(PhysicsKernel):
         return self.provider(values, t_abs)
 
     def config(self):
-        return {"type": self.kind, "param_names": list(self.param_names)}
+        cfg = {"type": self.kind, "param_names": list(self.param_names)}
+        provider_config = getattr(self.provider, "config", None)
+        if callable(provider_config):
+            cfg["provider"] = provider_config()
+        return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +561,45 @@ class MassCFTerm(UnbinnedTerm):
         Number of candidates per accumulation chunk.
     weights : ndarray (n,), optional
         Per-candidate weights.
+    a_res : ndarray (n,), optional
+        Per-candidate coefficient of the *exported* resolution's dependence on
+        the candidate's own fluctuation, ``sigma_i = sigma_bar_i (1 + a_i
+        x_i)``. When given (and non-zero) the width used in the likelihood
+        becomes a function of the parameters, ``s_i = sigma_i - a_i delta_i``
+        -- see :meth:`_chunk_sigma`. Absent or all-zero takes the static path,
+        which is bit-identical to the code before the correction existed.
+    self_consistent_sigma : bool
+        Master switch for that correction; ``False`` ignores ``a_res``.
+    sigma_floor : float
+        Lower bound on ``s_i`` as a fraction of ``sigma_i`` (see
+        :data:`SIGMA_FLOOR`).
+    norm_window : (float, float), optional
+        Mass window the candidates were *selected* in. When given, the density
+        is divided by its own integral over the window,
+        ``L_i -> L_i / Z_i`` with ``Z_i = Int_lo^hi L_i(m) dm``, i.e. the
+        likelihood becomes the correct truncated one. ``Z`` is evaluated on a
+        mass grid for a handful of resolution *classes* rather than per
+        candidate (see ``norm``); the class assignment is stored in
+        ``norm_class``. Omit for an untruncated sample.
+    norm_tpoints : int
+        Number of points of the (midpoint) ``t`` grid the truncation integral
+        uses. It has to resolve oscillations at the window half-width, so it is
+        much finer than the term's own ``tgrid``; the family exponents are
+        resampled onto it with a cubic spline when the term is built.
+    upsample : int
+        Integrate the density on a ``tau`` grid this many times finer than the
+        stored ``tgrid``, expanding the tabulated family exponents inside the
+        graph with a fixed cubic-spline matrix. The density is an inverse
+        Fourier transform whose integrand oscillates ``|m_i - m_pred|/sigma_i``
+        times across the grid; over a Z window that reaches ~60 periods, which
+        the in-maker's 64 exported points do not resolve. The exponents are
+        smooth in ``tau``, so the expansion is faithful, and doing it in the
+        graph keeps the *datacard* at the stored resolution -- only the
+        per-chunk intermediates grow.
+    norm : dict, optional
+        The resolution classes, ``{"sigma": (K,), "vgf": (K,), "class": (n,),
+        "families": [...]}``; the family entries mirror ``families`` but carry
+        ``(K, nt)`` arrays. Required with ``norm_window``.
     dtype : tf.DType
         Graph dtype for the real arithmetic (float64 recommended).
     """
@@ -523,6 +633,10 @@ class MassCFTerm(UnbinnedTerm):
         a_res=None,
         self_consistent_sigma=True,
         sigma_floor=SIGMA_FLOOR,
+        norm_window=None,
+        norm_tpoints=8192,
+        upsample=1,
+        norm=None,
         channel=None,
         dtype=tf.float64,
         param_defaults=None,
@@ -568,6 +682,22 @@ class MassCFTerm(UnbinnedTerm):
 
         self.sigma = tf.constant(sigma, dtype)
         self.mobs = tf.constant(mobs, dtype)
+        self.upsample = int(upsample)
+        if self.upsample < 1:
+            raise ValueError("upsample must be >= 1")
+        self.tgrid_stored = tgrid
+        if self.upsample > 1:
+            from scipy.interpolate import CubicSpline
+
+            tfine = np.linspace(tgrid[0], tgrid[-1],
+                                (self.nt - 1) * self.upsample + 1)
+            self._upmat = tf.constant(
+                CubicSpline(tgrid, np.eye(self.nt), axis=0)(tfine), dtype
+            )
+            tgrid = tfine
+        else:
+            self._upmat = None
+        self.nt_int = len(tgrid)
         self.tgrid = tf.constant(tgrid, dtype)
         # trapezoid weights: d = diff(t); trapz = sum(d * (y[1:] + y[:-1]) / 2)
         self.dtgrid = tf.constant(np.diff(tgrid), dtype)
@@ -644,19 +774,47 @@ class MassCFTerm(UnbinnedTerm):
         elif phik is not None:
             t_tab, re_tab, im_tab = (np.asarray(a, dtype=np.float64) for a in phik)
             self.phik_tab = (t_tab, re_tab, im_tab)
-            # kept as tensors too, so a parameter-dependent sigma can
+            # ALWAYS kept as tensors too (three (nk,) vectors, nothing), so a
+            # parameter-dependent sigma or an upsampled tau grid can
             # re-interpolate the kernel CF inside the graph
             self._pk_t = tf.constant(t_tab, dtype)
             self._pk_re = tf.constant(re_tab, dtype)
             self._pk_im = tf.constant(im_tab, dtype)
-            # absolute t per candidate, interpolated exactly as the reference
-            tgi = tgrid[None, :] / sigma[:, None]
-            self.phik_re = tf.constant(np.interp(tgi, t_tab, re_tab), dtype)
-            self.phik_im = tf.constant(np.interp(tgi, t_tab, im_tab), dtype)
-            del tgi
+            if self.upsample > 1 or self._dyn_sigma:
+                # the pre-interpolated (n, nt) grid is skipped: with `upsample`
+                # it would be that many times larger, and with a
+                # parameter-dependent sigma it is simply wrong (it is pinned to
+                # the exported sigma).  Both cases blend the tabulation per
+                # chunk instead, which needs a uniform grid.
+                d = np.diff(t_tab)
+                if not np.allclose(d, d[0]):
+                    raise ValueError(
+                        "an upsampled tau grid or a parameter-dependent sigma "
+                        "needs a uniformly spaced kernel CF tabulation"
+                    )
+                self.phik_re = None
+                self.phik_im = None
+            else:
+                # absolute t per candidate, interpolated exactly as the reference
+                tgi = tgrid[None, :] / sigma[:, None]
+                self.phik_re = tf.constant(np.interp(tgi, t_tab, re_tab), dtype)
+                self.phik_im = tf.constant(np.interp(tgi, t_tab, im_tab), dtype)
+                del tgi
         else:
             self.phik_re = None
             self.phik_im = None
+
+        # ---- truncation normalisation -------------------------------------
+        self.norm_window = None if norm_window is None else (
+            float(norm_window[0]), float(norm_window[1]))
+        self.norm_tpoints = int(norm_tpoints)
+        self._norm = None
+        if self.norm_window is not None:
+            if norm is None:
+                raise ValueError(
+                    "norm_window given without the 'norm' resolution classes"
+                )
+            self._build_norm(norm, phik)
 
         # ---- sparse per-candidate parameter dependence D ------------------
         self._jac_chunks = None
@@ -872,50 +1030,111 @@ class MassCFTerm(UnbinnedTerm):
             shift = dm if shift is None else shift + dm
         return shift
 
-    def _chunk_resolution(self, values, ci):
-        """Resolution log-CF exponent ``(Re S, Im S)`` of chunk ``ci``.
+    def _upsample_exponent(self, s):
+        """Expand a *stored-grid* ``(nrow, nt)`` exponent onto the integration
+        grid ``(nrow, nt_int)``.
 
-        ``S = sum_f k_f S_f`` over the per-family scale knobs.  Subclasses
-        override this and only this to change the PARAMETERISATION of the
-        resolution; the quadrature, the kernel, the mass shift and the
-        background mixture in ``_chunk_li`` are untouched.
+        The identity when ``upsample == 1``; the fixed cubic-spline matrix
+        otherwise. Applied to the TABULATED exponents only -- everything
+        analytic in ``tau`` (the Gaussian family, the physics kernel) is
+        evaluated on the integration grid directly.
         """
-        lo, hi = self._chunks[ci]
+        if s is None or self._upmat is None:
+            return s
+        return tf.matmul(s, self._upmat, transpose_b=True)
+
+    def _family_exponent(self, values, families, vgf):
+        """``(Re S, Im S)`` of one block of rows from a (pre-sliced) family list.
+
+        ``S = sum_f k_f S_f`` over the per-family scale knobs. The tabulated
+        families are summed on their *stored* grid and the sum is expanded once
+        (the spline is linear, so that is exact); the analytic Gaussian family
+        is evaluated on the integration grid directly.
+        """
         dtype = self.dtype
         s_re = None
         s_im = None
-        for f in self.families:
+        gauss = None
+        for f in families:
             k = values[f["param"]]
             if f["kind"] == "gauss":
-                contrib = k * (
-                    self.npdt(-0.5)
-                    * self.vgf[lo:hi][:, None]
-                    * self.tgrid[None, :] ** 2
-                )
-                s_re = contrib if s_re is None else s_re + contrib
+                gauss = k * (self.npdt(-0.5) * vgf[:, None] * self.tgrid[None, :] ** 2)
                 continue
             if "re" in f:
-                contrib = k * tf.cast(f["re"][lo:hi], dtype)
+                contrib = k * tf.cast(f["re"], dtype)
                 s_re = contrib if s_re is None else s_re + contrib
             if "im" in f:
-                contrib = k * tf.cast(f["im"][lo:hi], dtype)
+                contrib = k * tf.cast(f["im"], dtype)
                 s_im = contrib if s_im is None else s_im + contrib
+        s_re = self._upsample_exponent(s_re)
+        s_im = self._upsample_exponent(s_im)
+        if gauss is not None:
+            s_re = gauss if s_re is None else s_re + gauss
         return s_re, s_im
 
-    def _chunk_li(self, values, ci):
-        """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
+    def _chunk_resolution(self, values, ci):
+        """Resolution log-CF exponent ``(Re S, Im S)`` of chunk ``ci``.
+
+        THE single place the PER-CANDIDATE family sum is built: subclasses
+        override this and only this to change the PARAMETERISATION of the
+        resolution (see :class:`MaterialCFTerm`); the quadrature, the kernel,
+        the mass shift and the background mixture in :meth:`_chunk_li` are
+        untouched. The truncation normalisation is deliberately NOT routed
+        through here -- :meth:`_norm_z` builds its own sum over resolution
+        *classes*, whose rows are not candidates and to which the
+        per-candidate hooks therefore do not apply.
+
+        The returned exponents are already on the *integration* grid.
+        """
         lo, hi = self._chunks[ci]
-        dtype = self.dtype
-        # the residual first: the self-consistent resolution is a function of it
-        delta = self._chunk_residual(values, ci)
-        sigma = self._chunk_sigma(values, ci, delta)
-        dyn_sigma = sigma is not None
-        if not dyn_sigma:
-            sigma = self.sigma[lo:hi]
+        families = [
+            dict(f, **{c: f[c][lo:hi] for c in ("re", "im") if c in f})
+            for f in self.families
+        ]
+        return self._family_exponent(
+            values, families, None if self.vgf is None else self.vgf[lo:hi]
+        )
+
+    def _density(
+        self,
+        values,
+        sigma,
+        mobs,
+        families,
+        vgf,
+        phik_re,
+        phik_im,
+        jac_sp=None,
+        delta=None,
+        s_re=None,
+        s_im=None,
+        escale=None,
+    ):
+        """Density ``L(m)`` of one block of rows, before the positivity floor.
+
+        The quadrature itself, shared by the per-candidate chunks
+        (:meth:`_chunk_li`) and callable on any other set of rows -- a mass
+        grid, a set of resolution classes -- that wants exactly the same model.
+
+        ``delta``, ``s_re``/``s_im`` and ``escale`` are the *already computed*
+        residual, resolution log-CF exponent and exponent multiplier, which is
+        how :meth:`_chunk_li` feeds in the subclass hooks (the residual has to
+        exist before the self-consistent ``sigma`` that is then passed in as
+        the ``sigma`` argument). Left at ``None`` they are built here from
+        ``mobs``/``jac_sp`` and ``families``/``vgf``, which is the plain path.
+
+        ``phik_re``/``phik_im`` are the pre-interpolated per-row kernel CF; pass
+        ``None`` to have the tabulation blended at the actual ``t_abs`` inside
+        the graph (needed once ``sigma`` moves with the parameters, or once the
+        integration grid is finer than the stored one).
+        """
         t_abs = self.tgrid[None, :] / sigma[:, None]
 
-        s_re, s_im = self._chunk_resolution(values, ci)
-        escale = self._chunk_exponent_scale(values, ci)
+        # resolution CF exponent: sum over families, S = sum_f k_f S_f
+        if s_re is None and s_im is None and families is not None:
+            s_re, s_im = self._family_exponent(values, families, vgf)
+
+        # optional per-candidate multiplier of the WHOLE process-noise exponent
         if escale is not None:
             if s_re is not None:
                 s_re = s_re * escale[:, None]
@@ -929,20 +1148,26 @@ class MassCFTerm(UnbinnedTerm):
         if k_im is not None:
             s_im = k_im if s_im is None else s_im + k_im
 
+        if delta is None:
+            # predicted mass: m_ref alpha + dm_res + (D theta)_i
+            shift = self._mass_shift(values)
+            delta = mobs if shift is None else mobs - shift
+            if jac_sp is not None:
+                theta = tf.stack([values[p] for p in self.jac_params])
+                dj = tf.squeeze(
+                    tf.sparse.sparse_dense_matmul(jac_sp, theta[:, None]), axis=-1
+                )
+                delta = delta - dj
+
         # Re[phi_K e^S e^{-i t delta}] = e^{Sre} (Re phi_K cos psi - Im phi_K sin psi)
         # with psi = Sim - t delta; all-real arithmetic, no complex gradients.
         psi = -t_abs * delta[:, None]
         if s_im is not None:
             psi = psi + s_im
-        if dyn_sigma and self.phik_tab is not None:
-            # sigma moved, so the kernel CF has to be read at the NEW absolute
-            # t; the table is on a regular grid, so this is a gather + lerp
-            pk_re, pk_im = self._interp_phik(t_abs)
-            integ = pk_re * tf.cos(psi) - pk_im * tf.sin(psi)
-        elif self.phik_re is not None:
-            integ = self.phik_re[lo:hi] * tf.cos(psi) - self.phik_im[lo:hi] * tf.sin(
-                psi
-            )
+        if phik_re is None and self.phik_tab is not None:
+            phik_re, phik_im = self._interp_phik(t_abs)
+        if phik_re is not None:
+            integ = phik_re * tf.cos(psi) - phik_im * tf.sin(psi)
         else:
             integ = tf.cos(psi)
         if s_re is not None:
@@ -954,14 +1179,18 @@ class MassCFTerm(UnbinnedTerm):
         ) / (self.npdt(np.pi) * sigma)
 
     def _interp_phik(self, t_abs):
-        """Linear interpolation of the tabulated kernel CF at arbitrary
+        """Linear blend of the (uniform) kernel-CF tabulation at arbitrary
         absolute ``t``, differentiable in ``t``.
 
-        ``build_phik_table`` tabulates on ``np.linspace(0, tmax, npoints)``, so
-        the grid is regular and the lookup is ``floor(t/dt)`` plus a weight --
-        no retabulation per parameter point, and the same numbers ``np.interp``
-        would give.  Out of range is clamped to the last sample, where the
-        kernel CF has long decayed.
+        ONE implementation serving both callers: the parameter-dependent sigma,
+        which has moved ``t_abs`` away from the grid the ``(n, nt)`` array was
+        built on, and the upsampled ``tau`` grid, for which that array is never
+        built at all. Both need the same thing -- the tabulation read at the
+        actual ``t_abs`` -- and both tabulations are regular
+        (``build_phik_table`` uses ``np.linspace``), so the lookup is
+        ``floor(t/dt)`` plus a weight: no retabulation per parameter point, and
+        numerically the same numbers ``np.interp`` gives. Out of range is
+        clamped to the last sample, where the kernel CF has long decayed.
         """
         t_tab = self.phik_tab[0]
         t0 = self.npdt(t_tab[0])
@@ -976,6 +1205,199 @@ class MassCFTerm(UnbinnedTerm):
             b = tf.gather(tab, i0 + 1)
             out.append(a + (b - a) * w)
         return out[0], out[1]
+
+    def _chunk_li(self, values, ci):
+        """Per-candidate density ``L_i`` for chunk ``ci``, before the floor."""
+        lo, hi = self._chunks[ci]
+        # the residual FIRST: the self-consistent resolution is a function of it
+        delta = self._chunk_residual(values, ci)
+        sigma = self._chunk_sigma(values, ci, delta)
+        dyn_sigma = sigma is not None
+        if not dyn_sigma:
+            sigma = self.sigma[lo:hi]
+        s_re, s_im = self._chunk_resolution(values, ci)
+        # sigma moved, so the kernel CF has to be read at the NEW absolute t;
+        # passing None lets `_density` blend the tabulation in graph
+        use_tab = dyn_sigma and self.phik_tab is not None
+        return self._density(
+            values,
+            sigma,
+            None,
+            None,
+            None,
+            None if use_tab or self.phik_re is None else self.phik_re[lo:hi],
+            None if use_tab or self.phik_im is None else self.phik_im[lo:hi],
+            delta=delta,
+            s_re=s_re,
+            s_im=s_im,
+            escale=self._chunk_exponent_scale(values, ci),
+        )
+
+    def _norm_z(self, values):
+        """``Z_c = Int_lo^hi L(m; class c) dm`` for every resolution class.
+
+        The truncated likelihood of a sample selected in ``norm_window`` is
+        ``prod_i L_i(m_i) / Z_i``. ``Z_i`` is a very flat function of the
+        candidate's resolution, so it is evaluated once per resolution *class*
+        and gathered per candidate rather than integrated for each of ``n``.
+
+        The integral is done in Fourier space (Gil-Pelaez), not by sampling
+        the density on a mass grid::
+
+            Z = (1/pi) Int_0^inf Im[ phi(u) (e^{-i u d_lo} - e^{-i u d_hi}) ]/u du
+
+        with ``d_x = x - mu_c``. Both routes need a ``t`` grid fine enough to
+        resolve oscillations at the *window half-width* rather than at the
+        candidate's own pull -- for a Z that is ``|d|/sigma ~ 30/1 = 30``, i.e.
+        ~35 periods across the term's own ``tgrid``, which the 64-point in-maker
+        grid samples 1.8 times per period. Upsampling is therefore unavoidable;
+        doing it in Fourier space costs a ``(K, nt_norm)`` tensor, while the
+        mass-grid route costs ``(K, n_mass, nt_norm)``. Hence
+        :attr:`norm_tpoints` is large (thousands) and cheap.
+
+        The exponents are resampled onto that grid when the term is built (they
+        are smooth in ``t``: the largest second difference is <2 % of the range,
+        and a cubic spline through every other in-maker point reproduces them to
+        ~1e-4 absolute).
+
+        The integrand ``G(t)/t`` is evaluated on a *midpoint* grid, which avoids
+        the removable singularity at ``t = 0`` entirely.
+        """
+        dtype = self.dtype
+        lo, hi = self.norm_window
+        t = self._norm_tgrid
+        sigma = self._norm_sigma
+        t_abs = t[None, :] / sigma[:, None]
+
+        s_re = None
+        s_im = None
+        for f in self._norm_families:
+            k = values[f["param"]]
+            if f["kind"] == "gauss":
+                contrib = k * (
+                    self.npdt(-0.5) * self._norm_vgf[:, None] * t[None, :] ** 2
+                )
+                s_re = contrib if s_re is None else s_re + contrib
+                continue
+            if "re" in f:
+                contrib = k * tf.cast(f["re"], dtype)
+                s_re = contrib if s_re is None else s_re + contrib
+            if "im" in f:
+                contrib = k * tf.cast(f["im"], dtype)
+                s_im = contrib if s_im is None else s_im + contrib
+
+        k_re, k_im = self.kernel.log_cf(values, t_abs)
+        if k_re is not None:
+            s_re = k_re if s_re is None else s_re + k_re
+        if k_im is not None:
+            s_im = k_im if s_im is None else s_im + k_im
+
+        shift = self._mass_shift(values)
+        d_lo = tf.constant(lo - self.m_ref, dtype)
+        d_hi = tf.constant(hi - self.m_ref, dtype)
+        if shift is not None:
+            d_lo = d_lo - shift
+            d_hi = d_hi - shift
+
+        def edge(d):
+            psi = -t_abs * d
+            if s_im is not None:
+                psi = psi + s_im
+            if self._norm_phik_re is not None:
+                return self._norm_phik_re * tf.sin(psi) + self._norm_phik_im * tf.cos(
+                    psi
+                )
+            return tf.sin(psi)
+
+        g = edge(d_lo) - edge(d_hi)
+        if s_re is not None:
+            g = tf.exp(s_re) * g
+        return tf.reduce_sum(g / t[None, :], axis=1) * self.npdt(
+            self._norm_dt / np.pi
+        )
+
+    def _build_norm(self, norm, phik):
+        """Tabulate the resolution classes of the truncation normalisation."""
+        lo, hi = self.norm_window
+        if self.norm_tpoints < 16:
+            raise ValueError("norm_tpoints must be at least 16")
+        sig_c = np.asarray(norm["sigma"], dtype=np.float64).ravel()
+        self._nclass = len(sig_c)
+        cls = np.asarray(norm["class"], dtype=np.int64).ravel()
+        if cls.shape != (self.n,):
+            raise ValueError(
+                f"norm class index has shape {cls.shape}, expected {(self.n,)}"
+            )
+        if cls.min() < 0 or cls.max() >= self._nclass:
+            raise ValueError("norm class index out of range")
+        self._norm_class = tf.constant(cls, tf.int32)
+        self._norm_sigma = tf.constant(sig_c, self.dtype)
+
+        tmax = float(np.asarray(self.tgrid_stored)[-1])
+        nt = self.norm_tpoints
+        self._norm_dt = tmax / nt
+        tmid = (np.arange(nt) + 0.5) * self._norm_dt
+        self._norm_tgrid = tf.constant(tmid, self.dtype)
+
+        vgf_c = norm.get("vgf")
+        self._norm_vgf = (
+            None
+            if vgf_c is None
+            else tf.constant(np.asarray(vgf_c, dtype=np.float64).ravel(), self.dtype)
+        )
+
+        # resample the family exponents from the term's tgrid onto tmid
+        from scipy.interpolate import CubicSpline
+
+        tsrc = np.asarray(self.tgrid_stored, dtype=np.float64)
+        by_name = {f["name"]: f for f in norm.get("families", [])}
+        self._norm_families = []
+        for f in self.families:
+            entry = {"name": f["name"], "param": f["param"], "kind": f["kind"]}
+            if entry["kind"] != "gauss":
+                src = by_name.get(f["name"])
+                if src is None:
+                    raise ValueError(f"norm block is missing family '{f['name']}'")
+                for comp in ("re", "im"):
+                    if comp in f:
+                        arr = np.asarray(src[comp], dtype=np.float64)
+                        if arr.shape[0] != self._nclass:
+                            raise ValueError(
+                                f"norm family '{f['name']}' component '{comp}' has "
+                                f"shape {arr.shape}, expected "
+                                f"({self._nclass}, {self.nt})"
+                            )
+                        if arr.shape[1] == nt:
+                            up = arr
+                        elif arr.shape[1] == self.nt:
+                            up = CubicSpline(tsrc, arr, axis=1)(tmid)
+                        else:
+                            raise ValueError(
+                                f"norm family '{f['name']}' component '{comp}' has "
+                                f"{arr.shape[1]} t points, expected {self.nt} or {nt}"
+                            )
+                        entry[comp] = tf.constant(up, self.dtype)
+            self._norm_families.append(entry)
+
+        if phik is None and (self.phik_re is not None or self.phik_tab is not None):
+            raise ValueError(
+                "norm_window needs the kernel CF *tabulation* (phik=(t, re, im)); "
+                "it cannot be rebuilt from the per-candidate phik_grid"
+            )
+        if phik is not None:
+            t_tab, re_tab, im_tab = (np.asarray(a, dtype=np.float64) for a in phik)
+            tgi = tmid[None, :] / sig_c[:, None]
+            if tgi.max() > t_tab[-1] * (1 + 1e-9):
+                raise ValueError(
+                    f"the kernel CF is tabulated to t = {t_tab[-1]:.3f} but the "
+                    f"truncation normalisation needs {tgi.max():.3f} 1/GeV"
+                )
+            self._norm_phik_re = tf.constant(np.interp(tgi, t_tab, re_tab), self.dtype)
+            self._norm_phik_im = tf.constant(np.interp(tgi, t_tab, im_tab), self.dtype)
+        else:
+            self._norm_phik_re = None
+            self._norm_phik_im = None
+        self._norm = norm
 
     def _mix(self, values, li, ci):
         """Positivity floor + background mixture + ``-sum log`` for chunk ``ci``."""
@@ -1019,9 +1441,14 @@ class MassCFTerm(UnbinnedTerm):
         exact ``-sum log(density)``, with no dropped normalisation constant.
         """
         values = self._values(params)
+        z = None if self._norm is None else self._norm_z(values)
         total = None
         for ci in range(self.nchunk):
-            v = self._mix(values, self._chunk_li(values, ci), ci)
+            li = self._chunk_li(values, ci)
+            if z is not None:
+                lo, hi = self._chunks[ci]
+                li = li / tf.gather(z, self._norm_class[lo:hi])
+            v = self._mix(values, li, ci)
             total = v if total is None else total + v
         if total is None:
             return tf.constant(0.0, self.dtype)
@@ -1050,6 +1477,9 @@ class MassCFTerm(UnbinnedTerm):
             "self_consistent_sigma": self.self_consistent_sigma,
             "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,
+            "norm_window": None if self.norm_window is None else list(self.norm_window),
+            "norm_tpoints": self.norm_tpoints,
+            "upsample": self.upsample,
             "families": [
                 {"name": f["name"], "param": f["param"], "kind": f["kind"]}
                 for f in self.families
@@ -1331,6 +1761,11 @@ class MaterialCFTerm(MassCFTerm):
                         contrib = c2 if contrib is None else contrib + c2
                     if contrib is None:
                         continue
+                    # the per-group exponents are stored on the term's own
+                    # tgrid, so they go through the same expansion the flat
+                    # families do (a no-op at upsample == 1, which keeps this
+                    # bit-identical to the un-upsampled term)
+                    contrib = self._upsample_exponent(contrib)
                     if tgt == 0:
                         s_re = contrib if s_re is None else s_re + contrib
                     else:
@@ -1365,6 +1800,46 @@ class MaterialCFTerm(MassCFTerm):
             }
         )
         return cfg
+
+
+def declare_params(term, declarations, default=(0.0, np.nan, 0.0, 0)):
+    """Fill a term's parameter declaration arrays from a name-keyed dict.
+
+    ``declarations`` maps a parameter name to
+    ``(starting value, Gaussian prior sigma, prior mean, is_poi)``; anything not
+    mentioned takes ``default`` (start at 0, free, not a POI). The arrays are
+    written back onto the term *in its own parameter order* and returned as the
+    four kwargs of :meth:`rabbit.tensorwriter.TensorWriter.add_unbinned_term`::
+
+        term = MassCFTerm("z", ..., kernel=TabulatedLineshapeKernel(provider=zls))
+        decl = unbinned.declare_params(term, {
+            **zls.param_declarations(gz_prior=2.3),   # m_Z, Gamma_Z as POIs
+            "alpha": (0.0, np.nan, 0.0, 1),
+        })
+        writer.add_unbinned_term(term.name, term.config(), term.param_names,
+                                 datasets, **decl)
+
+    Unknown names are an error -- a typo in a POI name would otherwise silently
+    leave the parameter free and unreported.
+    """
+    unknown = set(declarations) - set(term.param_names)
+    if unknown:
+        raise ValueError(
+            f"unbinned term '{term.name}': declarations for {sorted(unknown)} "
+            f"which are not among its parameters {list(term.param_names)}"
+        )
+    rows = [declarations.get(n, default) for n in term.param_names]
+    out = {
+        "param_defaults": np.array([float(r[0]) for r in rows]),
+        "param_prior_sigmas": np.array([float(r[1]) for r in rows]),
+        "param_prior_means": np.array([float(r[2]) for r in rows]),
+        "param_is_poi": np.array([int(r[3]) for r in rows], dtype=np.int8),
+    }
+    term.param_defaults = out["param_defaults"]
+    term.param_prior_sigmas = out["param_prior_sigmas"]
+    term.param_prior_means = out["param_prior_means"]
+    term.param_is_poi = out["param_is_poi"]
+    return out
 
 
 _TERM_KINDS = {"MassCF": MassCFTerm, "MaterialCF": MaterialCFTerm}
@@ -1451,6 +1926,24 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
                         entry[comp] = data.pop(key)
             families.append(entry)
 
+        norm = None
+        if "norm_sigma" in data:
+            norm = {
+                "sigma": data.pop("norm_sigma"),
+                "class": data.pop("norm_class"),
+                "vgf": data.pop("norm_vgf", None),
+                "families": [],
+            }
+            for fam in families:
+                if fam.get("kind", "tab") == "gauss":
+                    continue
+                entry = {"name": fam["name"]}
+                for comp in ("re", "im"):
+                    key = f"S_{comp}_{fam['name']}_norm"
+                    if key in data:
+                        entry[comp] = data.pop(key)
+                norm["families"].append(entry)
+
         phik = None
         if "phik_t" in data:
             phik = (data.pop("phik_t"), data.pop("phik_re"), data.pop("phik_im"))
@@ -1500,6 +1993,7 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
             a_res=data.pop("a_res", None),
             phik=phik,
             phik_grid=phik_grid,
+            norm=norm,
             kernel=_make_kernel(cfg.pop("kernel", None)),
             background=_make_background(cfg.pop("background", None)),
             jac=jac,
