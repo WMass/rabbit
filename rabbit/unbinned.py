@@ -636,6 +636,7 @@ class MassCFTerm(UnbinnedTerm):
         jensen_mode="exact",
         jensen_scale=1.0,
         jensen_disc_floor=0.1,
+        corr_clip=0.0,
         sigma_floor=SIGMA_FLOOR,
         norm_window=None,
         norm_tpoints=8192,
@@ -737,6 +738,36 @@ class MassCFTerm(UnbinnedTerm):
                 f"jensen_mode must be 'off', 'shift' or 'exact', "
                 f"got '{jensen_mode}'"
             )
+        # THE DOMAIN OF THE TWO CORRECTIONS.
+        #
+        # Both the self-consistent resolution and the Jensen map are
+        # expansions in the RESOLUTION fluctuation: `sigma_i = sigma_bar_i
+        # (1 + a_i x_i)` and `m_hat/m - 1 = u + u^2 + s^2/2` are statements
+        # about `x`, `u` of order `s = sigma/m`. `delta_i` is the argument they
+        # are fed, and `delta_i` is the deviation from the REFERENCE MASS.
+        #
+        # For a resonance of negligible width in a narrow window those are the
+        # same thing: at the J/psi, `|r| = |delta|/m <= 0.113` and
+        # `|a delta|/sigma` stays under 0.1, which is where the spec's gates
+        # were measured. For the Z they are NOT: the window is +-30 GeV on
+        # 91.19, so `|r|` reaches 0.52 and the deviation out there is FSR and
+        # the Breit-Wigner tail, not a resolution fluctuation. Fed the full
+        # `delta`, the exact Jensen map moves the residual by a MEDIAN of
+        # 57.7 MeV and by up to 10.7 GeV, against the 20.6 MeV mean shift it
+        # exists to apply, and `a_i delta_i` reaches a full `sigma_i`.
+        #
+        # `corr_clip` is the argument's domain, in units of `sigma_i`: both
+        # corrections see `clip(delta, +-corr_clip sigma)` instead of `delta`,
+        # so inside a few sigma nothing changes and outside they SATURATE
+        # rather than extrapolate. The Jensen map is continued linearly with
+        # unit slope beyond the clip, so the residual stays monotone in the
+        # observable and the log-Jacobian vanishes there (it is the identity
+        # map out there, by construction). `0` disables the clip and
+        # reproduces the behaviour these corrections had when they were
+        # measured on the J/psi.
+        self.corr_clip = float(corr_clip)
+        if self.corr_clip < 0.0:
+            raise ValueError("corr_clip must be >= 0 (it is in units of sigma)")
         self.jensen_mode = jensen_mode
         self.jensen_scale = float(jensen_scale)
         self.jensen_disc_floor = float(jensen_disc_floor)
@@ -764,6 +795,7 @@ class MassCFTerm(UnbinnedTerm):
         # `_chunk_residual` computes u and `_chunk_logjac` needs it; both are
         # called once per chunk, residual first, inside one graph.
         self._jensen_u = {}
+        self._jensen_clipped = {}
 
         # ---- families -----------------------------------------------------
         self.families = []
@@ -1030,7 +1062,7 @@ class MassCFTerm(UnbinnedTerm):
             return None
         lo, hi = self._chunks[ci]
         sig = self.sigma[lo:hi]
-        return tf.maximum(sig - self.a_res[lo:hi] * delta,
+        return tf.maximum(sig - self.a_res[lo:hi] * self._corr_delta(delta, ci),
                           self.npdt(self.sigma_floor) * sig)
 
     def _chunk_residual(self, values, ci):
@@ -1057,6 +1089,14 @@ class MassCFTerm(UnbinnedTerm):
             delta = delta - ms
         return self._jensen_exact(delta, ci)
 
+    def _corr_delta(self, delta, ci):
+        """``delta`` restricted to the corrections' domain of validity."""
+        if self.corr_clip <= 0.0:
+            return delta
+        lo, hi = self._chunks[ci]
+        lim = self.npdt(self.corr_clip) * self.sigma[lo:hi]
+        return tf.clip_by_value(delta, -lim, lim)
+
     def _jensen_exact(self, delta, ci):
         """Invert the second-order mass map; identity unless mode is 'exact'.
 
@@ -1073,18 +1113,26 @@ class MassCFTerm(UnbinnedTerm):
         """
         if not self._jensen or self.jensen_mode != "exact":
             self._jensen_u.pop(ci, None)
+            self._jensen_clipped.pop(ci, None)
             return delta
         lo, hi = self._chunks[ci]
         m = self._jensen_m[lo:hi]
         s2 = self.npdt(self.jensen_scale) * self.jensen_s2[lo:hi]
-        r = delta / m
+        dc = self._corr_delta(delta, ci)
+        r = dc / m
         disc = tf.maximum(
             self.npdt(1.0) + self.npdt(4.0) * (r - self.npdt(0.5) * s2),
             self.npdt(self.jensen_disc_floor),
         )
         u = self.npdt(0.5) * (tf.sqrt(disc) - self.npdt(1.0))
         self._jensen_u[ci] = u
-        return u * m
+        self._jensen_clipped[ci] = (
+            None if self.corr_clip <= 0.0
+            else tf.abs(delta - dc) > self.npdt(0.0))
+        # inside the clip this IS `u m`; outside, the map is continued with
+        # unit slope from the boundary, so the correction saturates at the
+        # value it had there and the transform stays monotone
+        return u * m + (delta - dc)
 
     def _chunk_logjac(self, values, ci):
         """Optional ``log |d(residual)/d(observable)|`` of chunk ``ci``.
@@ -1105,7 +1153,12 @@ class MassCFTerm(UnbinnedTerm):
                 "_chunk_logjac was called before _chunk_residual for chunk "
                 f"{ci}; the Jensen Jacobian has nothing to report"
             )
-        return -tf.math.log(self.npdt(1.0) + self.npdt(2.0) * u)
+        lj = -tf.math.log(self.npdt(1.0) + self.npdt(2.0) * u)
+        clipped = self._jensen_clipped.get(ci)
+        if clipped is not None:
+            # unit slope beyond the clip -> no change of measure there
+            lj = tf.where(clipped, tf.zeros_like(lj), lj)
+        return lj
 
     def _mass_shift(self, values):
         """Predicted mass minus ``m_ref``: the scalar (candidate-independent) part."""
@@ -1565,6 +1618,7 @@ class MassCFTerm(UnbinnedTerm):
             "jensen_mode": self.jensen_mode,
             "jensen_scale": self.jensen_scale,
             "jensen_disc_floor": self.jensen_disc_floor,
+            "corr_clip": self.corr_clip,
             "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,
             "norm_window": None if self.norm_window is None else list(self.norm_window),
