@@ -103,14 +103,37 @@ Approximations
 --------------
 * **Born level, LO.** No QCD corrections beyond what the NNLO PDF absorbs, no
   EW loop corrections, no running of alpha or of sin^2(theta_W) with ``m``.
-* **No FSR.** The physics kernel is the *pre-FSR* lineshape by construction:
-  final-state radiation is the separate empirical kernel CF ``phi_K`` of
-  :class:`~rabbit.unbinned.MassCFTerm`, tabulated from the generator.
-* **No acceptance.** The luminosity table is inclusive in boson rapidity (a
-  ``--y-cut`` option exists in the generator but is off by default) and the
-  lepton angular distribution is integrated over, so no lepton pT/eta cuts are
-  folded in. A real data channel needs an ``m``-dependent acceptance
-  ``A(m)`` multiplying the pdf.
+* **FSR** is *optional and multiplicative* (``fsr=``). Final-state radiation
+  scales the mass, ``m_post = r m_pre``, and the distribution of
+  ``u = -ln r`` is -- in this sample, verified from 60 to 150 GeV -- the same
+  at every ``m_pre`` to a few per cent, so the fold is
+  ``p_post(m) = sum_j w_j p_born(m / r_j) / r_j``.  With ``fsr`` given, ``pdf``
+  (and hence the CF, and hence :class:`~rabbit.unbinned.MassCFTerm`) models the
+  **post-FSR** mass as a function of the POIs alone, which is what makes the
+  Z channel's FSR treatment exact rather than an additive convolution.  The
+  atoms are a midpoint quadrature, so the residual bias scales as the square of
+  the in-group spread of ``u``: on this sample the fitted ``Gamma_Z`` moves by
+  +152 / +29 / +3.9 MeV for an in-group sd of 1e-2 / 3.3e-3 / 1e-3.  Optional
+  per-atom ``m_lo``/``m_hi`` bands make the kernel piecewise constant in
+  ``m_pre``, which is *required* once a lepton ``p_T`` cut is applied (the cut
+  removes hard emission at an ``m_pre``-dependent rate).
+  Without ``fsr`` the provider is the pre-FSR lineshape, and FSR has to be
+  supplied as ``MassCFTerm``'s separate additive ``phi_K``.
+* **Acceptance** is *optional* (``acceptance=``): a smooth multiplicative
+  ``A(m)`` (Bernstein or a tabulated grid) applied to the Born spectrum
+  *before* the FSR fold, i.e. the factorisation
+  ``P(m_post, pass) = p_born(m_pre) A(m_pre) K_sel(m_post|m_pre)``.  Without it
+  the luminosity table is inclusive in boson rapidity (a ``--y-cut`` option
+  exists in the generator but is off by default) and the lepton angular
+  distribution is integrated over, so no lepton pT/eta cuts are folded in.
+* **No K-factor.** The hard ME and the parton luminosity are both LO.  Against
+  the POWHEG-MiNNLO sample this leaves a smooth ratio that runs from 1.7 at
+  55 GeV through 1.0 at the peak to 1.2 at 150 GeV; it is *six times* the full
+  spread of PDF set, PDF order and mu_F in [Q/2, 2Q], so it is a genuine
+  higher-order effect and not a luminosity choice.  It is **not** degenerate
+  with the POIs: floating a 5-term smooth ``K(m)`` restores ``m_Z`` and
+  ``Gamma_Z`` to the generator's inputs within 0.6 / 1.2 MeV on 29 M events and
+  costs only 1.25x / 1.21x on their errors.
 * **EW scheme.** Gmu, with ``sin^2(theta_W) = 1 - m_W^2/m_Z^2`` and
   ``alpha(m_Z) = sqrt(2) G_F m_W^2 sin^2 / pi`` evaluated once from the
   *reference* masses -- ``sin^2`` does not track a fitted ``m_Z``. It is a
@@ -185,6 +208,69 @@ QUARKS = (
 )
 
 DEFAULT_LUMI = "nnpdf31_nnlo_13tev"
+
+# The three pieces of the neutral-current matrix element, selectable so that a
+# fit can be repeated with the photon exchange and/or the gamma-Z interference
+# switched off (the interference is what tilts the peak, so leaving it out
+# moves the fitted mass by tens of MeV -- see tests/test_zgamma_kernel.py).
+DEFAULT_TERMS = ("gamma", "int", "z")
+
+
+def _load_fsr(fsr):
+    """Normalise an FSR-kernel spec to ``{"r", "w", "m_lo", "m_hi"}`` float64.
+
+    ``fsr`` is either such a mapping (lists accepted) or the path to an npz
+    holding those arrays. ``r = m_post / m_pre`` are the kernel's support
+    points and ``w`` the probabilities attached to them; ``r`` must lie in
+    ``(0, 1]`` -- FSR only ever lowers the mass.
+
+    ``m_lo``/``m_hi`` are optional and make the kernel **m-dependent**: an atom
+    fires only for pre-FSR masses inside its own ``[m_lo, m_hi)`` band, and the
+    weights are renormalised *within* each band, so the bands are a piecewise-
+    constant-in-``m_pre`` conditional kernel rather than a single one.  A plain
+    (band-less) kernel is stored as one band spanning ``(0, inf)``.
+
+    An m-independent kernel is exact inclusively -- the ``u = -ln r`` spectrum
+    of this sample is the same to a few per cent from 60 to 150 GeV -- but not
+    once a lepton ``p_T`` cut is applied, because the cut removes hard emission
+    at a rate that itself depends on ``m_pre``.
+    """
+    if isinstance(fsr, str):
+        with np.load(fsr, allow_pickle=False) as d:
+            fsr = {k: d[k] for k in ("r", "w", "m_lo", "m_hi") if k in d}
+    r = np.asarray(fsr["r"], dtype=np.float64).ravel()
+    w = np.asarray(fsr["w"], dtype=np.float64).ravel()
+    if r.shape != w.shape or r.size == 0:
+        raise ValueError("the FSR kernel needs equal-length, non-empty r and w")
+    if not np.all((r > 0.0) & (r <= 1.0 + 1e-12)):
+        raise ValueError("FSR kernel support must satisfy 0 < r <= 1")
+    if np.any(w < 0.0):
+        raise ValueError("FSR kernel weights must be non-negative")
+    if "m_lo" in fsr and fsr["m_lo"] is not None:
+        m_lo = np.asarray(fsr["m_lo"], dtype=np.float64).ravel()
+        m_hi = np.asarray(fsr["m_hi"], dtype=np.float64).ravel()
+        if m_lo.shape != r.shape or m_hi.shape != r.shape:
+            raise ValueError("m_lo/m_hi must be per atom")
+    else:
+        m_lo = np.zeros_like(r)
+        m_hi = np.full_like(r, np.inf)
+    # renormalise each band to unit probability
+    key = np.stack([m_lo, m_hi], axis=1)
+    _, inv = np.unique(key, axis=0, return_inverse=True)
+    tot = np.bincount(inv, w, inv.max() + 1)
+    if np.any(tot <= 0.0):
+        raise ValueError("an FSR kernel band has zero total weight")
+    return {"r": np.minimum(r, 1.0), "w": w / tot[inv], "m_lo": m_lo, "m_hi": m_hi}
+
+
+def _bernstein(u, n):
+    """The ``n + 1`` Bernstein basis polynomials of degree ``n`` at ``u``."""
+    from math import comb
+
+    u = np.clip(np.asarray(u, dtype=np.float64), 0.0, 1.0)
+    return np.stack(
+        [comb(n, k) * u**k * (1.0 - u) ** (n - k) for k in range(n + 1)], axis=-1
+    )
 
 
 def lumi_table_path(name):
@@ -303,6 +389,10 @@ class ZGammaLineshape:
         sin2_param=None,
         sin2=SIN2_DEFAULT,
         sin2_unit=1e-3,
+        terms=DEFAULT_TERMS,
+        acceptance=None,
+        fsr=None,
+        fsr_mmax=None,
         dtype=tf.float64,
     ):
         if width_scheme not in ("fixed", "running"):
@@ -348,6 +438,19 @@ class ZGammaLineshape:
             p for p in (mz_param, gz_param, sin2_param) if p is not None
         )
 
+        self.terms = tuple(terms)
+        bad = set(self.terms) - set(DEFAULT_TERMS)
+        if bad:
+            raise ValueError(
+                f"unknown lineshape term(s) {sorted(bad)}; "
+                f"choose from {DEFAULT_TERMS}"
+            )
+        if not self.terms:
+            raise ValueError("at least one lineshape term must be kept")
+        self.acceptance = None if acceptance is None else dict(acceptance)
+        self.fsr = None if fsr is None else _load_fsr(fsr)
+        self.fsr_mmax = None if fsr_mmax is None else float(fsr_mmax)
+
         # ---- mass grid and luminosities (constants) -----------------------
         m_grid = np.linspace(self.window[0], self.window[1], self.nm)
         self.dm = float(m_grid[1] - m_grid[0])
@@ -355,18 +458,29 @@ class ZGammaLineshape:
 
         log_m, log_lumi, self.lumi_provenance = load_lumi_table(lumi)
         lo, hi = float(np.exp(log_m[0])), float(np.exp(log_m[-1]))
-        if self.window[0] < lo - 1e-9 or self.window[1] > hi + 1e-9:
+        # The FSR fold needs the Born density ABOVE the output window; how far
+        # above is set by the kernel's smallest r, which for an empirical kernel
+        # runs down to O(1e-2) and would demand a 30 TeV grid.  The Born density
+        # there is ~1e-5 of the peak and the kernel weight below r = 0.5 is
+        # 0.7 %, so the grid is capped -- by default at the luminosity table's
+        # own upper edge -- and the migration from beyond it is dropped.
+        if fsr is None:
+            m_hi_needed = self.window[1]
+        else:
+            cap = hi if self.fsr_mmax is None else self.fsr_mmax
+            m_hi_needed = min(self.window[1] / float(self.fsr["r"].min()), cap)
+        self.m_hi_born = m_hi_needed
+        if self.window[0] < lo - 1e-9 or m_hi_needed > hi + 1e-9:
             raise ValueError(
-                f"mass window {self.window} is outside the luminosity table's "
+                f"mass window {self.window} (Born grid up to "
+                f"{m_hi_needed:.1f} GeV) is outside the luminosity table's "
                 f"range [{lo:.3f}, {hi:.3f}] GeV ({self.lumi_provenance['path']}); "
                 "regenerate the table with a wider --m-lo/--m-hi."
             )
         from scipy.interpolate import CubicSpline
 
         lg = np.log(m_grid)
-        self.lumis = np.array(
-            [np.exp(CubicSpline(log_m, row)(lg)) for row in log_lumi]
-        )
+        self.lumis = np.array([np.exp(CubicSpline(log_m, row)(lg)) for row in log_lumi])
 
         # Zero the outermost node on each side: the represented pdf then ramps
         # linearly to zero over one bin instead of stepping, which makes the
@@ -376,18 +490,72 @@ class ZGammaLineshape:
         edge[-1] = 0.0
         self._edge = tf.constant(edge, dtype)
 
-        self._m = tf.constant(m_grid, dtype)
-        self._q2 = tf.constant(m_grid**2, dtype)
-        self._lumis = tf.constant(self.lumis, dtype)
+        # ---- the FSR fold, the acceptance, and the extended Born grid ----
+        # FSR is multiplicative -- m_post = r m_pre with r = 1 - x <= 1 -- so
+        # the *post*-FSR density on the output grid needs the Born density
+        # ABOVE the output window as well:
+        #     p_post(m) = int_0^1 dr k(r) p_born(m/r) / r .
+        # When a kernel is given the Born spectrum is therefore evaluated on an
+        # extended grid of the same spacing, running from window[0] (the
+        # generator's hard m_ll cut, below which p_born is genuinely zero) up to
+        # window[1] / r_lo. p_born is linearly interpolated at m_i / r_j; the
+        # indices and interpolation fractions do not depend on any fitted
+        # parameter, so they are precomputed here and the fold costs two
+        # gathers of shape (nm, n_kernel) per evaluation.
+        if self.fsr is None:
+            m_born = m_grid
+        else:
+            n_ext = int(np.ceil((self.m_hi_born - self.window[0]) / self.dm))
+            n_ext = max(n_ext + 1, self.nm)
+            m_born = self.window[0] + self.dm * np.arange(n_ext)
+        self.m_born = m_born
+        self.n_born = len(m_born)
+
+        acc = self._acceptance_on(m_born)
+        self._acc = None if acc is None else tf.constant(acc, dtype)
+
+        if self.fsr is not None:
+            # The fold is linear in the Born density and its coefficients do not
+            # depend on any fitted parameter, so it collapses to one constant
+            # (nm, n_born) matrix:  p_post = F p_born.  Building F sums the
+            # atoms away at construction time -- a (nm, n_atoms) gather pair
+            # would otherwise be re-materialised, and back-propagated through as
+            # a scatter-add, on every Hessian evaluation, which is 30x slower
+            # for a 3000-atom kernel and does not get cheaper as the kernel is
+            # refined.
+            r = self.fsr["r"]
+            w = self.fsr["w"]
+            F = np.zeros((self.nm, self.n_born))
+            rows = np.arange(self.nm)
+            for j in range(len(r)):
+                m_src = m_grid / r[j]
+                x = (m_src - self.window[0]) / self.dm
+                i0 = np.floor(x).astype(np.int64)
+                frac = x - i0
+                ok = (i0 >= 0) & (i0 + 1 < self.n_born)
+                ok &= (m_src >= self.fsr["m_lo"][j]) & (m_src < self.fsr["m_hi"][j])
+                if not ok.any():
+                    continue
+                c = w[j] / r[j]
+                idx = np.clip(i0, 0, self.n_born - 2)
+                np.add.at(F, (rows[ok], idx[ok]), c * (1.0 - frac[ok]))
+                np.add.at(F, (rows[ok], idx[ok] + 1), c * frac[ok])
+            self._fsr_mat = tf.constant(F, dtype)
+
+        self._m = tf.constant(m_born, dtype)
+        self._q2 = tf.constant(m_born**2, dtype)
+        lg_born = np.log(m_born)
+        self._lumis = tf.constant(
+            np.array([np.exp(CubicSpline(log_m, row)(lg_born)) for row in log_lumi]),
+            dtype,
+        )
 
         # ---- CF grid (constants) ------------------------------------------
         dtau = 2.0 * np.pi / (self.nfft * self.dm)
         # +4 guard points for the 4-point interpolation stencil at the top end
         ntau = min(int(np.ceil(self.tau_max / dtau)) + 4, self.nfft // 2 + 1)
         if ntau < 8:
-            raise ValueError(
-                "tau grid too short; increase tau_max or decrease nfft/nm"
-            )
+            raise ValueError("tau grid too short; increase tau_max or decrease nfft/nm")
         self.dtau = dtau
         self.ntau = ntau
         self.tau_tab = np.arange(ntau) * dtau
@@ -403,6 +571,46 @@ class ZGammaLineshape:
 
         self._npad = self.nfft - self.nm
         self._cache = None
+
+    def _acceptance_on(self, m):
+        """The acceptance factor ``A(m)`` on masses ``m``, or ``None``.
+
+        ``self.acceptance`` is a mapping. Two forms:
+
+        ``{"kind": "bernstein", "lo":, "hi":, "coef": [...]}``
+            ``A(m) = sum_k coef_k B_{k,n}(u)``, ``u = (m - lo)/(hi - lo)``
+            clipped to ``[0, 1]``, so ``A`` is constant outside ``[lo, hi]``.
+            Bernstein because the coefficients are then bounded by the same
+            interval as ``A`` itself, which keeps a fitted acceptance positive
+            without a constraint.
+        ``{"kind": "grid", "m": [...], "a": [...]}``
+            linear interpolation of tabulated values, constant-extrapolated.
+
+        The factor multiplies the *Born* spectrum, before the FSR fold: the
+        probability that a candidate is selected is a property of the pre-FSR
+        event (through the radiation it goes on to emit), and the FSR kernel
+        that follows is the one measured *on selected events*. Together they
+        are the factorisation
+        ``P(m_post, pass) = p_born(m_pre) A(m_pre) K_sel(m_post|m_pre)``.
+        """
+        a = self.acceptance
+        if a is None:
+            return None
+        kind = a.get("kind", "bernstein")
+        m = np.asarray(m, dtype=np.float64)
+        if kind == "bernstein":
+            lo = float(a["lo"])
+            hi = float(a["hi"])
+            coef = np.asarray(a["coef"], dtype=np.float64)
+            b = _bernstein((m - lo) / (hi - lo), len(coef) - 1)
+            out = b @ coef
+        elif kind == "grid":
+            out = np.interp(m, np.asarray(a["m"], float), np.asarray(a["a"], float))
+        else:
+            raise ValueError(f"unknown acceptance kind '{kind}'")
+        if np.any(out < 0.0):
+            raise ValueError("the acceptance must be non-negative")
+        return out
 
     # -- description -------------------------------------------------------
     def config(self):
@@ -425,12 +633,40 @@ class ZGammaLineshape:
             "sin2_param": self.sin2_param,
             "sin2": self.sin2,
             "sin2_unit": self.sin2_unit,
+            "fsr_mmax": self.fsr_mmax,
+            "terms": list(self.terms),
+            "acceptance": (
+                None
+                if self.acceptance is None
+                else {
+                    k: (list(v) if isinstance(v, (list, tuple, np.ndarray)) else v)
+                    for k, v in self.acceptance.items()
+                }
+            ),
+            "fsr": (
+                None
+                if self.fsr is None
+                else {
+                    "r": self.fsr["r"].tolist(),
+                    "w": self.fsr["w"].tolist(),
+                    "m_lo": self.fsr["m_lo"].tolist(),
+                    "m_hi": [
+                        None if not np.isfinite(v) else float(v)
+                        for v in self.fsr["m_hi"]
+                    ],
+                }
+            ),
         }
 
     @classmethod
     def from_config(cls, cfg, dtype=tf.float64):
         cfg = dict(cfg)
         cfg.pop("type", None)
+        f = cfg.get("fsr")
+        if isinstance(f, dict) and "m_hi" in f:
+            f = dict(f)
+            f["m_hi"] = [np.inf if v is None else float(v) for v in f["m_hi"]]
+            cfg["fsr"] = f
         return cls(dtype=dtype, **cfg)
 
     def param_declarations(self, mz_prior=None, gz_prior=None, sin2_prior=None):
@@ -471,12 +707,12 @@ class ZGammaLineshape:
     # -- the physics -------------------------------------------------------
     def _values(self, values):
         one = tf.constant(1.0, self.dtype)
-        mz = tf.constant(self.mz_ref, self.dtype) + values[
-            self.mz_param
-        ] * self.npdt(self.mz_unit)
-        gz = tf.constant(self.gz_ref, self.dtype) + values[
-            self.gz_param
-        ] * self.npdt(self.gz_unit)
+        mz = tf.constant(self.mz_ref, self.dtype) + values[self.mz_param] * self.npdt(
+            self.mz_unit
+        )
+        gz = tf.constant(self.gz_ref, self.dtype) + values[self.gz_param] * self.npdt(
+            self.gz_unit
+        )
         if self.sin2_param is None:
             s2 = tf.constant(self.sin2, self.dtype)
         else:
@@ -524,13 +760,22 @@ class ZGammaLineshape:
             * tf.square(tf.constant(1.0, self.dtype) - s2)
         )
 
+        keep_g = "gamma" in self.terms
+        keep_i = "int" in self.terms
+        keep_z = "z" in self.terms
+
         out = None
         for i, (_, q_f, i3) in enumerate(QUARKS):
             e_f = self.npdt(q_f)
-            me = tf.constant(float(q_f) ** 2 / 2.0, self.dtype) / tf.square(q2)
+            if keep_g:
+                me = tf.constant(float(q_f) ** 2 / 2.0, self.dtype) / tf.square(q2)
+            else:
+                me = tf.zeros_like(q2)
             for g in (-e_f * s2, self.npdt(i3) - e_f * s2):
-                me = me + prop_re * int_c * e_f * g
-                me = me + prop_mod2 * z_c * tf.square(g)
+                if keep_i:
+                    me = me + prop_re * int_c * e_f * g
+                if keep_z:
+                    me = me + prop_mod2 * z_c * tf.square(g)
             term = me * self._lumis[i]
             out = term if out is None else out + term
         out = self.npdt(2.0) * self._m * out
@@ -538,13 +783,39 @@ class ZGammaLineshape:
             out = out * self.npdt(GEV2PB)
         return out
 
+    def born_pdf(self, values=None, **kw):
+        """The Born spectrum on :attr:`m_born`, times the acceptance.
+
+        Not normalised -- :meth:`pdf` does that after the FSR fold.
+        """
+        y = self.dsigma_dm(values, in_pb=False, **kw)
+        if self._acc is not None:
+            y = y * self._acc
+        return y
+
+    def fold_fsr(self, y_born):
+        """Apply the multiplicative FSR kernel, Born grid -> output grid.
+
+        ``p_post(m_i) = sum_j w_j p_born(m_i / r_j) / r_j``, with ``p_born``
+        linearly interpolated and taken to be zero outside :attr:`m_born`; the
+        whole map is the constant matrix built in ``__init__``.
+        """
+        if self.fsr is None:
+            return y_born
+        return tf.linalg.matvec(self._fsr_mat, y_born)
+
     def pdf(self, values=None, **kw):
-        """Normalised, window-truncated lineshape on the mass grid.
+        """Normalised, window-truncated lineshape on :attr:`m_grid`.
+
+        Born spectrum -> acceptance -> FSR fold -> window truncation ->
+        normalisation, so with ``fsr`` given this is the density of the
+        *post*-FSR mass and everything downstream (the CF, and hence
+        :class:`~rabbit.unbinned.MassCFTerm`) models the post-FSR mass directly.
 
         ``sum_k pdf_k * dm == 1`` exactly (the outermost nodes are zero, so the
         trapezoid weight of every interior node is ``dm``).
         """
-        y = self.dsigma_dm(values, in_pb=False, **kw) * self._edge
+        y = self.fold_fsr(self.born_pdf(values, **kw)) * self._edge
         return y / (tf.reduce_sum(y) * self.npdt(self.dm))
 
     def dsigma_dm_np(self, mz=None, gz=None, sin2=None, in_pb=True):
@@ -604,9 +875,7 @@ class ZGammaLineshape:
         """
         n = self.ntau
         x = t_abs / self.npdt(self.dtau)
-        x = tf.clip_by_value(
-            x, tf.constant(0.0, self.dtype), self.npdt(float(n - 3))
-        )
+        x = tf.clip_by_value(x, tf.constant(0.0, self.dtype), self.npdt(float(n - 3)))
         i0 = tf.floor(x)
         f = x - i0
         idx = tf.cast(i0, tf.int32) + 1

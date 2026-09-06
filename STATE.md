@@ -23,7 +23,9 @@ theory nuisances) — see the last section.
 | `de1edcd` | `zgamma.py`, `lineshapes/__init__.py`, `TabulatedLineshapeKernel` wiring, `unbinned.declare_params`, package-data, first cut of the tests |
 | `0218bd6` | test threshold fix, graceful skip in test 6, first STATE.md |
 | `bb85bef` | default `nm = 32768`, `f.param_model` fix in test 6 |
-| (this one) | full test results in STATE.md |
+| `4cf512e` | full test results in STATE.md |
+| `93f74f4`…`3275383` | truncated likelihood (`norm_window`), Fourier-space `Z`, `upsample` |
+| (this one) | **`terms`, `acceptance`, `fsr` in the provider** — see below |
 
 ## Files
 
@@ -67,7 +69,9 @@ the `PhysicsKernel` contract), `density_from_cf(values, m)` (diagnostic),
 
 Constructor knobs: `m_ref`, `window`, `nm`, `nfft`, `tau_max`, `lumi`,
 `width_scheme`, `mz_param`/`gz_param`/`sin2_param`, `mz_ref`/`gz_ref`/`sin2`,
-`mz_unit`/`gz_unit`/`sin2_unit`, `dtype`.
+`mz_unit`/`gz_unit`/`sin2_unit`, `terms`, `acceptance`, `fsr`, `fsr_mmax`,
+`dtype`. New surface: `born_pdf(values)` (Born x acceptance on the extended
+grid `m_born`) and `fold_fsr(y)` (Born grid -> output grid).
 
 Defaults: `nm=32768` (dm = 2.44 MeV), `nfft=16*nm` (dtau = 4.91e-3 GeV^-1),
 `tau_max=40` GeV^-1, `window=(50,130)`, `m_ref=91.1876`,
@@ -397,3 +401,108 @@ resolution costs the Z nothing *given* an external constraint.
 * `m_Z` and the momentum-scale parameter `alpha` are exactly degenerate in a
   single-resonance fit — a Z channel measures `m_Z` only jointly with the
   J/psi (or another) channel that pins the scale.
+
+
+---
+
+# 2026-09-05 — the generator's own parameters, and the FSR fold moved into the provider
+
+Everything below is measured at **generator level** on 29.3 M events
+(N_eff 19.9 M) of `DYJetsToMuMu_H2ErratumFix_TuneCP5_13TeV-powhegMiNNLO-pythia8-photos`
+UL16 MiniAODv2 — the sample the detector-level Z channel will be fitted on.
+Driver, kernels and figures: `calibration_studies/zchannel/`
+(`fit_gen.py`, `README.md` §"Generator-level closure"), figures in
+`~/public_html/cvh/260905_zgen/`.
+
+## 1. The width convention is settled, and the provider already had it right
+
+The gridpack's `powheg.input` sets **no** EW inputs, so running its own
+`pwhg_main` for one initialisation prints what POWHEG used. It reads the PDG
+(running-width) values and converts them to the **constant-width** scheme,
+unconditionally — there is no `runningwidth` flag in this process:
+
+| | POWHEG | provider | difference |
+|---|---|---|---|
+| `m_Z` (used) | 91.153509740726733 | `MZ_FIXED` | 0 |
+| `Gamma_Z` (used) | 2.4932018986110700 | `GZ_FIXED` = 2.4932 | −1.9 keV |
+| `m_W` | 79.906853549493746 | `MW` | 0 |
+| `sin^2` | 0.23153999447822571 | `1 − MW²/MZ_FIXED²` | 1e-16 |
+| `1/alpha(m_Z)` | 128.82531590804655 | derived | 0 |
+| `G_F` | 1.1663787e-5 | same | 0 |
+| lumi PDF | `lhaid 306000` | `NNPDF31_nnlo_as_0118` mem 0 | same set |
+| `m_ll` range | `min_Z_mass 50` | window lower edge 50 | same |
+
+So `width_scheme="fixed"` and every EW constant of `ZGammaLineshape` **is** the
+generator's. Fitting in either convention against its own reference agrees to
+0.2 MeV; the 34 MeV is entirely in the reference value.
+
+## 2. What the provider was missing, and now has
+
+* **`terms=("gamma","int","z")`** — select the matrix-element pieces.
+* **`acceptance=`** — a smooth multiplicative `A(m)` (Bernstein or a grid)
+  applied to the Born spectrum *before* the FSR fold.
+* **`fsr=`** — the **multiplicative** FSR fold,
+  `p_post(m) = sum_j w_j p_born(m/r_j)/r_j`, on a Born grid extended above the
+  window (capped by `fsr_mmax`, default the luminosity table's edge). Optional
+  per-atom `m_lo`/`m_hi` bands make it piecewise constant in `m_pre`.
+  Everything downstream — `pdf`, `cf_tab`, `MassCFTerm` — then models the
+  **post**-FSR mass as a function of the POIs alone, which is what the earlier
+  note asked for (`dm/m_pre` is nearly `m_pre`-independent while `dm` is not, so
+  `MassCFTerm`'s additive `phi_K` was an approximation).
+  The fold is one constant `(nm, n_born)` matrix built in `__init__`; a
+  gather-based version was 30x slower once the kernel had a few thousand atoms
+  (its backward pass is a scatter-add over `nm x n_atoms`).
+
+## 3. Closure (window 60–120 GeV, all errors are the weighted sandwich)
+
+| model | Δ`m_Z` [MeV] | Δ`Gamma_Z` [MeV] |
+|---|---|---|
+| pre-FSR, 2 parameters | −2.47 ± 0.40 | **+75.83 ± 0.85** |
+| pre-FSR + 5-term smooth `K(m)` | −0.45 ± 0.50 | +1.14 ± 0.97 |
+| post-FSR, no fold | −227.1 ± 0.48 | +741.3 ± 1.19 |
+| post-FSR, no fold, + `K(m)` | −30.7 ± 0.56 | +317.0 ± 1.19 |
+| **post-FSR, folded, + `K(m)`** | **+0.15 ± 0.56** | **+1.31 ± 1.14** |
+| fiducial (pT>25, \|eta\|<2.4), folded + `A(m)` + `K(m)` | **−0.31 ± 0.87** | **+2.61 ± 1.75** |
+
+## 4. The one thing the provider does *not* model: the NNLO K-factor
+
+The hard ME and the parton luminosity are both LO, and the sample is MiNNLO.
+The generated/model ratio runs 1.7 (55 GeV) → 1.0 (peak) → 1.2 (150 GeV), which
+is why the 2-parameter fit puts +76 MeV on the width. It is **not** a luminosity
+choice — over NNPDF3.1 NNLO / its replica 1 / NNPDF3.1 LO / CT18 NNLO and
+mu_F in [Q/2, 2Q] the bias moves by only ±3 MeV (`m_Z`) and ±4 MeV (`Gamma_Z`),
+about 5 % of the effect — and it is **not degenerate with the POIs**: floating
+5 Legendre terms restores the inputs, costs 1.25x / 1.21x on the errors, has
+every rho(POI, c_k) below 0.40, and makes the fitted POIs agree across all five
+luminosities to 0.25 MeV / 0.03 MeV.
+
+**Therefore the detector-level Z card must float a smooth `K(m)`.** Without one
+the kernel is wrong by 76 MeV on the width — 50x its projected statistical
+error.
+
+## 5. FSR-kernel systematics that carry over to data
+
+* **Quadrature.** The atoms are a midpoint rule, so the bias goes as the square
+  of the in-group spread of `u = -ln r`: 1e-2 → +152, 3.3e-3 → +29,
+  1e-3 → +3.9, 3.3e-4 → +1.3, 1e-4 → +0.7 MeV on `Gamma_Z`. `build_kernel`'s
+  default is now 3.3e-4 (~3200 atoms).
+* **`m_pre`-dependence.** Inclusively the kernel is multiplicative to a few per
+  cent (⟨u⟩ 26.2e-3 → 28.8e-3 from 60–80 to 110–150 GeV) and banding moves the
+  fit by 0.3 / 0.7 MeV. Under a **tight fiducial cut it is not**: ⟨u⟩ runs
+  7.1e-3 → 14.9e-3, a factor two, and using the inclusive kernel on the
+  fiducial sample costs 3.2 MeV on `m_Z`. Bands are mandatory there.
+* **Kernel statistics.** Half-sample split: 0.4 MeV on `Gamma_Z` at 15 M gen
+  events, i.e. negligible.
+* **Numerics.** `nm` 4096/8192/16384 and a Born grid capped at 160 or 200 GeV
+  all agree to 0.06 MeV.
+
+## 6. What this leaves for the detector-level card
+
+1. a floating `K(m)` (5 Legendre terms, or the same idea as a Bernstein);
+2. `fsr=` a banded kernel built with the **analysis** selection, `sigma_cap`
+   3.3e-4 or finer;
+3. `acceptance=` the reco acceptance (at gen level `A(m)` is degenerate with
+   `K(m)` — dropping it changed the fit by 0.3 / 0.9 MeV — so it matters only
+   inasmuch as it is *not* smooth);
+4. everything above is *in addition to* the resolution, the background and the
+   `m_Z`–`alpha` degeneracy already listed.

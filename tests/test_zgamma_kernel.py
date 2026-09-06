@@ -34,6 +34,13 @@ Checks, in order:
    NLL through the Fitter matches the term evaluated directly, ``m_Z`` and
    ``Gamma_Z`` come out as the two POIs, and a Gaussian prior on ``Gamma_Z``
    is applied.
+7. **terms / acceptance / FSR fold** -- the three optional modifiers of the
+   Born spectrum, each against a closed form: switching matrix-element pieces
+   off reproduces the piecewise sums; an acceptance multiplies the *un*folded
+   pdf exactly; a one-atom FSR kernel at ``r0`` is a pure rescaling, so the
+   folded pdf must equal ``p_born(m/r0)/r0``; a two-atom kernel is the weighted
+   sum of two such rescalings; a one-band kernel equals the band-less one; and
+   the whole configuration round-trips through ``config()``/``from_config``.
 
 Run (in the rabbit / wmassdev singularity)::
 
@@ -275,9 +282,7 @@ def test_cf(args):
     # same exact convolution at nm and at 4 nm. This is the O(dm^2) piece and
     # the only approximation left in the density; it is a smooth, systematic
     # few-ppm shape effect, far below the statistical reach of any Z sample.
-    fine = ZGammaLineshape(
-        window=tuple(args.window), nm=4 * args.nm, nfft=args.nfft
-    )
+    fine = ZGammaLineshape(window=tuple(args.window), nm=4 * args.nm, nfft=args.nfft)
     d_c = _gauss_smear(z, p, 1.5, m_at)
     d_f = _gauss_smear(fine, fine.pdf(v).numpy(), 1.5, m_at)
     print(
@@ -467,9 +472,7 @@ def test_wrong_kernel(args, toy, ref=None):
     )
     mz_true_abs = z.mz_ref + args.mz_true * 1e-3
     bias = res.x[1] * 1e-3 + z.m_ref - mz_true_abs  # GeV
-    for lab, v, e in zip(
-        ["k_res", "dm_bw [MeV]", "Gamma_bw [MeV]"], res.x, err
-    ):
+    for lab, v, e in zip(["k_res", "dm_bw [MeV]", "Gamma_bw [MeV]"], res.x, err):
         print(f"    {lab:>15s} = {v:11.4f} +- {e:.4f}")
     print(
         f"\n    the Breit-Wigner peak lands at "
@@ -546,9 +549,7 @@ def test_datacard(args):
             "k_res": (1.0, np.nan, 1.0, 0),
         },
     )
-    print(
-        f"  declarations: {dict(zip(term.param_names, zip(*decl.values())))}"
-    )
+    print(f"  declarations: {dict(zip(term.param_names, zip(*decl.values())))}")
 
     w = TensorWriter()
     w.add_dummy_channel()
@@ -585,7 +586,9 @@ def test_datacard(args):
         ok &= npoi == 2 and set(names[:npoi]) == {"m_Z", "Gamma_Z"}
 
         # the NLL through the Fitter equals the term evaluated directly
-        x = np.array([decl["param_defaults"][term.param_names.index(nm)] for nm in names])
+        x = np.array(
+            [decl["param_defaults"][term.param_names.index(nm)] for nm in names]
+        )
         rng2 = np.random.default_rng(11)
         for _ in range(2):
             xt = x + rng2.normal(0.0, 0.3, len(names))
@@ -619,6 +622,99 @@ def test_datacard(args):
 
 
 # ---------------------------------------------------------------------------
+def test_modifiers(args):
+    """Test 7: ``terms``, ``acceptance`` and the multiplicative FSR fold."""
+    import json
+
+    import numpy as np
+    import tensorflow as tf
+
+    from rabbit.lineshapes import ZGammaLineshape
+
+    print("\n=== 7. terms / acceptance / FSR fold ===")
+    ok = True
+    W = (60.0, 130.0)
+    NM = 4096
+    kw = dict(window=W, nm=NM, nfft=NM, tau_max=1.0)
+    V = {"m_Z": tf.constant(0.0, tf.float64), "Gamma_Z": tf.constant(0.0, tf.float64)}
+
+    # (a) the matrix-element pieces add up
+    full = ZGammaLineshape(**kw).dsigma_dm(V).numpy()
+    parts = np.zeros_like(full)
+    for t in ("gamma", "int", "z"):
+        parts += ZGammaLineshape(terms=(t,), **kw).dsigma_dm(V).numpy()
+    d = np.max(np.abs(parts - full)) / np.max(np.abs(full))
+    print(f"  7a. gamma + int + z == full ME: max rel dev {d:.2e}")
+    ok &= d < 1e-13
+
+    # (b) the acceptance multiplies the pdf and then renormalises
+    acc = {"kind": "bernstein", "lo": W[0], "hi": W[1], "coef": [0.2, 0.6, 0.9, 0.7]}
+    z0 = ZGammaLineshape(**kw)
+    za = ZGammaLineshape(acceptance=acc, **kw)
+    a = za._acceptance_on(z0.m_grid)
+    want = z0.pdf(V).numpy() * a
+    want = want / (want.sum() * z0.dm)
+    got = za.pdf(V).numpy()
+    d = np.max(np.abs(got - want)) / np.max(want)
+    print(f"  7b. acceptance x pdf, renormalised: max rel dev {d:.2e}")
+    ok &= d < 1e-12
+
+    # (c) a one-atom kernel at r0 is a pure rescaling of the Born spectrum
+    r0 = 0.97
+    zf = ZGammaLineshape(fsr={"r": [r0], "w": [1.0]}, **kw)
+    got = zf.pdf(V).numpy()
+    yb = zf.born_pdf(V).numpy()
+    want = np.interp(zf.m_grid / r0, zf.m_born, yb, left=0.0, right=0.0) / r0
+    want = want * zf._edge.numpy()
+    want = want / (want.sum() * zf.dm)
+    d = np.max(np.abs(got - want)) / np.max(want)
+    peak_shift = zf.m_grid[np.argmax(got)] - z0.m_grid[np.argmax(z0.pdf(V).numpy())]
+    print(
+        f"  7c. one atom at r = {r0}: max rel dev {d:.2e}, "
+        f"peak moved {peak_shift:+.3f} GeV (expect ~{-(1-r0)*91.2:+.3f})"
+    )
+    ok &= d < 1e-12
+    ok &= abs(peak_shift + (1 - r0) * 91.2) < 0.2
+
+    # (d) two atoms are the weighted sum of two rescalings
+    rr, ww = [1.0, 0.9], [0.6, 0.4]
+    z2 = ZGammaLineshape(fsr={"r": rr, "w": ww}, **kw)
+    yb = z2.born_pdf(V).numpy()
+    want = np.zeros(NM)
+    for r, wt in zip(rr, ww):
+        want += wt / r * np.interp(z2.m_grid / r, z2.m_born, yb, left=0.0, right=0.0)
+    want = want * z2._edge.numpy()
+    want = want / (want.sum() * z2.dm)
+    got = z2.pdf(V).numpy()
+    d = np.max(np.abs(got - want)) / np.max(want)
+    n = float(got.sum() * z2.dm)
+    print(f"  7d. two atoms: max rel dev {d:.2e}, norm {n:.15f}")
+    ok &= d < 1e-12 and abs(n - 1.0) < 1e-12
+
+    # (e) one band spanning everything == no band
+    zb = ZGammaLineshape(
+        fsr={"r": rr, "w": ww, "m_lo": [0.0, 0.0], "m_hi": [1e9, 1e9]}, **kw
+    )
+    d = np.max(np.abs(zb.pdf(V).numpy() - got)) / np.max(got)
+    print(f"  7e. one all-inclusive band == band-less: max rel dev {d:.2e}")
+    ok &= d < 1e-14
+
+    # (f) config round trip
+    cfg = ZGammaLineshape(
+        terms=("z", "int"), acceptance=acc, fsr={"r": rr, "w": ww}, **kw
+    ).config()
+    zc = ZGammaLineshape.from_config(json.loads(json.dumps(cfg)))
+    zr = ZGammaLineshape(
+        terms=("z", "int"), acceptance=acc, fsr={"r": rr, "w": ww}, **kw
+    )
+    d = np.max(np.abs(zc.pdf(V).numpy() - zr.pdf(V).numpy()))
+    print(f"  7f. config -> JSON -> from_config: max abs dev {d:.2e}")
+    ok &= d == 0.0
+
+    print("  PASS" if ok else "  FAIL")
+    return ok
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -664,6 +760,8 @@ def main():
             results["5 wrong kernel"] = test_wrong_kernel(args, toy)
     if 6 not in args.skip:
         results["6 datacard round trip"] = test_datacard(args)
+    if 7 not in args.skip:
+        results["7 terms/acceptance/FSR"] = test_modifiers(args)
 
     print("\n" + "=" * 62)
     for k, v in results.items():
