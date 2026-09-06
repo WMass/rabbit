@@ -393,6 +393,8 @@ class ZGammaLineshape:
         acceptance=None,
         fsr=None,
         fsr_mmax=None,
+        shape=0,
+        shape_window=None,
         dtype=tf.float64,
     ):
         if width_scheme not in ("fixed", "running"):
@@ -434,8 +436,13 @@ class ZGammaLineshape:
         self.sin2_param = sin2_param
         self.sin2 = float(sin2)
         self.sin2_unit = float(sin2_unit)
+        self.shape = int(shape)
+        if self.shape < 0:
+            raise ValueError("shape must be >= 0")
+        self.shape_params = tuple(f"shape{k}" for k in range(1, self.shape + 1))
         self.param_names = tuple(
-            p for p in (mz_param, gz_param, sin2_param) if p is not None
+            [p for p in (mz_param, gz_param, sin2_param) if p is not None]
+            + list(self.shape_params)
         )
 
         self.terms = tuple(terms)
@@ -513,6 +520,7 @@ class ZGammaLineshape:
 
         acc = self._acceptance_on(m_born)
         self._acc = None if acc is None else tf.constant(acc, dtype)
+        self._build_shape_basis(shape_window)
 
         if self.fsr is not None:
             # The fold is linear in the Born density and its coefficients do not
@@ -613,6 +621,52 @@ class ZGammaLineshape:
         return out
 
     # -- description -------------------------------------------------------
+    def _build_shape_basis(self, shape_window):
+        """Legendre basis of the smooth K(m), tabulated on the Born grid.
+
+        ``K(m) = exp(sum_{k>=1} c_k P_k(u))``, ``u = 2(m - lo)/(hi - lo) - 1``
+        over ``shape_window`` (the FIT window, not the Born support -- that is
+        where the coefficients are meant to be orthogonal). ``k`` starts at 1:
+        ``P_0`` is a constant and the overall normalisation is already free.
+        Identical construction to ``zchannel/fit_gen.py`` ``GenFit``.
+        """
+        self.shape_window = (
+            tuple(self.window)
+            if shape_window is None
+            else (float(shape_window[0]), float(shape_window[1]))
+        )
+        if not self.shape:
+            self._shape_basis = None
+            return
+        lo, hi = self.shape_window
+        if not lo < hi:
+            raise ValueError(f"empty shape window {self.shape_window}")
+        from numpy.polynomial import legendre
+
+        uu = 2.0 * (self.m_born - lo) / (hi - lo) - 1.0
+        basis = np.stack(
+            [legendre.legval(uu, [0] * k + [1]) for k in range(1, self.shape + 1)]
+        )
+        self._shape_basis = tf.constant(basis, self.dtype)
+
+    def _shape_factor(self, values):
+        """``exp(sum_k c_k P_k)`` on the Born grid, or None."""
+        if not self.shape or self._shape_basis is None:
+            return None
+        if not values:
+            return None
+        c = tf.stack(
+            [
+                tf.cast(values[p], self.dtype)
+                for p in self.shape_params
+                if p in values
+            ]
+        )
+        if int(c.shape[0]) != self.shape:
+            return None
+        arg = tf.tensordot(c, self._shape_basis, axes=1)
+        return tf.exp(tf.clip_by_value(arg, self.npdt(-30.0), self.npdt(30.0)))
+
     def config(self):
         """JSON-serialisable description, round-tripped by :func:`from_config`."""
         return {
@@ -634,6 +688,8 @@ class ZGammaLineshape:
             "sin2": self.sin2,
             "sin2_unit": self.sin2_unit,
             "fsr_mmax": self.fsr_mmax,
+            "shape": self.shape,
+            "shape_window": list(self.shape_window),
             "terms": list(self.terms),
             "acceptance": (
                 None
@@ -669,7 +725,9 @@ class ZGammaLineshape:
             cfg["fsr"] = f
         return cls(dtype=dtype, **cfg)
 
-    def param_declarations(self, mz_prior=None, gz_prior=None, sin2_prior=None):
+    def param_declarations(
+        self, mz_prior=None, gz_prior=None, sin2_prior=None, shape_prior=None
+    ):
         """Per-parameter ``(default, prior_sigma, prior_mean, is_poi)`` rows.
 
         Ordered like :attr:`param_names`. Defaults are 0 (i.e. the reference
@@ -689,6 +747,8 @@ class ZGammaLineshape:
         }
         if self.sin2_param is not None:
             rows[self.sin2_param] = (0.0, sin2_prior, 0.0, 0)
+        for p in self.shape_params:
+            rows[p] = (0.0, shape_prior, 0.0, 0)
         return {
             k: (v[0], np.nan if v[1] is None else float(v[1]), v[2], v[3])
             for k, v in rows.items()
@@ -791,6 +851,9 @@ class ZGammaLineshape:
         y = self.dsigma_dm(values, in_pb=False, **kw)
         if self._acc is not None:
             y = y * self._acc
+        k = self._shape_factor(values)
+        if k is not None:
+            y = y * k
         return y
 
     def fold_fsr(self, y_born):
