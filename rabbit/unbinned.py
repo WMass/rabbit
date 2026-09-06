@@ -707,6 +707,51 @@ class MassCFTerm(UnbinnedTerm):
         """Parameter names a subclass contributes (see ``MaterialCFTerm``)."""
         return ()
 
+    # ---- hooks a subclass overrides to change WHAT is evaluated, without
+    # ---- touching the quadrature that evaluates it.  All three are no-ops
+    # ---- here, so MassCFTerm's NLL is unchanged.
+    def _chunk_exponent_scale(self, values, ci):
+        """Optional per-candidate ``(nchunk,)`` multiplier of the resolution
+        log-CF exponent, applied to Re S and Im S alike.
+
+        Reserved for effects that scale a candidate's whole process-noise
+        exponent by something other than the material amounts -- e.g. the
+        dependence of the FITTED per-candidate sigma on the candidate's own
+        fluctuation (the block variances are evaluated at the fitted state, so
+        sigma_obs = sigma_bar (1 + a x)).  Returning ``None`` means 1.
+        """
+        return None
+
+    def _chunk_residual(self, values, ci):
+        """Residual ``delta_i`` fed to the inverse-Fourier integral.
+
+        Default: ``m_i^0 - m_ref - (scale + kernel shift) - (D theta)_i``, i.e.
+        LINEAR in the parameters.  A subclass may return any per-candidate
+        function of them -- in particular a nonlinear transform to a
+        truth-referenced variable -- provided it also supplies the matching
+        ``_chunk_logjac``.
+        """
+        lo, hi = self._chunks[ci]
+        shift = self._mass_shift(values)
+        delta = self.mobs[lo:hi] if shift is None else self.mobs[lo:hi] - shift
+        if self._jac_chunks is not None:
+            theta = tf.stack([values[p] for p in self.jac_params])
+            dj = tf.squeeze(
+                tf.sparse.sparse_dense_matmul(self._jac_chunks[ci], theta[:, None]),
+                axis=-1,
+            )
+            delta = delta - dj
+        return delta
+
+    def _chunk_logjac(self, values, ci):
+        """Optional ``log |d(residual)/d(observable)|`` of chunk ``ci``.
+
+        A nonlinear ``_chunk_residual`` changes the measure, and the density
+        the likelihood needs is ``p_x(x_i) |dx_i/dm_i|``.  ``None`` means the
+        transform is the identity (unit Jacobian), which is the linear default.
+        """
+        return None
+
     def _mass_shift(self, values):
         """Predicted mass minus ``m_ref``: the scalar (candidate-independent) part."""
         shift = None
@@ -755,6 +800,12 @@ class MassCFTerm(UnbinnedTerm):
         t_abs = self.tgrid[None, :] / sigma[:, None]
 
         s_re, s_im = self._chunk_resolution(values, ci)
+        escale = self._chunk_exponent_scale(values, ci)
+        if escale is not None:
+            if s_re is not None:
+                s_re = s_re * escale[:, None]
+            if s_im is not None:
+                s_im = s_im * escale[:, None]
 
         # physics-kernel CF (delta: nothing; Breit-Wigner: -Gamma |t| / 2)
         k_re, k_im = self.kernel.log_cf(values, t_abs)
@@ -763,16 +814,9 @@ class MassCFTerm(UnbinnedTerm):
         if k_im is not None:
             s_im = k_im if s_im is None else s_im + k_im
 
-        # predicted mass: m_ref alpha + dm_res + (D theta)_i
-        shift = self._mass_shift(values)
-        delta = self.mobs[lo:hi] if shift is None else self.mobs[lo:hi] - shift
-        if self._jac_chunks is not None:
-            theta = tf.stack([values[p] for p in self.jac_params])
-            dj = tf.squeeze(
-                tf.sparse.sparse_dense_matmul(self._jac_chunks[ci], theta[:, None]),
-                axis=-1,
-            )
-            delta = delta - dj
+        # residual: m_i^0 - m_ref - (m_ref alpha + dm_kernel) - (D theta)_i,
+        # or whatever a subclass makes of it (see _chunk_residual)
+        delta = self._chunk_residual(values, ci)
 
         # Re[phi_K e^S e^{-i t delta}] = e^{Sre} (Re phi_K cos psi - Im phi_K sin psi)
         # with psi = Sim - t delta; all-real arithmetic, no complex gradients.
@@ -819,6 +863,9 @@ class MassCFTerm(UnbinnedTerm):
             total = (tf.constant(1.0, dtype) - fb) * lp + fb * bkg
 
         logl = tf.math.log(total)
+        lj = self._chunk_logjac(values, ci)
+        if lj is not None:
+            logl = logl + lj
         if self.weights is not None:
             logl = self.weights[lo:hi] * logl
         return -tf.reduce_sum(logl)
