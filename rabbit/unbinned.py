@@ -632,6 +632,10 @@ class MassCFTerm(UnbinnedTerm):
         weights=None,
         a_res=None,
         self_consistent_sigma=True,
+        jensen_s2=None,
+        jensen_mode="exact",
+        jensen_scale=1.0,
+        jensen_disc_floor=0.1,
         sigma_floor=SIGMA_FLOOR,
         norm_window=None,
         norm_tpoints=8192,
@@ -726,6 +730,40 @@ class MassCFTerm(UnbinnedTerm):
             and self.self_consistent_sigma
             and bool(np.any(self._a_res_np != 0.0))
         )
+
+        # ---- the second-order (Jensen) correction ------------------------
+        if jensen_mode not in ("off", "shift", "exact"):
+            raise ValueError(
+                f"jensen_mode must be 'off', 'shift' or 'exact', "
+                f"got '{jensen_mode}'"
+            )
+        self.jensen_mode = jensen_mode
+        self.jensen_scale = float(jensen_scale)
+        self.jensen_disc_floor = float(jensen_disc_floor)
+        self._jensen_s2_np = None
+        if jensen_s2 is not None:
+            arr = np.asarray(jensen_s2, dtype=np.float64).ravel()
+            if arr.shape != (self.n,):
+                raise ValueError(
+                    f"jensen_s2 has shape {arr.shape}, expected {(self.n,)}"
+                )
+            if np.any(arr < 0.0):
+                raise ValueError("jensen_s2 must be non-negative (it is a variance)")
+            self._jensen_s2_np = arr
+            self.jensen_s2 = tf.constant(arr, dtype)
+        else:
+            self.jensen_s2 = None
+        self._jensen = (
+            self.jensen_mode != "off"
+            and self.jensen_s2 is not None
+            and self.jensen_scale != 0.0
+            and bool(np.any(self._jensen_s2_np != 0.0))
+        )
+        # the OBSERVED mass, the denominator of r = delta/m. Truth-free.
+        self._jensen_m = tf.constant(mobs + float(m_ref), dtype)
+        # `_chunk_residual` computes u and `_chunk_logjac` needs it; both are
+        # called once per chunk, residual first, inside one graph.
+        self._jensen_u = {}
 
         # ---- families -----------------------------------------------------
         self.families = []
@@ -920,11 +958,19 @@ class MassCFTerm(UnbinnedTerm):
     def _chunk_mean_shift(self, values, ci):
         """Optional per-candidate ``(nchunk,)`` ADDITIVE shift of the model mean.
 
-        Reserved for a deterministic per-candidate offset of the predicted mass
-        that is not a global parameter -- e.g. the second-order Jensen term of
-        the mass functional, ``0.5 tr(H Sigma)``.  ``None`` means zero.
+        The second-order (Jensen) term of the mass functional,
+        ``0.5 tr(H Sigma) = 1.5 s^2 m``, in the ``shift`` form: a deterministic
+        location offset the MLE is ASSUMED to respond to with weight 1.  It
+        does not (the measured response is 0.73 at J/psi resolution and 0.56 at
+        Z-like), so this form over-corrects by 27-44 % and exists only for
+        comparison.  ``jensen_mode="exact"`` is the default and does the work
+        in :meth:`_chunk_residual` instead.  ``None`` means zero.
         """
-        return None
+        if not self._jensen or self.jensen_mode != "shift":
+            return None
+        lo, hi = self._chunks[ci]
+        return (self.npdt(1.5 * self.jensen_scale)
+                * self.jensen_s2[lo:hi] * self._jensen_m[lo:hi])
 
     def _chunk_sigma(self, values, ci, delta):
         """Per-candidate ``(nchunk,)`` resolution, which DEPENDS on the
@@ -1009,7 +1055,36 @@ class MassCFTerm(UnbinnedTerm):
         ms = self._chunk_mean_shift(values, ci)
         if ms is not None:
             delta = delta - ms
-        return delta
+        return self._jensen_exact(delta, ci)
+
+    def _jensen_exact(self, delta, ci):
+        """Invert the second-order mass map; identity unless mode is 'exact'.
+
+        ``m_hat/m - 1 = u + u^2 + s^2/2`` (uncorrelated equal legs,
+        ``m ~ (k1 k2)^{-1/2}``), so with ``r = delta/m``
+
+            u = 1/2 (sqrt(max(1 + 4(r - s^2/2), floor)) - 1)
+
+        and the density picks up ``du/dr = 1/(1 + 2u)``, which
+        :meth:`_chunk_logjac` supplies.  The discriminant floor only bites
+        where ``r < -1/4``, i.e. a candidate more than a quarter of its own
+        mass below the pole -- the far tail, where the second-order expansion
+        has no meaning either way.
+        """
+        if not self._jensen or self.jensen_mode != "exact":
+            self._jensen_u.pop(ci, None)
+            return delta
+        lo, hi = self._chunks[ci]
+        m = self._jensen_m[lo:hi]
+        s2 = self.npdt(self.jensen_scale) * self.jensen_s2[lo:hi]
+        r = delta / m
+        disc = tf.maximum(
+            self.npdt(1.0) + self.npdt(4.0) * (r - self.npdt(0.5) * s2),
+            self.npdt(self.jensen_disc_floor),
+        )
+        u = self.npdt(0.5) * (tf.sqrt(disc) - self.npdt(1.0))
+        self._jensen_u[ci] = u
+        return u * m
 
     def _chunk_logjac(self, values, ci):
         """Optional ``log |d(residual)/d(observable)|`` of chunk ``ci``.
@@ -1017,8 +1092,20 @@ class MassCFTerm(UnbinnedTerm):
         A nonlinear ``_chunk_residual`` changes the measure, and the density
         the likelihood needs is ``p_x(x_i) |dx_i/dm_i|``.  ``None`` means the
         transform is the identity (unit Jacobian), which is the linear default.
+
+        For the exact Jensen map that is ``-log(1 + 2u)``.  It must not be
+        dropped: without it the transform is a rescaling, not a
+        reparameterisation, and the correction is wrong at its own order.
         """
-        return None
+        if not self._jensen or self.jensen_mode != "exact":
+            return None
+        u = self._jensen_u.get(ci)
+        if u is None:
+            raise RuntimeError(
+                "_chunk_logjac was called before _chunk_residual for chunk "
+                f"{ci}; the Jensen Jacobian has nothing to report"
+            )
+        return -tf.math.log(self.npdt(1.0) + self.npdt(2.0) * u)
 
     def _mass_shift(self, values):
         """Predicted mass minus ``m_ref``: the scalar (candidate-independent) part."""
@@ -1475,6 +1562,9 @@ class MassCFTerm(UnbinnedTerm):
             "floor": self.floor,
             "floor_scale": self.floor_scale,
             "self_consistent_sigma": self.self_consistent_sigma,
+            "jensen_mode": self.jensen_mode,
+            "jensen_scale": self.jensen_scale,
+            "jensen_disc_floor": self.jensen_disc_floor,
             "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,
             "norm_window": None if self.norm_window is None else list(self.norm_window),
@@ -1991,6 +2081,7 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
             vgf=data.pop("vgf", None),
             weights=data.pop("weights", None),
             a_res=data.pop("a_res", None),
+            jensen_s2=data.pop("jensen_s2", None),
             phik=phik,
             phik_grid=phik_grid,
             norm=norm,
