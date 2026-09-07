@@ -570,6 +570,10 @@ class MassCFTerm(UnbinnedTerm):
         which is bit-identical to the code before the correction existed.
     self_consistent_sigma : bool
         Master switch for that correction; ``False`` ignores ``a_res``.
+    corr_coeff_max : float
+        Bound on the fluctuation form's quadratic coefficient ``|c_i/sigma_i|``
+        -- the expansion parameter itself. A per-candidate constant, so it is
+        parameter-independent; see :meth:`_build_fluct`. 0 disables it.
     corr_form : {"residual", "fluctuation"}
         WHERE the two corrections act. ``"residual"`` is the historical form
         measured on the J/psi: the width is evaluated at ``delta_i(theta)`` and
@@ -646,6 +650,7 @@ class MassCFTerm(UnbinnedTerm):
         jensen_disc_floor=0.1,
         corr_clip=0.0,
         corr_form="residual",
+        corr_coeff_max=0.08,
         sigma_floor=SIGMA_FLOOR,
         norm_window=None,
         norm_tpoints=8192,
@@ -798,6 +803,7 @@ class MassCFTerm(UnbinnedTerm):
                 f"corr_form must be 'residual' or 'fluctuation', got '{corr_form}'"
             )
         self.corr_form = corr_form
+        self.corr_coeff_max = float(corr_coeff_max)
         self._fluct = corr_form == "fluctuation"
         if self._fluct and jensen_mode == "shift":
             raise ValueError(
@@ -1230,6 +1236,35 @@ class MassCFTerm(UnbinnedTerm):
         sig = np.asarray(sigma, dtype=np.float64)
         # c_i / sigma_i  (the linear scale is sigma_i itself)
         g = -a + (sig / mden if jen else 0.0)
+        # THE DOMAIN OF THE EXPANSION, as a bound on the COEFFICIENT (not on
+        # any argument -- that was `corr_clip`'s mistake).  The quadratic term
+        # of the map contributes `g_i x^2` against the linear `x`, so `g_i` IS
+        # the expansion parameter, and where `|g_i| |x| ~ 1` the first-order
+        # truncation stops being a correction: the modelled density can go
+        # NEGATIVE in the tail.  Measured on the 300 k Z card: with both
+        # corrections on, `|g|` reaches 0.097 and NOT ONE of 300 000 densities
+        # is non-positive; with the Jensen term switched off the cancellation
+        # `g = -vgf sigma/m` is gone, `|g|` reaches 0.197, and 19 candidates
+        # (all with sigma_m/m > 0.066) go negative and take the NLL to -inf.
+        # `corr_coeff_max` bounds `|g_i|`; it is a per-candidate CONSTANT
+        # computed from observables, so it is theta-independent and cannot
+        # deform the likelihood's dependence on the parameters.  Scanned on the
+        # 300 k Z card at five parameter points (reference, m_Z +-30 MeV,
+        # Gamma_Z +-60 MeV): 0.10 leaves 2-3 non-positive densities in the
+        # `nojensen` arm, 0.08 leaves NONE anywhere, at the cost of bounding
+        # 364 of 300 000 candidates (0.12 %) in the physics configuration --
+        # all of them with sigma_m/m > 0.066, i.e. a factor 40 less weight in
+        # the mass than a typical candidate.
+        if self.corr_coeff_max > 0.0:
+            nlim = int(np.sum(np.abs(g) > self.corr_coeff_max))
+            if nlim:
+                logger.info(
+                    f"unbinned term '{self.name}': {nlim} of {n} candidates "
+                    f"({100.0 * nlim / max(n, 1):.4f} %) have |c_i/sigma_i| "
+                    f"above corr_coeff_max = {self.corr_coeff_max:g}; the "
+                    f"quadratic coefficient is bounded there"
+                )
+            g = np.clip(g, -self.corr_coeff_max, self.corr_coeff_max)
         d = (
             0.5 * self.jensen_scale * self._jensen_s2_np * m
             if jen
@@ -1936,6 +1971,7 @@ class MassCFTerm(UnbinnedTerm):
             "jensen_disc_floor": self.jensen_disc_floor,
             "corr_clip": self.corr_clip,
             "corr_form": self.corr_form,
+            "corr_coeff_max": self.corr_coeff_max,
             "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,
             "norm_window": None if self.norm_window is None else list(self.norm_window),
