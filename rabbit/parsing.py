@@ -237,6 +237,26 @@ def common_parser():
         "across re-solves after rejected steps",
     )
     parser.add_argument(
+        "--nDevices",
+        default=1,
+        type=int,
+        help="Shard the likelihood over this many devices (bins-sharded "
+        "data parallelism, GPUs preferred). The main motivation is memory: "
+        "every large tensor in the fit is bins-proportional and gets split "
+        "across the devices, so models that exceed a single GPU's memory "
+        "become fittable; compute also scales when each shard is large "
+        "enough to saturate its device. Only the dense-tensor Poisson/chi2 "
+        "likelihoods are supported (no sparse mode, no --covarianceFit).",
+    )
+    parser.add_argument(
+        "--devices",
+        default=None,
+        type=int,
+        nargs="+",
+        help="Explicit physical GPU indices to use (overrides the automatic "
+        "least-occupied selection). The number given should match --nDevices.",
+    )
+    parser.add_argument(
         "--precondition",
         action="store_true",
         help="Reparameterise a block of parameters so the reference Hessian is the "
@@ -307,6 +327,19 @@ def common_parser():
         "diagonal entry, to keep near-degenerate blocks factorisable. Escalated "
         "automatically if the Cholesky still fails; a block that cannot be factorised "
         "falls back to no preconditioning.",
+    )
+    parser.add_argument(
+        "--hvpBatch",
+        default=256,
+        type=int,
+        help="Number of Hessian-vector products evaluated together when the "
+        "dense Hessian is assembled from HVPs (preconditioning and, on the "
+        "multi-device path, the postfit Hessian). Memory scales with this and "
+        "the number of graph calls scales inversely: on a 4-way shard of a "
+        "92144-bin model 256 costs a few GB and turns 6538 sequential HVPs into "
+        "26 batched ones. The batch is halved automatically if the device "
+        "cannot hold it, so this is an upper bound rather than a value that "
+        "has to be right. Set 1 for the sequential loop.",
     )
     parser.add_argument(
         "--hvpMethod",

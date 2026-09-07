@@ -67,7 +67,37 @@ def match_regexp_params(regular_expressions, parameter_names):
     return matched
 
 
+def make_fitter(indata, param_model, options, **kwargs):
+    """Construct the Fitter appropriate for the requested device count.
+
+    The device layout is fixed at initialization, so the choice is a
+    static one: --nDevices > 1 returns the bins-sharded
+    :class:`rabbit.sharding.MultiDeviceFitter` subclass, anything else the
+    plain single-device Fitter. Imported lazily to avoid a module cycle
+    (sharding subclasses Fitter). All keyword arguments are forwarded
+    verbatim, so this wrapper cannot drift from Fitter.__init__'s
+    signature.
+    """
+    if int(getattr(options, "nDevices", 1) or 1) > 1:
+        from rabbit.sharding import MultiDeviceFitter
+
+        return MultiDeviceFitter(indata, param_model, options, **kwargs)
+    return Fitter(indata, param_model, options, **kwargs)
+
+
 class Fitter:
+    # Dynamically-built tf.function wrappers holding un-copyable FuncGraph
+    # state; stripped on deepcopy and rebuilt. Subclasses extend this with
+    # their own dynamic machinery (see rabbit.sharding.MultiDeviceFitter).
+    _DYNAMIC_TF_FUNCS = frozenset(
+        {
+            "loss_val",
+            "loss_val_grad",
+            "loss_val_grad_hessp",
+            "loss_val_grad_hessp_fwdrev",
+            "loss_val_grad_hessp_revrev",
+        }
+    )
     valid_systematic_types = ["log_normal", "normal"]
 
     def __init__(
@@ -95,6 +125,7 @@ class Fitter:
         # outcome can be written to the output. None if the minimizer raised.
         self.minimizer_result = None
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
+        self.hvp_batch = int(getattr(options, "hvpBatch", 256) or 256)
         # Optional parameter preconditioning (see rabbit/preconditioner.py).
         # getattr so callers that build options objects by hand keep working.
         self.precondition = getattr(options, "precondition", False)
@@ -519,14 +550,7 @@ class Fitter:
         }
         # Also strip the dynamically-built loss/grad/HVP tf.function wrappers,
         # which hold un-copyable FuncGraph state and will be rebuilt below.
-        dynamic_tf_funcs = {
-            "loss_val",
-            "loss_val_grad",
-            "loss_val_grad_hessp",
-            "loss_val_grad_hessp_fwdrev",
-            "loss_val_grad_hessp_revrev",
-        }
-        skip = jit_overrides | dynamic_tf_funcs
+        skip = jit_overrides | set(self._DYNAMIC_TF_FUNCS)
         state = {k: v for k, v in self.__dict__.items() if k not in skip}
         cls = type(self)
         obj = cls.__new__(cls)
@@ -846,6 +870,14 @@ class Fitter:
 
         self.arm_regularizers()
 
+    def _regularizers_need_observables(self):
+        """Whether any attached regularizer reads the predicted yields.
+
+        Penalties on the parameters alone (see Regularizer.needs_observables)
+        do not, and then the full yields never have to be built for them.
+        """
+        return any(getattr(reg, "needs_observables", True) for reg in self.regularizers)
+
     def arm_regularizers(self):
         """Tell every regularizer about the current parameter layout.
 
@@ -853,9 +885,17 @@ class Fitter:
         ``init_fit_parms``.
         """
         xinit = self.get_x()
-        nexp0 = self.expected_yield(full=True)
+        nexp0 = (
+            self.expected_yield(full=True)
+            if self._regularizers_need_observables()
+            else None
+        )
         for reg in self.regularizers:
-            reg.set_expectations(xinit, nexp0, parms=self.parms)
+            reg.set_expectations(
+                xinit,
+                nexp0 if getattr(reg, "needs_observables", True) else None,
+                parms=self.parms,
+            )
         self._regularizers_armed = True
 
     def bayesassign(self):
@@ -2121,7 +2161,9 @@ class Fitter:
         nexpfullcentral, _, beta = self._compute_yields_with_beta(
             profile=profile,
             compute_norm=False,
-            full=len(self.regularizers),
+            # only build the full (masked-channel-inclusive) yields if some
+            # regularizer actually reads them
+            full=self._regularizers_need_observables(),
         )
 
         nexp = nexpfullcentral[: self.indata.nbins]
@@ -2140,7 +2182,15 @@ class Fitter:
                 )
             x = self.get_x()
             penalties = [
-                reg.compute_nll_penalty(x, nexpfullcentral) * tf.exp(2 * self.tau)
+                reg.compute_nll_penalty(
+                    x,
+                    (
+                        nexpfullcentral
+                        if getattr(reg, "needs_observables", True)
+                        else None
+                    ),
+                )
+                * tf.exp(2 * self.tau)
                 for reg in self.regularizers
             ]
             lpenalty = tf.add_n(penalties)
@@ -2212,6 +2262,11 @@ class Fitter:
     def _compute_loss(self, profile=True):
         return self._compute_nll(profile=profile)
 
+    # Fitter methods that also run per shard: the shard evaluators are
+    # duck-typed stand-ins (see rabbit.sharding), and binding the class's own
+    # unbound methods onto them shares the yields/NLL mathematics -- both
+    # interpolation forms, both systematic types, the BBB machinery -- with
+    # the single-device path by construction.
     def _make_tf_functions(self):
         # Build tf.function wrappers at instance construction time so that
         # jit_compile and the HVP autodiff mode can be controlled via fit
@@ -2365,6 +2420,90 @@ class Fitter:
         _, _, hess = self.loss_val_grad_hess()
         return hess.__array__()
 
+    def _hessp_batch(self, P):
+        """Hessian-vector products for a batch of directions P: [k, npar].
+
+        vectorized_map is a pfor of width k, not the while_loop that
+        tape.jacobian's non-pfor path builds -- so XLA compiles it without the
+        unrolling that made chunking unusable. Memory scales with k rather than
+        npar, which is the whole point: k = 64 costs ~0.4 GB where vectorising
+        over all 6538 parameters costs 43 GB.
+        """
+
+        def one(p):
+            p = tf.stop_gradient(p)
+            with tf.GradientTape() as t2:
+                with tf.GradientTape() as t1:
+                    val = self._compute_loss()
+                grad = t1.gradient(val, self.x)
+            return t2.gradient(grad, self.x, output_gradients=p)
+
+        return tf.vectorized_map(one, P)
+
+    def hessian_from_hvps(self, block=None, batch=None):
+        """Dense Hessian assembled column by column from Hessian-vector products.
+
+        tape.jacobian vectorises over every parameter at once, holding one
+        [nbins, 9] intermediate each: 43 GB on one device for a 6538-parameter,
+        92144-bin model, and several times that in practice -- unallocatable on
+        a GPU and enough to exhaust a 187 GB host. Yet the *result* is only
+        [npar, npar] (342 MB here): the size is entirely in the intermediates.
+
+        An HVP costs one [npar] vector instead, and in a multi-device fit
+        loss_val_grad_hessp is already sharded -- it is what the minimiser calls
+        every iteration -- so this distributes over the GPUs for free and needs
+        no sharded jacobian of its own. The cost is npar HVPs.
+
+        ``block`` restricts the columns computed, which is what preconditioning
+        wants: it only needs the submatrix over the selected parameters.
+        """
+        n = int(self.x.shape[0])
+        idx = np.arange(n) if block is None else np.asarray(block, dtype=np.int64)
+        k = self.hvp_batch if batch is None else int(batch)
+        out = np.empty((n, idx.size), dtype=np.float64)
+
+        if k > 1:
+            s0 = 0
+            while s0 < idx.size:
+                cols = idx[s0 : s0 + k]
+                basis = np.zeros((cols.size, n), dtype=np.float64)
+                basis[np.arange(cols.size), cols] = 1.0
+                try:
+                    hp = self._hessp_batch_dispatch(
+                        tf.constant(basis, dtype=self.indata.dtype)
+                    )
+                except tf.errors.ResourceExhaustedError:
+                    # The per-batch memory is k * nbins * 9 * 8 in principle,
+                    # but the loss graph holds several bins-shaped tensors at
+                    # once -- measured at ~6.5x that on one model -- so the
+                    # right k is model dependent. Halve and retry rather than
+                    # making the caller guess: this runs once per build, so a
+                    # couple of wasted attempts cost far less than falling back
+                    # to an unpreconditioned fit or losing the covariance.
+                    if k == 1:
+                        raise
+                    k = max(1, k // 2)
+                    logger.warning(
+                        f"HVP batch too large for the device; retrying with "
+                        f"--hvpBatch {k}"
+                    )
+                    continue
+                out[:, s0 : s0 + cols.size] = np.asarray(hp).T
+                s0 += cols.size
+            return out
+
+        v = np.zeros(n, dtype=np.float64)
+        for c, j in enumerate(idx):
+            v[j] = 1.0
+            _, _, hp = self.loss_val_grad_hessp(tf.constant(v, dtype=self.indata.dtype))
+            out[:, c] = np.asarray(hp)
+            v[j] = 0.0
+        return out
+
+    def _hessp_batch_dispatch(self, P):
+        """Batched HVP; subclasses override to keep the work distributed."""
+        return self._hessp_batch(P)
+
     def _build_preconditioner(self):
         """Preconditioner for the upcoming :meth:`fit`, or an exact no-op.
 
@@ -2393,7 +2532,9 @@ class Fitter:
         except Exception as ex:
             logger.warning(
                 f"Could not compute the reference Hessian for preconditioning ({ex}); "
-                "running unpreconditioned."
+                "running unpreconditioned. On the multi-device path the "
+                "Hessian is assembled from batched HVPs; lower --hvpBatch if "
+                "this is an out-of-memory error."
             )
             return precond.Preconditioner.identity(theta_ref)
 
@@ -2440,7 +2581,8 @@ class Fitter:
             pc = pc_cell[0]
             self.x.assign(pc.to_physical(yval))
             val, grad = self.loss_val_grad()
-            return val.__array__(), pc.grad_to_internal(grad.__array__())
+            grad_y = pc.grad_to_internal(grad.__array__())
+            return val.__array__(), grad_y
 
         def scipy_hessp(yval, pval):
             pc = pc_cell[0]

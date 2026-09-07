@@ -7,7 +7,17 @@ from rabbit.h5pyutils_read import makesparsetensor, maketensor
 
 
 class FitInputData:
-    def __init__(self, filename, pseudodata=None):
+    def __init__(self, filename, pseudodata=None, host_memory=False):
+        # In multi-device (sharded) fits the full tensors must not
+        # materialize on one GPU -- only per-device slices are copied over
+        # later -- so all loading is pinned to host memory.
+        if host_memory:
+            with tf.device("/CPU:0"):
+                self._init_impl(filename, pseudodata)
+        else:
+            self._init_impl(filename, pseudodata)
+
+    def _init_impl(self, filename, pseudodata=None):
         with h5py.File(filename, mode="r") as f:
 
             # load text arrays from file

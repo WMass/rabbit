@@ -853,6 +853,21 @@ def main():
     if args.eager:
         tf.config.run_functions_eagerly(True)
 
+    # Restrict TF to the requested GPUs *before* the runtime context
+    # initializes: by default TF creates a CUDA context on -- and reserves
+    # the memory of -- every visible GPU, so a single-device fit on a
+    # 4-GPU machine would block all four while using one. On shared
+    # interactive nodes the selection also avoids GPUs another process is
+    # occupying (least-memory-used first); --devices picks explicitly.
+    # Under slurm with --gres this is all moot (CUDA_VISIBLE_DEVICES
+    # already hides other jobs' GPUs). Must run before any op touches the
+    # GPUs; list_physical_devices itself is safe.
+    from rabbit.sharding import pick_physical_gpus
+
+    chosen = pick_physical_gpus(args.nDevices, explicit=args.devices)
+    if chosen is not None:
+        tf.config.set_visible_devices(chosen, "GPU")
+
     # --noHessian skips computing the postfit Hessian, so the dense
     # parameter covariance matrix is never available. Any feature that
     # needs the covariance is incompatible.
@@ -886,12 +901,14 @@ def main():
     )
     blinded_fits = [f == 0 or (f > 0 and args.toysDataMode == "observed") for f in fits]
 
-    indata = inputdata.FitInputData(args.filename, args.pseudoData)
+    indata = inputdata.FitInputData(
+        args.filename, args.pseudoData, host_memory=args.nDevices > 1
+    )
 
     model_specs = args.paramModel or [["Mu"]]
     param_model = ph.load_models(model_specs, indata, **vars(args))
 
-    ifitter = fitter.Fitter(
+    ifitter = fitter.make_fitter(
         indata,
         param_model,
         args,
