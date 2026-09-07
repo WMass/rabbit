@@ -342,6 +342,29 @@ def common_parser():
         "has to be right. Set 1 for the sequential loop.",
     )
     parser.add_argument(
+        "--snapshotFile",
+        default=None,
+        type=str,
+        help="Write parameter snapshots to this file. A snapshot holds the "
+        "parameter values and names -- enough to resume with --externalPostfit "
+        "<file>, either to carry on minimizing or, with --noFit, to run only "
+        "the postfit step at that point. One is written when the minimizer is "
+        "interrupted (SIGINT/SIGTERM), when it fails, and when it converges, "
+        "so a long fit killed at any stage still leaves its parameters behind. "
+        "Snapshots are written atomically, so an interrupted write cannot "
+        "destroy the previous one. Default: <outdir>/<outname stem>_snapshot.hdf5 "
+        "when --snapshotInterval is set, otherwise off.",
+    )
+    parser.add_argument(
+        "--snapshotInterval",
+        default=0.0,
+        type=float,
+        help="Also snapshot every this many hours of fitting (0 disables the "
+        "periodic ones; the interrupt, failure and convergence snapshots do not "
+        "depend on it). Costs one small file write per interval. Worth setting "
+        "on any fit long enough that losing it would hurt.",
+    )
+    parser.add_argument(
         "--hvpMethod",
         default="revrev",
         type=str,

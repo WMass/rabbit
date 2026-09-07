@@ -901,6 +901,17 @@ def main():
     )
     blinded_fits = [f == 0 or (f > 0 and args.toysDataMode == "observed") for f in fits]
 
+    # Default snapshot destination, next to the fit output it belongs to. Only
+    # when periodic snapshots were asked for: the interrupt/failure/convergence
+    # ones are cheap but still a file appearing where the user did not ask for
+    # one, so those follow --snapshotFile only.
+    if args.snapshotFile is None and args.snapshotInterval > 0:
+        stem = _os.path.splitext(args.outname)[0]
+        if args.postfix:
+            stem = f"{stem}_{args.postfix}"
+        args.snapshotFile = _os.path.join(args.outpath, f"{stem}_snapshot.hdf5")
+        _os.makedirs(args.outpath, exist_ok=True)
+
     indata = inputdata.FitInputData(
         args.filename, args.pseudoData, host_memory=args.nDevices > 1
     )

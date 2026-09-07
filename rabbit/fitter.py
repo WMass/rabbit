@@ -28,6 +28,7 @@ from rabbit.minimizer import (
     minimize_trust_krylov,
     minimize_trust_ncg,
 )
+from rabbit.snapshot import Snapshotter, snapshot_on_signal
 from rabbit.tfhelpers import edmval_cov
 
 logger = logging.child_logger(__name__)
@@ -128,6 +129,11 @@ class Fitter:
         self.hvp_batch = int(getattr(options, "hvpBatch", 256) or 256)
         # Optional parameter preconditioning (see rabbit/preconditioner.py).
         # getattr so callers that build options objects by hand keep working.
+        # Parameter snapshots (see rabbit/snapshot.py). Everything the fit has
+        # learned lives in memory until the output is written at the very end,
+        # so without these an interrupted fit leaves nothing at all.
+        self.snapshot_file = getattr(options, "snapshotFile", None)
+        self.snapshot_interval = float(getattr(options, "snapshotInterval", 0.0) or 0.0)
         self.precondition = getattr(options, "precondition", False)
         self.precondition_params = getattr(options, "preconditionParams", None)
         self.precondition_from = getattr(options, "preconditionFrom", "hessian")
@@ -2705,112 +2711,136 @@ class Fitter:
         callback = None
         prev_loss = None
         attempt = 0
-        while True:
-            cb = FitterCallback(xval, self.earlyStopping)
-            try:
-                if self.minimizer_method == "tf-trust-exact":
-                    res = minimize_trust_exact(
-                        native_loss,
-                        native_closure,
-                        xval,
-                        gtol=sci_opts.get("gtol", 0.0),
-                        maxiter=sci_opts.get("maxiter"),
-                        callback=cb,
-                    )
-                elif self.minimizer_method == "tf-trust-ncg":
-                    res = minimize_trust_ncg(
-                        native_loss,
-                        native_grad_closure,
-                        native_hessp(),
-                        native_set_point,
-                        xval,
-                        gtol=sci_opts.get("gtol", 0.0),
-                        maxiter=sci_opts.get("maxiter"),
-                        callback=cb,
-                    )
-                elif self.minimizer_method == "tf-trust-krylov":
-                    res = minimize_trust_krylov(
-                        native_loss,
-                        native_grad_closure,
-                        native_hessp(),
-                        native_set_point,
-                        xval,
-                        gtol=sci_opts.get("gtol", 0.0),
-                        maxiter=sci_opts.get("maxiter"),
-                        callback=cb,
-                    )
+        # to_physical is the whole reason this is built here rather than in the
+        # callback: under preconditioning the minimiser's iterate is in internal
+        # coordinates, and a snapshot of those would load without complaint and
+        # be wrong. pc_cell is read at save time, not captured, so a rebuilt
+        # transform is picked up.
+        snapshotter = Snapshotter(
+            self.snapshot_file,
+            self.parms,
+            to_physical=lambda v: pc_cell[0].to_physical(v),
+            interval_hours=self.snapshot_interval,
+        )
+        snapshotter.update(xval)
+
+        with snapshot_on_signal(snapshotter):
+            while True:
+                cb = FitterCallback(xval, self.earlyStopping, snapshotter=snapshotter)
+                try:
+                    if self.minimizer_method == "tf-trust-exact":
+                        res = minimize_trust_exact(
+                            native_loss,
+                            native_closure,
+                            xval,
+                            gtol=sci_opts.get("gtol", 0.0),
+                            maxiter=sci_opts.get("maxiter"),
+                            callback=cb,
+                        )
+                    elif self.minimizer_method == "tf-trust-ncg":
+                        res = minimize_trust_ncg(
+                            native_loss,
+                            native_grad_closure,
+                            native_hessp(),
+                            native_set_point,
+                            xval,
+                            gtol=sci_opts.get("gtol", 0.0),
+                            maxiter=sci_opts.get("maxiter"),
+                            callback=cb,
+                        )
+                    elif self.minimizer_method == "tf-trust-krylov":
+                        res = minimize_trust_krylov(
+                            native_loss,
+                            native_grad_closure,
+                            native_hessp(),
+                            native_set_point,
+                            xval,
+                            gtol=sci_opts.get("gtol", 0.0),
+                            maxiter=sci_opts.get("maxiter"),
+                            callback=cb,
+                        )
+                    else:
+                        res = scipy.optimize.minimize(
+                            scipy_loss,
+                            xval,
+                            method=self.minimizer_method,
+                            jac=True,
+                            tol=0.0,
+                            callback=cb,
+                            options=sci_opts,
+                            **info_minimize,
+                        )
+                except Exception as ex:
+                    # minimizer could have called the loss or hessp functions with "random" values, so restore the
+                    # state from the end of the last iteration before the exception
+                    xval = cb.xval
+                    self.minimizer_result = None
+                    if not cb.stopped_early:
+                        # a real failure, not a stall: surface it rather than
+                        # letting a broken callback look like a converged fit
+                        logger.warning(f"Minimizer raised: {ex}")
+                        # the expensive case: a failure here used to discard the
+                        # whole fit, however close to the minimum it had got
+                        snapshotter.save(
+                            cb.xval, "minimizer-failed", error=str(ex)[:200]
+                        )
+                    logger.debug(ex)
                 else:
-                    res = scipy.optimize.minimize(
-                        scipy_loss,
-                        xval,
-                        method=self.minimizer_method,
-                        jac=True,
-                        tol=0.0,
-                        callback=cb,
-                        options=sci_opts,
-                        **info_minimize,
-                    )
-            except Exception as ex:
-                # minimizer could have called the loss or hessp functions with "random" values, so restore the
-                # state from the end of the last iteration before the exception
-                xval = cb.xval
-                self.minimizer_result = None
+                    xval = res["x"]
+                    self.minimizer_result = res
+                    logger.debug(res)
+
+                callback = merge_callbacks(callback, cb)
+                last_loss = cb.loss_history[-1] if cb.loss_history else None
                 if not cb.stopped_early:
-                    # a real failure, not a stall: surface it rather than
-                    # letting a broken callback look like a converged fit
-                    logger.warning(f"Minimizer raised: {ex}")
-                logger.debug(ex)
-            else:
-                xval = res["x"]
-                self.minimizer_result = res
-                logger.debug(res)
-
-            callback = merge_callbacks(callback, cb)
-            last_loss = cb.loss_history[-1] if cb.loss_history else None
-
-            if not cb.stopped_early:
-                break
-            # The only reason to stop restarting is that the last restart
-            # bought nothing: a round can never end above where it started
-            # (the trust region accepts improving steps only), so "not below
-            # the previous round" means the descent is genuinely exhausted.
-            if (
-                prev_loss is not None
-                and last_loss is not None
-                and last_loss
-                >= prev_loss - RESTART_MIN_IMPROVEMENT * max(1.0, abs(prev_loss))
-            ):
+                    break
+                # The only reason to stop restarting is that the last restart
+                # bought nothing: a round can never end above where it started
+                # (the trust region accepts improving steps only), so "not below
+                # the previous round" means the descent is genuinely exhausted.
+                if (
+                    prev_loss is not None
+                    and last_loss is not None
+                    and last_loss
+                    >= prev_loss - RESTART_MIN_IMPROVEMENT * max(1.0, abs(prev_loss))
+                ):
+                    logger.info(
+                        f"Restart did not reduce the loss further ({prev_loss} -> "
+                        f"{last_loss}); stopping after {attempt} restart(s)."
+                    )
+                    break
+                if 0 <= self.max_restarts <= attempt:
+                    logger.warning(
+                        f"Minimizer still stalling at loss {last_loss} after "
+                        f"{self.max_restarts} restart(s) and the loss was still "
+                        "coming down; raise --maxRestarts to let it continue."
+                    )
+                    break
+                attempt += 1
                 logger.info(
-                    f"Restart did not reduce the loss further ({prev_loss} -> "
-                    f"{last_loss}); stopping after {attempt} restart(s)."
+                    f"Minimizer stalled at loss {last_loss}; restarting "
+                    f"(#{attempt}) to reset the trust radius."
                 )
-                break
-            if 0 <= self.max_restarts <= attempt:
-                logger.warning(
-                    f"Minimizer still stalling at loss {last_loss} after "
-                    f"{self.max_restarts} restart(s) and the loss was still "
-                    "coming down; raise --maxRestarts to let it continue."
-                )
-                break
-            attempt += 1
-            logger.info(
-                f"Minimizer stalled at loss {last_loss}; restarting "
-                f"(#{attempt}) to reset the trust radius."
-            )
-            prev_loss = last_loss
+                prev_loss = last_loss
 
-            # Rebuild the transform at the point we are restarting from. The
-            # one built at the start whitens the Hessian *there*; by the time
-            # the fit has stalled somewhere else that Hessian has changed and
-            # the transform no longer conditions anything. Refreshing costs one
-            # Hessian evaluation and is a no-op when preconditioning is off.
-            self.x.assign(pc_cell[0].to_physical(xval))
-            pc_cell[0] = self._build_preconditioner()
-            xval = pc_cell[0].from_physical(self.x.numpy())
+                # Rebuild the transform at the point we are restarting from. The
+                # one built at the start whitens the Hessian *there*; by the time
+                # the fit has stalled somewhere else that Hessian has changed and
+                # the transform no longer conditions anything. Refreshing costs one
+                # Hessian evaluation and is a no-op when preconditioning is off.
+                self.x.assign(pc_cell[0].to_physical(xval))
+                pc_cell[0] = self._build_preconditioner()
+                xval = pc_cell[0].from_physical(self.x.numpy())
 
         # xval (and callback.xval) are internal coordinates; everything outside
         # fit() expects physical parameters.
         self.x.assign(pc_cell[0].to_physical(xval))
+
+        # The minimum itself. Writing it costs nothing next to the fit and
+        # covers the stretch that is otherwise unprotected: everything between
+        # here and the output file being closed, which on a large model means
+        # the Hessian, the impacts and the postfit histograms.
+        snapshotter.save(xval, "converged")
 
         return callback
 

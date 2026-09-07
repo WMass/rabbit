@@ -23,9 +23,14 @@ logger = logging.child_logger(__name__)
 
 
 class FitterCallback:
-    def __init__(self, xv, early_stopping=-1):
+    def __init__(self, xv, early_stopping=-1, snapshotter=None):
         self.iiter = 0
         self.xval = xv
+        # Optional rabbit.snapshot.Snapshotter. The callback is the only place
+        # that sees the accepted iterate every iteration, which is exactly what
+        # a snapshot wants: trial points the trust region goes on to reject are
+        # not states the fit was ever in.
+        self.snapshotter = snapshotter
 
         self.loss_history = []
         self.time_history = []
@@ -66,6 +71,14 @@ class FitterCallback:
 
         self.xval = intermediate_result.x
         self.iiter += 1
+
+        # After the update, so the snapshot and the loss recorded with it are
+        # the same iterate. Placed after the early-stopping check too: that
+        # path raises, and fit() snapshots on the way out.
+        if self.snapshotter is not None:
+            self.snapshotter.maybe_save(
+                self.xval, elapsed, iteration=self.iiter, loss=float(loss)
+            )
 
 
 # Relative loss improvement below which a restart counts as having bought
