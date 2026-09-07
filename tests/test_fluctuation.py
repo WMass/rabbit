@@ -34,6 +34,8 @@ the residual.  Checks:
    differences.
 6. `c_i = -vgf_i sigma_i^2/m_i`: the two quadratic coefficients cancel, which
    is why the naive Z bias is -15...-27 MeV and not the full -35.
+7. `set_corrections` rebuilds the per-candidate constants, so the whole variant
+   ladder runs off ONE card and reproduces terms built that way exactly.
 """
 import os
 import sys
@@ -305,6 +307,44 @@ def test_cancellation():
     print("  PASS")
 
 
+def test_set_corrections():
+    print("\n=== 7. set_corrections rebuilds the constants (one card, all "
+          "variants) ===")
+    rng = np.random.default_rng(13)
+    n = 600
+    sigma = 0.9 + 0.4 * rng.random(n)
+    mobs = 2.0 * sigma * rng.standard_normal(n)
+    vgf = 0.4 + 0.4 * rng.random(n)
+    m = mobs + MREF
+    a_res = (1.0 + vgf) * sigma / np.abs(m)
+    s2 = (sigma / np.abs(m)) ** 2
+    common = dict(vgf=vgf, a_res=a_res, jensen_s2=s2, corr_form="fluctuation",
+                  floor="softplus")
+    ladder = {
+        "both": dict(self_consistent_sigma=True, jensen_mode="exact"),
+        "noares": dict(self_consistent_sigma=False, jensen_mode="exact"),
+        "nojensen": dict(self_consistent_sigma=True, jensen_mode="off"),
+        "neither": dict(self_consistent_sigma=False, jensen_mode="off"),
+    }
+    one = build(sigma, mobs, jensen_mode="exact", **common)
+    for label, kw in ladder.items():
+        ref = build(sigma, mobs,
+                    **{**common,
+                       "jensen_mode": kw["jensen_mode"],
+                       "self_consistent_sigma": kw["self_consistent_sigma"]})
+        got = one.set_corrections(**kw)
+        a, b = nll(got), nll(ref)
+        print(f"  {label:9s} one-card {a!r}  purpose-built {b!r}  "
+              f"identical: {a == b}")
+        assert a == b, (label, a, b)
+    # `neither` must equal the term that never had either input
+    plain = build(sigma, mobs, vgf=vgf, floor="softplus")
+    one.set_corrections(self_consistent_sigma=False, jensen_mode="off")
+    assert nll(one) == nll(plain), (nll(one), nll(plain))
+    print(f"  neither == a term with no correction at all: True")
+    print("  PASS")
+
+
 if __name__ == "__main__":
     test_off_is_identical()
     test_density_moments()
@@ -312,4 +352,5 @@ if __name__ == "__main__":
     test_bounded_at_z()
     test_gradient()
     test_cancellation()
+    test_set_corrections()
     print("\nALL PASS")

@@ -1256,6 +1256,55 @@ class MassCFTerm(UnbinnedTerm):
         for k in (1, 2):
             self._dmat[k] = tf.constant(sp(tfine, k), self.dtype)
 
+    def set_corrections(self, self_consistent_sigma=None, jensen_mode=None):
+        """Switch either correction on or off AFTER construction.
+
+        The variant ladder (both on / no `a_res` / no Jensen / neither) runs off
+        ONE card, and in the fluctuation form the two corrections are baked into
+        per-candidate constants at construction, so flipping the flags by hand
+        is not enough -- they have to be rebuilt.  Returns ``self``.
+        """
+        if self_consistent_sigma is not None:
+            self.self_consistent_sigma = bool(self_consistent_sigma)
+            if self.self_consistent_sigma and self.a_res is None:
+                raise ValueError(
+                    "self_consistent_sigma requested but the term has no a_res"
+                )
+        if jensen_mode is not None:
+            if jensen_mode not in ("off", "shift", "exact"):
+                raise ValueError(
+                    f"jensen_mode must be 'off', 'shift' or 'exact', "
+                    f"got '{jensen_mode}'"
+                )
+            if self._fluct and jensen_mode == "shift":
+                raise ValueError(
+                    "jensen_mode='shift' has no meaning in the fluctuation form"
+                )
+            if jensen_mode != "off" and self.jensen_s2 is None:
+                raise ValueError(
+                    f"jensen_mode='{jensen_mode}' but the term has no jensen_s2"
+                )
+            self.jensen_mode = jensen_mode
+        self._dyn_sigma = bool(
+            not self._fluct
+            and self.a_res is not None
+            and self.self_consistent_sigma
+            and np.any(self._a_res_np != 0.0)
+        )
+        self._jensen = bool(
+            not self._fluct
+            and self.jensen_mode != "off"
+            and self.jensen_s2 is not None
+            and self.jensen_scale != 0.0
+            and np.any(self._jensen_s2_np != 0.0)
+        )
+        if self._fluct:
+            self._build_fluct(
+                self.sigma.numpy(), self.mobs.numpy(),
+                self.jensen_mode, self.tgrid.numpy(),
+            )
+        return self
+
     def _fluct_w(self, values, ci):
         """``(w_re, w_im)`` of the fluctuation-form correction factor
         ``Phi_i/phi_i = 1 + w_i(tau)`` -- see :meth:`_build_fluct`."""
