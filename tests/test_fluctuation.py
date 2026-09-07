@@ -313,13 +313,15 @@ def test_set_corrections():
     rng = np.random.default_rng(13)
     n = 600
     sigma = 0.9 + 0.4 * rng.random(n)
-    mobs = 2.0 * sigma * rng.standard_normal(n)
+    # inside +-4 sigma: with a DELTA kernel a candidate further out has no
+    # density and every arm of the ladder returns inf, which compares equal and
+    # tests nothing
+    mobs = np.clip(sigma * rng.standard_normal(n), -4 * sigma, 4 * sigma)
     vgf = 0.4 + 0.4 * rng.random(n)
     m = mobs + MREF
     a_res = (1.0 + vgf) * sigma / np.abs(m)
     s2 = (sigma / np.abs(m)) ** 2
-    common = dict(vgf=vgf, a_res=a_res, jensen_s2=s2, corr_form="fluctuation",
-                  floor="softplus")
+    common = dict(vgf=vgf, a_res=a_res, jensen_s2=s2, corr_form="fluctuation")
     ladder = {
         "both": dict(self_consistent_sigma=True, jensen_mode="exact"),
         "noares": dict(self_consistent_sigma=False, jensen_mode="exact"),
@@ -336,9 +338,10 @@ def test_set_corrections():
         a, b = nll(got), nll(ref)
         print(f"  {label:9s} one-card {a!r}  purpose-built {b!r}  "
               f"identical: {a == b}")
+        assert np.isfinite(a), (label, a)
         assert a == b, (label, a, b)
     # `neither` must equal the term that never had either input
-    plain = build(sigma, mobs, vgf=vgf, floor="softplus")
+    plain = build(sigma, mobs, vgf=vgf)
     one.set_corrections(self_consistent_sigma=False, jensen_mode="off")
     assert nll(one) == nll(plain), (nll(one), nll(plain))
     print(f"  neither == a term with no correction at all: True")
