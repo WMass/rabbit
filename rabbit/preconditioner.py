@@ -313,6 +313,53 @@ class Preconditioner:
                 )
         return out
 
+    def tf_transforms(self):
+        """TF-graph versions of ``_apply_T``/``_apply_TT``, or None if no-op.
+
+        For the matrix-free (HVP) native subproblem the reparameterisation
+        must run *inside* the compiled CG loop -- once per Hessian-vector
+        product -- so the numpy implementations above cannot be used there.
+        The block matrices are captured as tf constants once; each
+        application is gather -> dense matvec -> scatter per block, the same
+        parallel-GEMV rationale as the cached L^-1 on the numpy side.
+        """
+        if not self.blocks:
+            return None
+        import tensorflow as tf
+
+        ops = []
+        for b in self.blocks:
+            gather_idx = tf.constant(b.idx, dtype=tf.int64)
+            scatter_idx = tf.constant(b.idx.reshape(-1, 1), dtype=tf.int64)
+            linv = tf.constant(b.linv) if b.linv is not None else None
+            chol = tf.constant(b.chol) if b.linv is None else None
+            ops.append((gather_idx, scatter_idx, linv, chol))
+
+        def _apply(v, transpose):
+            # transpose=True: T v (L^-T per block); False: T^T v (L^-1)
+            out = v
+            for gidx, sidx, linv, chol in ops:
+                sub = tf.gather(out, gidx)
+                if linv is not None:
+                    new = tf.linalg.matvec(linv, sub, transpose_a=transpose)
+                else:
+                    new = tf.squeeze(
+                        tf.linalg.triangular_solve(
+                            chol, sub[:, None], lower=True, adjoint=transpose
+                        ),
+                        axis=-1,
+                    )
+                out = tf.tensor_scatter_nd_update(out, sidx, new)
+            return out
+
+        def apply_T(v):
+            return _apply(v, True)
+
+        def apply_TT(v):
+            return _apply(v, False)
+
+        return apply_T, apply_TT
+
     def to_physical(self, y):
         """theta = theta_ref + T y."""
         return self.theta_ref + self._apply_T(y)

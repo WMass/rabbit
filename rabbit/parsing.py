@@ -212,13 +212,29 @@ def common_parser():
         choices=[
             "trust-krylov",
             "trust-exact",
+            "tf-trust-exact",
+            "tf-trust-ncg",
+            "tf-trust-krylov",
             "BFGS",
             "L-BFGS-B",
             "CG",
             "trust-ncg",
             "dogleg",
         ],
-        help="Mnimizer method used in scipy.optimize.minimize for the nominal fit minimization",
+        help="Minimizer method used for the nominal fit minimization. The "
+        "'tf-' prefixed methods are native TensorFlow implementations, the rest "
+        "are dispatched to scipy.optimize.minimize. 'tf-trust-exact' ports "
+        "trust-exact keeping the Hessian and the subproblem's Cholesky "
+        "factorizations on the TensorFlow device instead of round-tripping "
+        "through LAPACK; 'tf-trust-ncg' is the matrix-free Steihaug-CG "
+        "counterpart (the same subproblem as scipy's trust-ncg, and the "
+        "practical stand-in for trust-krylov) with the whole CG inner loop "
+        "compiled as one TF graph call, i.e. no python round trip per "
+        "Hessian-vector product; 'tf-trust-krylov' is a native GLTR (the "
+        "trust-krylov algorithm): Lanczos on device with the subproblem "
+        "solved to optimality within the Krylov subspace via host-side "
+        "tridiagonal solves, reusing the radius-independent Krylov data "
+        "across re-solves after rejected steps",
     )
     parser.add_argument(
         "--precondition",
