@@ -570,6 +570,14 @@ class MassCFTerm(UnbinnedTerm):
         which is bit-identical to the code before the correction existed.
     self_consistent_sigma : bool
         Master switch for that correction; ``False`` ignores ``a_res``.
+    corr_form : {"residual", "fluctuation"}
+        WHERE the two corrections act. ``"residual"`` is the historical form
+        measured on the J/psi: the width is evaluated at ``delta_i(theta)`` and
+        the Jensen map is inverted on it, both bounded by ``corr_clip``.
+        ``"fluctuation"`` is the treatment: both are one deterministic map of
+        the resolution fluctuation, applied INSIDE the convolution, with no
+        clip and no log-Jacobian -- see :meth:`_build_fluct`. At a delta kernel
+        the two agree by construction; at the Z only the second is defined.
     sigma_floor : float
         Lower bound on ``s_i`` as a fraction of ``sigma_i`` (see
         :data:`SIGMA_FLOOR`).
@@ -637,6 +645,7 @@ class MassCFTerm(UnbinnedTerm):
         jensen_scale=1.0,
         jensen_disc_floor=0.1,
         corr_clip=0.0,
+        corr_form="residual",
         sigma_floor=SIGMA_FLOOR,
         norm_window=None,
         norm_tpoints=8192,
@@ -784,14 +793,35 @@ class MassCFTerm(UnbinnedTerm):
             self.jensen_s2 = tf.constant(arr, dtype)
         else:
             self.jensen_s2 = None
+        if corr_form not in ("residual", "fluctuation"):
+            raise ValueError(
+                f"corr_form must be 'residual' or 'fluctuation', got '{corr_form}'"
+            )
+        self.corr_form = corr_form
+        self._fluct = corr_form == "fluctuation"
+        if self._fluct and jensen_mode == "shift":
+            raise ValueError(
+                "jensen_mode='shift' has no meaning in the fluctuation form: "
+                "the deterministic part of the map is s^2/2 (the EXACT form's), "
+                "not the 1.5 s^2 the shift form assumes the MLE responds to "
+                "with weight 1"
+            )
         self._jensen = (
-            self.jensen_mode != "off"
+            not self._fluct
+            and self.jensen_mode != "off"
             and self.jensen_s2 is not None
             and self.jensen_scale != 0.0
             and bool(np.any(self._jensen_s2_np != 0.0))
         )
+        if self._fluct:
+            # the residual form's two devices are OFF: the width stays the
+            # exported constant and the residual map is the identity.  Both
+            # effects are carried instead by `_build_fluct`, INSIDE the
+            # convolution.
+            self._dyn_sigma = False
         # the OBSERVED mass, the denominator of r = delta/m. Truth-free.
         self._jensen_m = tf.constant(mobs + float(m_ref), dtype)
+        self._build_fluct(sigma, mobs, jensen_mode, tgrid)
         # `_chunk_residual` computes u and `_chunk_logjac` needs it; both are
         # called once per chunk, residual first, inside one graph.
         self._jensen_u = {}
@@ -998,6 +1028,13 @@ class MassCFTerm(UnbinnedTerm):
         comparison.  ``jensen_mode="exact"`` is the default and does the work
         in :meth:`_chunk_residual` instead.  ``None`` means zero.
         """
+        if self._fluct:
+            # the DETERMINISTIC part d_i = m_i s_i^2/2 of the fluctuation map
+            # (see `_build_fluct`); the x-dependent part is the CF factor
+            if self._fl_d is None:
+                return None
+            lo, hi = self._chunks[ci]
+            return self._fl_d[lo:hi]
         if not self._jensen or self.jensen_mode != "shift":
             return None
         lo, hi = self._chunks[ci]
@@ -1097,6 +1134,142 @@ class MassCFTerm(UnbinnedTerm):
         lim = self.npdt(self.corr_clip) * self.sigma[lo:hi]
         return tf.clip_by_value(delta, -lim, lim)
 
+    def _build_fluct(self, sigma, mobs, jensen_mode, tgrid):
+        """The FLUCTUATION form of the two corrections (``corr_form``).
+
+        THE DEFECT OF THE RESIDUAL FORM.  Both corrections are statements about
+        the RESOLUTION fluctuation, and the residual form feeds them
+        ``delta_i(theta) = m_i - M(theta)``.  At a narrow resonance in a narrow
+        window those coincide; at the Z they do not -- the window is +-27 sigma
+        and what sits out there is the Breit-Wigner tail and FSR, not
+        resolution.  Fed the full ``delta``, the exact Jensen map moves the
+        residual by a median 57.7 MeV and by up to 10.7 GeV against the 20.6 MeV
+        it exists to apply.  ``corr_clip`` bounds that but is a saturation
+        device, not a treatment.
+
+        THE TREATMENT.  Put both corrections where they belong: INSIDE the
+        convolution, as a deterministic per-candidate map of the fluctuation.
+        With ``x`` the standardized fluctuation (CF ``phi_i(tau) = e^{S_i(tau)}``,
+        the exported exponents) the observed mass is
+
+            m_i = m_true + u_i(x),   u_i(x) = sigma_i x + c_i x^2 + d_i,
+
+        so, integrating over the fluctuation rather than evaluating at it,
+
+            L_i(theta) = Int K_theta(m_i - u_i(x)) p_i(x) dx ,
+
+        which needs no log-Jacobian, no clip, and no assumption that
+        ``delta_i`` is small.  The measure is ``p_i(x) dx = p_x(x)(1 - a_i x)dx``:
+        the ``(1 - a_i x)`` is the Jacobian of recovering the UNCONDITIONAL
+        width ``sigma_bar_i`` from the exported ``sigma_i = sigma_bar_i(1+a_i x)``
+        -- profiling out ``sigma_bar_i`` against the observed ``sigma_i`` -- and
+        it is NOT optional: dropping it leaves a score of ``+a_i/sigma_bar_i`` at
+        the truth, i.e. a bias of order ``a_i sigma_i`` (27 MeV at the Z), and
+        it is the piece that makes this form reduce EXACTLY to the residual
+        form's validated density when the kernel is a delta.
+
+        The coefficients, both truth-free:
+
+            c_i = -a_i sigma_i + sigma_i^2 / m_i ,     d_i = m_i s_i^2 / 2
+
+        -- the first term of ``c_i`` is the self-consistent width (sec. 2-3 of
+        MASSCFTERM_SPEC), the second and ``d_i`` are the Jensen map's ``u^2``
+        and ``s^2/2`` (sec. 4b).  With ``a_i = (1 + vgf_i) sigma_i/m_i`` the two
+        largely CANCEL, ``c_i = -vgf_i sigma_i^2/m_i``, which is why the naive Z
+        bias is -15...-27 MeV and not the full -35.
+
+        IN FOURIER SPACE.  ``d_i`` is a shift of the residual (handled by
+        :meth:`_chunk_mean_shift`).  The rest is one multiplicative factor on
+        the resolution CF, on the same ``tau`` grid the term already integrates:
+
+            Phi_i(tau)/phi_i(tau) = 1 + i a_i (S'(tau) - S'(0))
+                                      - i (c_i/sigma_i) tau (S''(tau) + S'(tau)^2)
+
+        from ``E[x e^{i tau x}] = -i phi'`` and ``E[x^2 e^{i tau x}] = -phi''``
+        with ``phi'' = (S'' + S'^2) phi``.  The ``- S'(0)`` normalises
+        ``Phi_i(0) = 1`` (it is ``1 - a_i E[x]``, a candidate constant, so it
+        cannot bias anything -- but it keeps the density normalised to 1 and so
+        keeps the truncation ``Z`` consistent).  ``c_i/sigma_i = -a_i +
+        sigma_i/m_i`` needs no division at evaluation time.
+
+        WHAT IS EXACT AND WHAT IS APPROXIMATED.  The truncation is first order
+        in ``a_i`` and in ``c_i``.  It is EXACT for the first moment at that
+        order: for a centred unit-variance ``x`` the modelled mean is
+
+            E[Delta_i] = c_i + d_i - a_i sigma_i          (exact in a, c)
+
+        -- which is the whole content of both corrections -- with the neglected
+        pieces ``O(a_i^2, a_i c_i, c_i^2) ~ 1e-4`` of a correction that is
+        itself ~1e-2 of the width.  The second moment loses
+        ``c_i^2 Var(x^2) ~ 2 (c_i/sigma_i)^2 ~ 2e-4`` relative, well under
+        0.1 MeV on ``Gamma_Z``.  Both are measured directly against the
+        residual form on the J/psi, where the two must agree.
+        """
+        self._fl_a = None
+        self._fl_g = None
+        self._fl_d = None
+        self._fluct_active = False
+        self._dmat = {}
+        if not self._fluct:
+            return
+        n = self.n
+        a = np.zeros(n)
+        if self.a_res is not None and self.self_consistent_sigma:
+            a = self._a_res_np.astype(np.float64)
+        m = np.asarray(mobs, dtype=np.float64) + float(self.m_ref)
+        mden = np.maximum(np.abs(m), 1e-9)
+        # the same convention the residual form uses: an all-zero `jensen_s2`
+        # switches the Jensen map off entirely, so the term is bit-identical to
+        # one that was never given it
+        jen = (
+            jensen_mode != "off"
+            and self._jensen_s2_np is not None
+            and self.jensen_scale != 0.0
+            and bool(np.any(self._jensen_s2_np != 0.0))
+        )
+        sig = np.asarray(sigma, dtype=np.float64)
+        # c_i / sigma_i  (the linear scale is sigma_i itself)
+        g = -a + (sig / mden if jen else 0.0)
+        d = (
+            0.5 * self.jensen_scale * self._jensen_s2_np * m
+            if jen
+            else np.zeros(n)
+        )
+        self._fl_a = tf.constant(a, self.dtype)
+        self._fl_g = tf.constant(g, self.dtype)
+        self._fl_d = None if not np.any(d != 0.0) else tf.constant(d, self.dtype)
+        self._fluct_active = bool(np.any(a != 0.0) or np.any(g != 0.0))
+        if not self._fluct_active:
+            return
+        # the CF-derivative form uses S'(0); the grid has to reach tau = 0
+        if abs(float(self.tgrid_stored[0])) > 1e-12:
+            raise ValueError(
+                "corr_form='fluctuation' needs a tau grid that starts at 0 "
+                f"(it starts at {float(self.tgrid_stored[0]):g}): the CF "
+                "normalisation is fixed at S'(0)"
+            )
+        from scipy.interpolate import CubicSpline
+
+        tsrc = np.asarray(self.tgrid_stored, dtype=np.float64)
+        tfine = np.asarray(tgrid, dtype=np.float64)   # the INTEGRATION grid
+        sp = CubicSpline(tsrc, np.eye(len(tsrc)), axis=0)
+        for k in (1, 2):
+            self._dmat[k] = tf.constant(sp(tfine, k), self.dtype)
+
+    def _fluct_w(self, values, ci):
+        """``(w_re, w_im)`` of the fluctuation-form correction factor
+        ``Phi_i/phi_i = 1 + w_i(tau)`` -- see :meth:`_build_fluct`."""
+        lo, hi = self._chunks[ci]
+        d1re, d1im, d2re, d2im = self._chunk_resolution_derivs(values, ci)
+        p1re = d1re - d1re[:, :1]
+        p1im = d1im - d1im[:, :1]
+        dre = d2re + d1re * d1re - d1im * d1im
+        dim = d2im + self.npdt(2.0) * d1re * d1im
+        a = self._fl_a[lo:hi][:, None]
+        g = self._fl_g[lo:hi][:, None]
+        gt = g * self.tgrid[None, :]
+        return (-a * p1im + gt * dim, a * p1re - gt * dre)
+
     def _jensen_exact(self, delta, ci):
         """Invert the second-order mass map; identity unless mode is 'exact'.
 
@@ -1183,22 +1356,30 @@ class MassCFTerm(UnbinnedTerm):
             return s
         return tf.matmul(s, self._upmat, transpose_b=True)
 
-    def _family_exponent(self, values, families, vgf):
-        """``(Re S, Im S)`` of one block of rows from a (pre-sliced) family list.
+    def _family_parts(self, values, families, vgf):
+        """``(tabulated Re S, tabulated Im S, Gaussian variance)`` of one block.
 
-        ``S = sum_f k_f S_f`` over the per-family scale knobs. The tabulated
-        families are summed on their *stored* grid and the sum is expanded once
-        (the spline is linear, so that is exact); the analytic Gaussian family
-        is evaluated on the integration grid directly.
+        The exponent is split into the two pieces that behave differently under
+        differentiation in ``tau``: the TABULATED families, summed on their
+        *stored* grid (a cubic spline maps them, and their tau-derivatives, onto
+        the integration grid), and the analytic Gaussian family, returned as its
+        per-row variance ``v`` -- the exponent is ``-v tau^2/2``, its first
+        derivative ``-v tau`` and its second ``-v``, all exact.
+
+        Splitting it here is what lets :meth:`_chunk_resolution` and
+        :meth:`_chunk_resolution_derivs` be built from ONE traversal of the
+        family list, so a subclass that changes the parameterisation
+        (:class:`MaterialCFTerm`) overrides one method and gets both.
         """
         dtype = self.dtype
         s_re = None
         s_im = None
-        gauss = None
+        gv = None
         for f in families:
             k = values[f["param"]]
             if f["kind"] == "gauss":
-                gauss = k * (self.npdt(-0.5) * vgf[:, None] * self.tgrid[None, :] ** 2)
+                contrib = k * vgf
+                gv = contrib if gv is None else gv + contrib
                 continue
             if "re" in f:
                 contrib = k * tf.cast(f["re"], dtype)
@@ -1206,11 +1387,26 @@ class MassCFTerm(UnbinnedTerm):
             if "im" in f:
                 contrib = k * tf.cast(f["im"], dtype)
                 s_im = contrib if s_im is None else s_im + contrib
+        return s_re, s_im, gv
+
+    def _assemble_exponent(self, s_re, s_im, gv):
+        """Stored-grid tabulated parts + Gaussian variance -> ``(Re S, Im S)``
+        on the INTEGRATION grid.
+
+        ``S = sum_f k_f S_f`` over the per-family scale knobs. The tabulated sum
+        is expanded once (the spline is linear, so that is exact); the Gaussian
+        family is evaluated on the integration grid directly.
+        """
         s_re = self._upsample_exponent(s_re)
         s_im = self._upsample_exponent(s_im)
-        if gauss is not None:
+        if gv is not None:
+            gauss = self.npdt(-0.5) * gv[:, None] * self.tgrid[None, :] ** 2
             s_re = gauss if s_re is None else s_re + gauss
         return s_re, s_im
+
+    def _family_exponent(self, values, families, vgf):
+        """``(Re S, Im S)`` of one block of rows from a (pre-sliced) family list."""
+        return self._assemble_exponent(*self._family_parts(values, families, vgf))
 
     def _chunk_resolution(self, values, ci):
         """Resolution log-CF exponent ``(Re S, Im S)`` of chunk ``ci``.
@@ -1226,14 +1422,65 @@ class MassCFTerm(UnbinnedTerm):
 
         The returned exponents are already on the *integration* grid.
         """
+        return self._assemble_exponent(*self._chunk_resolution_parts(values, ci))
+
+    def _chunk_resolution_parts(self, values, ci):
+        """The chunk's exponent in the split form of :meth:`_family_parts`.
+
+        THE method a subclass overrides to change the PARAMETERISATION of the
+        resolution: both the exponent (:meth:`_chunk_resolution`) and its
+        tau-derivatives (:meth:`_chunk_resolution_derivs`) are assembled from
+        what this returns, so the two can never drift apart.
+        """
         lo, hi = self._chunks[ci]
         families = [
             dict(f, **{c: f[c][lo:hi] for c in ("re", "im") if c in f})
             for f in self.families
         ]
-        return self._family_exponent(
+        return self._family_parts(
             values, families, None if self.vgf is None else self.vgf[lo:hi]
         )
+
+    def _deriv_exponent(self, s, order):
+        """``d^order/dtau^order`` of a stored-grid ``(nrow, nt)`` exponent,
+        evaluated on the INTEGRATION grid.
+
+        A fixed cubic-spline differentiation matrix, built once in
+        :meth:`_build_fluct`. The exponents are smooth in ``tau`` (the largest
+        second difference is a couple of per cent of the range), which is the
+        same property the ``upsample`` expansion already relies on.
+        """
+        if s is None:
+            return None
+        return tf.matmul(s, self._dmat[order], transpose_b=True)
+
+    def _chunk_resolution_derivs(self, values, ci):
+        """``(S'_re, S'_im, S''_re, S''_im)`` of the chunk on the integration
+        grid, differentiated with respect to the standardized ``tau``.
+
+        Only the RESOLUTION exponent: the physics kernel is a separate factor of
+        the integrand and is not part of the fluctuation whose map the
+        correction inverts.
+        """
+        s_re, s_im, gv = self._chunk_resolution_parts(values, ci)
+        d1re = self._deriv_exponent(s_re, 1)
+        d1im = self._deriv_exponent(s_im, 1)
+        d2re = self._deriv_exponent(s_re, 2)
+        d2im = self._deriv_exponent(s_im, 2)
+        if gv is not None:
+            g1 = -gv[:, None] * self.tgrid[None, :]
+            g2 = -gv[:, None] * tf.ones_like(self.tgrid)[None, :]
+            d1re = g1 if d1re is None else d1re + g1
+            d2re = g2 if d2re is None else d2re + g2
+        z = None
+        if d1re is None or d1im is None or d2re is None or d2im is None:
+            z = tf.zeros(
+                [self._chunks[ci][1] - self._chunks[ci][0], self.nt_int], self.dtype
+            )
+        return (d1re if d1re is not None else z,
+                d1im if d1im is not None else z,
+                d2re if d2re is not None else z,
+                d2im if d2im is not None else z)
 
     def _density(
         self,
@@ -1249,6 +1496,7 @@ class MassCFTerm(UnbinnedTerm):
         s_re=None,
         s_im=None,
         escale=None,
+        corr_w=None,
     ):
         """Density ``L(m)`` of one block of rows, before the positivity floor.
 
@@ -1267,6 +1515,11 @@ class MassCFTerm(UnbinnedTerm):
         ``None`` to have the tabulation blended at the actual ``t_abs`` inside
         the graph (needed once ``sigma`` moves with the parameters, or once the
         integration grid is finer than the stored one).
+
+        ``corr_w`` is the fluctuation-form correction factor ``1 + w(tau)``
+        (given as ``(Re w, Im w)``), which multiplies the RESOLUTION CF -- see
+        :meth:`_build_fluct`.  ``None`` leaves the integrand bit-for-bit as it
+        was before that form existed.
         """
         t_abs = self.tgrid[None, :] / sigma[:, None]
 
@@ -1306,10 +1559,23 @@ class MassCFTerm(UnbinnedTerm):
             psi = psi + s_im
         if phik_re is None and self.phik_tab is not None:
             phik_re, phik_im = self._interp_phik(t_abs)
-        if phik_re is not None:
-            integ = phik_re * tf.cos(psi) - phik_im * tf.sin(psi)
+        if corr_w is None:
+            if phik_re is not None:
+                integ = phik_re * tf.cos(psi) - phik_im * tf.sin(psi)
+            else:
+                integ = tf.cos(psi)
         else:
-            integ = tf.cos(psi)
+            # Re[phi_K e^S (1 + w) e^{-i t delta}] = (1 + w_re) P - w_im Q with
+            # P = Re[phi_K e^{i psi}] the uncorrected integrand and
+            # Q = Im[phi_K e^{i psi}] its quadrature partner.
+            w_re, w_im = corr_w
+            cpsi, spsi = tf.cos(psi), tf.sin(psi)
+            if phik_re is not None:
+                p = phik_re * cpsi - phik_im * spsi
+                q = phik_re * spsi + phik_im * cpsi
+            else:
+                p, q = cpsi, spsi
+            integ = p + (w_re * p - w_im * q)
         if s_re is not None:
             integ = tf.exp(s_re) * integ
 
@@ -1371,6 +1637,7 @@ class MassCFTerm(UnbinnedTerm):
             s_re=s_re,
             s_im=s_im,
             escale=self._chunk_exponent_scale(values, ci),
+            corr_w=self._fluct_w(values, ci) if self._fluct_active else None,
         )
 
     def _norm_z(self, values):
@@ -1619,6 +1886,7 @@ class MassCFTerm(UnbinnedTerm):
             "jensen_scale": self.jensen_scale,
             "jensen_disc_floor": self.jensen_disc_floor,
             "corr_clip": self.corr_clip,
+            "corr_form": self.corr_form,
             "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,
             "norm_window": None if self.norm_window is None else list(self.norm_window),
@@ -1879,9 +2147,9 @@ class MaterialCFTerm(MassCFTerm):
             return tf.exp(e)
         return tf.maximum(tf.constant(1.0, self.dtype) + e, self.npdt(0.0))
 
-    def _chunk_resolution(self, values, ci):
+    def _chunk_resolution_parts(self, values, ci):
         # any LEGACY per-family knobs first (empty in the physical model)
-        s_re, s_im = super()._chunk_resolution(values, ci)
+        s_re, s_im, gv = super()._chunk_resolution_parts(values, ci)
         lo, hi = self._chunks[ci]
         dtype = self.dtype
 
@@ -1906,10 +2174,9 @@ class MaterialCFTerm(MassCFTerm):
                     if contrib is None:
                         continue
                     # the per-group exponents are stored on the term's own
-                    # tgrid, so they go through the same expansion the flat
-                    # families do (a no-op at upsample == 1, which keeps this
-                    # bit-identical to the un-upsampled term)
-                    contrib = self._upsample_exponent(contrib)
+                    # tgrid, so they join the flat tabulated families there and
+                    # go through the same expansion (a no-op at upsample == 1,
+                    # which keeps this bit-identical to the un-upsampled term)
                     if tgt == 0:
                         s_re = contrib if s_re is None else s_re + contrib
                     else:
@@ -1925,10 +2192,9 @@ class MaterialCFTerm(MassCFTerm):
                     self._h_seg[a:b] - np.int32(lo),
                     hi - lo,
                 )
-            contrib = self.npdt(-0.5) * v[:, None] * self.tgrid[None, :] ** 2
-            s_re = contrib if s_re is None else s_re + contrib
+            gv = v if gv is None else gv + v
 
-        return s_re, s_im
+        return s_re, s_im, gv
 
     def config(self):
         cfg = super().config()
