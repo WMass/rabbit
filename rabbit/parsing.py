@@ -365,6 +365,28 @@ def common_parser():
         "on any fit long enough that losing it would hurt.",
     )
     parser.add_argument(
+        "--unbinnedChunk",
+        default=0,
+        type=int,
+        help="Candidate chunk size for unbinned likelihood terms, overriding "
+        "the one stored in the datacard (0: keep it). The chunk is a pure "
+        "memory / dispatch knob -- the objective is a sum over candidates and "
+        "does not depend on how it is partitioned -- so it can be retuned per "
+        "machine. A term carrying a per-candidate sparse D refuses to be "
+        "re-chunked, because its blocks were sliced at write time.",
+    )
+    parser.add_argument(
+        "--unbinnedChunkMode",
+        default="graph",
+        choices=["graph", "eager"],
+        help="How an unbinned term loops its candidate chunks. 'graph' is a "
+        "tf.while_loop with the gradient accumulated in the body and the "
+        "Hessian-vector product taken forward-over-reverse, so exactly one "
+        "chunk is ever live; 'eager' is the python loop, which builds the "
+        "whole sample's tape and exists as the reference the graph path is "
+        "checked against.",
+    )
+    parser.add_argument(
         "--hvpMethod",
         default="revrev",
         type=str,
