@@ -97,6 +97,10 @@ class Fitter:
             "loss_val_grad_hessp",
             "loss_val_grad_hessp_fwdrev",
             "loss_val_grad_hessp_revrev",
+            # only set when the card carries unbinned terms, and a bound
+            # method either way -- strip it with the rest so __deepcopy__
+            # rebuilds it against the copy rather than the original
+            "loss_val_grad_hess",
         }
     )
     valid_systematic_types = ["log_normal", "normal"]
@@ -125,6 +129,9 @@ class Fitter:
         # scipy's OptimizeResult from the last fit(), so the convergence
         # outcome can be written to the output. None if the minimizer raised.
         self.minimizer_result = None
+        # kept so init_fit_parms can read the unbinned chunk options, which
+        # only become relevant once the terms exist
+        self._fit_options = options
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
         self.hvp_batch = int(getattr(options, "hvpBatch", 256) or 256)
         # Optional parameter preconditioning (see rabbit/preconditioner.py).
@@ -486,8 +493,30 @@ class Fitter:
         # The term objects are built by FitInputData (they own large constant
         # tensors); here only their parameter names are resolved against the
         # fit parameter vector. See rabbit.unbinned.
+        # chunk size and loop mode, from the CLI, before the terms are wired:
+        # both are pure evaluation knobs (the objective is a sum over
+        # candidates and does not depend on how it is partitioned), so they
+        # belong to the fit, not to the card.
+        raw_unbinned = getattr(self.indata, "unbinned_terms", []) or []
+        want_chunk = int(getattr(self._fit_options, "unbinnedChunk", 0) or 0)
+        want_mode = getattr(self._fit_options, "unbinnedChunkMode", "graph")
+        for term in raw_unbinned:
+            if want_chunk:
+                term.rechunk(want_chunk)
+            if want_mode == "eager":
+                term.chunk_mode = "eager"
+            elif not term.graph_chunkable:
+                logger.warning(
+                    f"unbinned term '{term.name}' cannot use the graph chunk "
+                    "loop (its per-chunk slicing needs a python chunk index); "
+                    "it will build the whole sample's tape."
+                )
+            logger.info(
+                f"unbinned term '{term.name}': {term.n} candidates in "
+                f"{term.nchunk} chunk(s) of {term.chunk}, {term.chunk_mode} loop"
+            )
         self.unbinned_terms = unbinned_terms_mod.build_tf_unbinned_terms(
-            getattr(self.indata, "unbinned_terms", []),
+            raw_unbinned,
             self.parms,
         )
 
@@ -1042,6 +1071,33 @@ class Fitter:
             return edmval, cov
         else:
             return edmval_cov(grad, hess)
+
+    def _floating_block(self, grad, hess):
+        """``(grad, hess)`` restricted to the parameters that are floating.
+
+        A frozen parameter contributes an exactly zero row and column to the
+        Hessian (``get_x`` stop-gradients it), so the full matrix is singular
+        as soon as anything is frozen. :meth:`edmval_cov` has always masked
+        them; the ``--diagnostics`` line did not, and solved the singular
+        system instead -- "Input matrix is not invertible", which the fitter
+        reports as "Minimizer raised" and turns into a failed fit.
+        """
+        if not len(self.frozen_params):
+            return grad, hess
+        sub = tf.gather(grad, self.floating_indices, axis=0)
+        subh = tf.gather(hess, self.floating_indices, axis=0)
+        subh = tf.gather(subh, self.floating_indices, axis=1)
+        return sub, subh
+
+    def log_diagnostics(self, grad, hess):
+        """Condition number and EDM of the CURRENT point, for --diagnostics."""
+        subgrad, subhess = self._floating_block(grad, hess)
+        try:
+            logger.info(f"  - Condition number: {tfh.cond_number(subhess)}")
+            logger.info(f"  - edmval: {tfh.edmval(subgrad, subhess)}")
+        except Exception as ex:  # pragma: no cover - diagnostics only
+            # a diagnostic must never be able to fail a fit
+            logger.warning(f"  - diagnostics unavailable at this point: {ex}")
 
     def edmval_cov_rows_hessfree(self, grad, row_indices, rtol=1e-10, maxiter=None):
         """Hessian-free edmval + selected rows of the covariance matrix.
@@ -2329,6 +2385,19 @@ class Fitter:
         # propagation through SparseMatrixMatMul (no JVP rule for the
         # CSR variant), so the fwdrev HVP cannot be used in sparse mode.
         # Fall back to revrev with a warning.
+        # An unbinned term hides its candidate loop behind a
+        # `tf.custom_gradient` (see rabbit.unbinned): the value is a
+        # tf.while_loop, its VJP is the gradient loop and the gradient's VJP is
+        # the HVP loop. That is exactly the revrev contract. Forward mode is a
+        # different mechanism -- ForwardAccumulator does not go through a
+        # registered VJP -- so fwdrev would come back wrong or zero here.
+        if getattr(self, "unbinned_terms", None) and self.hvp_method == "fwdrev":
+            logger.warning(
+                "fwdrev HVP is not supported with unbinned likelihood terms "
+                "(their candidate loop is hidden behind a tf.custom_gradient, "
+                "which forward mode does not traverse); falling back to revrev."
+            )
+            self.hvp_method = "revrev"
         if self.hvp_method == "fwdrev" and self.indata.sparse:
             logger.warning(
                 "fwdrev HVP is not supported in sparse mode "
@@ -2340,6 +2409,54 @@ class Fitter:
             self.loss_val_grad_hessp = self.loss_val_grad_hessp_fwdrev
         else:
             self.loss_val_grad_hessp = self.loss_val_grad_hessp_revrev
+
+        # THE HESSIAN ROUTE FOR AN UNBINNED CARD.  `loss_val_grad_hess` builds
+        # the matrix with `t2.jacobian`, which vectorises over every parameter
+        # at once and so holds `nparams` copies of the forward tape.  For an
+        # unbinned term that tape is the whole candidate sample: 116 GB at
+        # 300 000 candidates and 5 parameters, which is what drove the
+        # full-scale fits out of the Fitter in the first place.  The matrix
+        # itself is only [npar, npar].
+        #
+        # `hessian_from_hvps` (PR #154) builds it column by column from the
+        # very HVP the PR #153 minimizers already call every iteration, each
+        # costing one chunk of memory rather than the sample.  At the 7-100
+        # parameters of these fits that is seconds, and flat in memory.  It is
+        # selected automatically -- an unbinned card must never take the pfor
+        # route, and the user should not have to know that.
+        if getattr(self, "unbinned_terms", None):
+            self.loss_val_grad_hess = self._loss_val_grad_hess_from_hvps
+            # `_hessp_batch` is a pfor of width k over the same loss; a
+            # tf.while_loop with a custom gradient inside one is not something
+            # to rely on, and the batching buys nothing at this parameter
+            # count. One HVP at a time.
+            self.hvp_batch = 1
+            logger.info(
+                f"{len(self.unbinned_terms)} unbinned term(s): the Hessian is "
+                "assembled from Hessian-vector products rather than from the "
+                "vectorised jacobian, and the HVP is revrev."
+            )
+
+    def _loss_val_grad_hess_from_hvps(self, profile=True):
+        """``loss_val_grad_hess`` for a card carrying unbinned terms.
+
+        Same signature and same return types as the traced version it replaces,
+        so every caller -- the preconditioner's reference matrix, the postfit
+        covariance, the impacts, `tf-trust-exact` -- is unchanged.
+        """
+        if not profile:
+            # nothing in the unbinned path profiles, so the flag only reaches
+            # the binned part of the loss; refuse rather than quietly ignoring
+            # it if there is a binned part that would care
+            if self.bbstat.enabled:
+                raise NotImplementedError(
+                    "profile=False Hessian with unbinned terms and bin-by-bin "
+                    "statistics is not implemented"
+                )
+        val, grad = self.loss_val_grad()
+        hess = self.hessian_from_hvps(batch=1)
+        hess = 0.5 * (hess + hess.T)
+        return val, grad, tf.constant(hess, dtype=self.indata.dtype)
 
     @tf.function
     def loss_val_grad_hess(self, profile=True):
@@ -2605,10 +2722,7 @@ class Fitter:
             self.x.assign(pc.to_physical(yval))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
+                self.log_diagnostics(grad, hess)
             return pc.hess_to_internal(hess.__array__())
 
         # Native (TF) minimizer counterparts of the callbacks above. Same
@@ -2625,10 +2739,7 @@ class Fitter:
             self.x.assign(pc.to_physical(yval))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
+                self.log_diagnostics(grad, hess)
             if pc.enabled:
                 grad = tf.constant(pc.grad_to_internal(grad.__array__()))
                 hess = tf.constant(pc.hess_to_internal(hess.__array__()))

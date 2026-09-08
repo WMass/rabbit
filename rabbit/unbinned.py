@@ -608,6 +608,182 @@ class UnbinnedTerm:
     def nparams(self):
         return len(self.param_names)
 
+    # -- the candidate loop, ON DEVICE ------------------------------------
+    #
+    # WHY THIS IS HERE AND NOT IN A DRIVER.  The obvious implementation of an
+    # unbinned term -- build the whole sample's NLL and let the Fitter's tapes
+    # differentiate it -- keeps every candidate's forward tape live at once,
+    # and the pfor Hessian keeps `nparams` copies of it: 116 GB at 300 000
+    # candidates and 5 parameters, i.e. unrunnable at the 3.7 M of a real
+    # sample.  That is what pushed the full-scale fits out of `Fitter.minimize`
+    # into standalone drivers, and with them went rabbit's EDM, its termination
+    # convention, its snapshots, its output files and every downstream tool.
+    #
+    # The NLL is a SUM over candidates, so its gradient and its Hessian-vector
+    # products are the same sums, and a chunk's tape can be released before the
+    # next chunk is taped.  Doing that INSIDE the term -- as a `tf.while_loop`
+    # with `parallel_iterations=1`, the gradient taken in the loop body and
+    # accumulated -- makes the term an ordinary differentiable function of its
+    # parameters with a bounded memory footprint, and the Fitter needs to know
+    # nothing about any of it.
+    #
+    # `tf.custom_gradient` is what hides the loop from the Fitter's tapes: the
+    # forward pass is the value loop, its VJP is the gradient loop, and the
+    # gradient's own VJP is the Hessian-vector-product loop.  So
+    # `loss_val_grad` and the revrev `loss_val_grad_hessp` work unchanged, and
+    # nothing outside ever differentiates *through* a chunk.
+
+    def _chunk_loop(self, init, body_piece, nchunk=None):
+        """``tf.while_loop`` over the candidate chunks, summing contributions.
+
+        ``body_piece(ci) -> tuple`` returns this chunk's contribution to each
+        accumulator.  ``parallel_iterations=1`` is not a tuning knob: it is
+        what bounds the live memory to ONE chunk.  An unrolled python loop
+        inside a ``tf.function`` would let the executor start every chunk at
+        once and give back the memory problem this exists to solve.
+        """
+        nch = int(self.nchunk if nchunk is None else nchunk)
+        if nch == 0:
+            return tuple(init)
+        out = tf.while_loop(
+            lambda ci, *acc: ci < nch,
+            lambda ci, *acc: (ci + 1,)
+            + tuple(a + b for a, b in zip(acc, body_piece(ci))),
+            (tf.constant(0, tf.int32),) + tuple(init),
+            parallel_iterations=1,
+            swap_memory=False,
+            maximum_iterations=nch,
+        )
+        return out[1:]
+
+    def _chunk_contribution(self, params, ci):
+        """This chunk's contribution to ``-sum log L``. Subclass implements."""
+        raise NotImplementedError
+
+    def rechunk(self, chunk):
+        """Change the candidate chunk size.
+
+        The chunk size is a pure memory / dispatch knob -- the objective is a
+        sum over candidates and does not depend on how it is partitioned -- so
+        this is safe to expose on the command line. It is NOT safe for a term
+        carrying a per-candidate sparse ``D``: those blocks are sliced at write
+        time, so a different chunking would pair chunk ``ci`` of the candidates
+        with block ``ci`` of a different partition. That case raises rather
+        than silently mis-aligning.
+        """
+        chunk = int(chunk)
+        if chunk <= 0:
+            raise ValueError(f"chunk must be positive, got {chunk}")
+        if getattr(self, "_jac_chunks", None) is not None:
+            raise ValueError(
+                f"term '{self.name}' carries a per-candidate sparse D whose "
+                "per-chunk blocks were built at write time; re-chunking it "
+                "would silently mis-align them"
+            )
+        self.chunk = int(min(chunk, self.n)) if self.n else 1
+        self.nchunk = int(np.ceil(self.n / self.chunk)) if self.n else 0
+        self._chunks = ChunkTable(self.chunk, self.n, self.nchunk)
+        return self
+
+    def _nll_graph(self, params):
+        """``nll`` with the candidate loop on device and bounded memory.
+
+        Exactly the same arithmetic as the eager loop -- the same
+        ``_chunk_contribution`` per chunk, summed in the same order -- with the
+        three derivative levels the Fitter can ask for each computed by their
+        own pass over the chunks:
+
+        =====================  ======================================
+        the Fitter calls       this runs
+        =====================  ======================================
+        ``loss_val``           the value loop
+        ``loss_val_grad``      value loop, then the gradient loop
+        ``..._hessp(p)``       value, gradient, then the HVP loop at p
+        =====================  ======================================
+
+        Each pass holds one chunk.  The value loop is repeated rather than
+        fused into the gradient because ``tf.custom_gradient`` gives the
+        backward pass no channel for forward-computed tensors other than a
+        closure, and closing over a chunk\'s tape is the thing being avoided.
+        It costs about a third of a gradient and buys a cheap value-only call,
+        which the trust-region loop makes once per iteration to price a
+        proposed step.
+        """
+        term = self
+
+        @tf.custom_gradient
+        def _grad_of_nll(p):
+            def piece(ci):
+                with tf.GradientTape() as tape:
+                    tape.watch(p)
+                    f = term._chunk_contribution(p, ci)
+                g = tape.gradient(f, p)
+                return (tf.zeros_like(p) if g is None else g,)
+
+            (g,) = term._chunk_loop((tf.zeros_like(p),), piece)
+
+            def hvp(dg):
+                # the VJP of the GRADIENT with cotangent dg is H^T dg = H dg,
+                # which is exactly what the revrev `loss_val_grad_hessp` asks
+                # for. Forward-over-reverse per chunk, so the tangent and the
+                # tape of one chunk are all that is live.
+                def piece2(ci):
+                    with tf.autodiff.ForwardAccumulator(p, dg) as acc:
+                        with tf.GradientTape() as tape:
+                            tape.watch(p)
+                            f = term._chunk_contribution(p, ci)
+                        gg = tape.gradient(f, p)
+                        gg = tf.zeros_like(p) if gg is None else gg
+                    hv = acc.jvp(gg)
+                    return (tf.zeros_like(p) if hv is None else hv,)
+
+                (hv,) = term._chunk_loop((tf.zeros_like(p),), piece2)
+                return hv
+
+            return g, hvp
+
+        @tf.custom_gradient
+        def _nll(p):
+            (v,) = term._chunk_loop(
+                (tf.zeros([], term.dtype),),
+                lambda ci: (term._chunk_contribution(p, ci),),
+            )
+
+            def vjp(dy):
+                return dy * _grad_of_nll(p)
+
+            return v, vjp
+
+        return _nll(params)
+
+
+    @property
+    def chunk_mode(self):
+        """``"graph"`` (tf.while_loop) or ``"eager"`` (python loop).
+
+        ``graph`` wherever the term supports it, which is what keeps the
+        Fitter's memory bounded; a term whose per-chunk slicing needs a python
+        index falls back, and so does an explicit ``term.chunk_mode = "eager"``
+        (the tests set it to compare the two).
+        """
+        forced = getattr(self, "_chunk_mode", None)
+        if forced is not None:
+            return forced
+        return "graph" if self.graph_chunkable else "eager"
+
+    @chunk_mode.setter
+    def chunk_mode(self, value):
+        if value not in (None, "graph", "eager"):
+            raise ValueError(
+                f"chunk_mode must be 'graph', 'eager' or None; got {value!r}"
+            )
+        if value == "graph" and not self.graph_chunkable:
+            raise ValueError(
+                f"term '{self.name}' cannot use the graph chunk loop: its "
+                "per-chunk slicing needs a python chunk index"
+            )
+        self._chunk_mode = value
+
     @property
     def graph_chunkable(self):
         """Can the candidate-chunk loop run as a ``tf.while_loop``?
@@ -1584,10 +1760,17 @@ class MassCFTerm(UnbinnedTerm):
         start, stop = int(start), int(stop)
         if not 0 <= start < stop <= self.n:
             raise ValueError(f"candidate range [{start}, {stop}) outside [0, {self.n})")
-        if not self.graph_chunkable:
+        if getattr(self, "g_ptr", None) is not None or getattr(
+            self, "h_ptr", None
+        ) is not None:
+            # the CSR group / hit blocks are indexed by a POINTER array of
+            # length n+1 into a flat nnz axis; slicing candidates means
+            # re-cutting both, which the leading-dimension detection below
+            # cannot do. Refuse rather than hand a shard the wrong rows.
             raise ValueError(
-                f"term '{self.name}' cannot be candidate-sliced: its per-chunk "
-                "slicing does not go through ChunkTable"
+                f"term '{self.name}' carries CSR group / hit blocks, which "
+                "candidate_slice does not re-cut; multi-device sharding of "
+                "such a term is not supported"
             )
         out = _copy.copy(self)
         n = stop - start
@@ -2232,13 +2415,43 @@ class MassCFTerm(UnbinnedTerm):
         return -tf.reduce_sum(logl)
 
     # -- public ------------------------------------------------------------
+    def _chunk_contribution(self, params, ci):
+        """One chunk's ``-sum_i log L_i``, for a python OR a traced ``ci``.
+
+        Self-contained by construction: it takes the raw parameter vector and
+        rebuilds everything the chunk needs, so the same body serves the eager
+        loop and the ``tf.while_loop``.  The price is that the parameter-only
+        prologue -- the physics-kernel transform and the truncation
+        normalisation ``Z`` -- is evaluated once per chunk rather than once per
+        call.  Measured at ~4 ms per chunk on the Z card against a ~260 ms
+        gradient, i.e. 14 % at 113 chunks; hoisting it means the gradient no
+        longer flows through a single tape and is deliberately left for when a
+        per-resolution-class kernel makes it matter.
+        """
+        values = self._values(params)
+        li = self._chunk_li(values, ci)
+        if self._norm is not None:
+            z = self._norm_z(values)
+            lo, hi = self._chunks[ci]
+            li = li / tf.gather(z, self._norm_class[lo:hi])
+        return self._mix(values, li, ci)
+
     def nll(self, params, full_nll=False):
         """Scalar NLL contribution, accumulated over candidate chunks.
 
         ``full_nll`` is accepted for interface symmetry with the binned and
         external terms but has no effect: an unbinned term is already the
         exact ``-sum log(density)``, with no dropped normalisation constant.
+
+        With :attr:`chunk_mode` ``"graph"`` (the default wherever the term
+        supports it) the loop is a ``tf.while_loop`` and the derivatives come
+        from :meth:`_nll_graph`, so the Fitter never differentiates through
+        more than one chunk.  ``"eager"`` is the original python loop, kept as
+        the reference the graph path is checked against and as the fallback for
+        a term whose per-chunk slicing needs a python index.
         """
+        if self.chunk_mode == "graph":
+            return self._nll_graph(params)
         values = self._values(params)
         z = None if self._norm is None else self._norm_z(values)
         total = None
@@ -2445,6 +2658,9 @@ class MaterialCFTerm(MassCFTerm):
             if nnz and (g_id.min() < 0 or g_id.max() >= len(self.group_params)):
                 raise ValueError("grp_id out of range of group_params")
             self.g_ptr = g_ptr
+            # a tf copy as well: with a traced chunk index the CSR bounds have
+            # to be gathered rather than read as python ints
+            self._g_ptr_t = tf.constant(np.asarray(g_ptr, np.int32), tf.int32)
             self._g_id = tf.constant(g_id, tf.int32)
             self._g_seg = tf.constant(
                 np.repeat(np.arange(self.n, dtype=np.int64), np.diff(g_ptr)),
@@ -2506,6 +2722,7 @@ class MaterialCFTerm(MassCFTerm):
             if len(h_cls) and (h_cls.min() < 0 or h_cls.max() >= len(self.hit_params)):
                 raise ValueError("hit_cls out of range of hit_params")
             self.h_ptr = h_ptr
+            self._h_ptr_t = tf.constant(np.asarray(h_ptr, np.int32), tf.int32)
             self._h_cls = tf.constant(h_cls, tf.int32)
             self._h_v = tf.constant(h_v, self.dtype)
             self._h_seg = tf.constant(
@@ -2541,12 +2758,20 @@ class MaterialCFTerm(MassCFTerm):
             return tf.exp(e)
         return tf.maximum(tf.constant(1.0, self.dtype) + e, self.npdt(0.0))
 
-    @property
-    def graph_chunkable(self):
-        # the CSR group / hit blocks are indexed as `int(self.g_ptr[lo])`,
-        # i.e. a python int out of a numpy pointer array: a traced chunk index
-        # cannot do that, so a term that carries them stays on the host loop.
-        return self.g_ptr is None and self.h_ptr is None
+    @staticmethod
+    def _csr_bounds(ptr_np, ptr_tf, lo, hi):
+        """``(ptr[lo], ptr[hi])`` for a python OR a traced chunk bound.
+
+        The CSR group / hit blocks used to be indexed as ``int(self.g_ptr[lo])``
+        -- a python int out of a numpy pointer array -- which is the one thing
+        a traced chunk index cannot do, and it is what kept this class off the
+        graph loop. Gathering from a tf copy fixes that; the python branch
+        still returns python ints, so the eager path's slices stay static and
+        bit-for-bit what they were.
+        """
+        if tf.is_tensor(lo) or tf.is_tensor(hi):
+            return tf.gather(ptr_tf, lo), tf.gather(ptr_tf, hi)
+        return int(ptr_np[lo]), int(ptr_np[hi])
 
     def _chunk_resolution_parts(self, values, ci):
         # any LEGACY per-family knobs first (empty in the physical model)
@@ -2555,10 +2780,12 @@ class MaterialCFTerm(MassCFTerm):
         dtype = self.dtype
 
         if self.g_ptr is not None and len(self.group_families):
-            a, b = int(self.g_ptr[lo]), int(self.g_ptr[hi])
+            a, b = self._csr_bounds(self.g_ptr, self._g_ptr_t, lo, hi)
             w = self._amount(values)
             wrow = tf.gather(w, self._g_id[a:b])[:, None]
-            seg = self._g_seg[a:b] - np.int32(lo)
+            seg = self._g_seg[a:b] - (
+                lo if tf.is_tensor(lo) else np.int32(lo)
+            )
             nseg = hi - lo
             for f in self.group_families:
                 for comp, tgt in (("re", 0), ("im", 1)):
@@ -2586,11 +2813,11 @@ class MaterialCFTerm(MassCFTerm):
         if self.h_ptr is not None:
             v = self.vg_other[lo:hi]
             if len(self.hit_params):
-                a, b = int(self.h_ptr[lo]), int(self.h_ptr[hi])
+                a, b = self._csr_bounds(self.h_ptr, self._h_ptr_t, lo, hi)
                 hw = self._hitscale(values)
                 v = v + tf.math.unsorted_segment_sum(
                     tf.gather(hw, self._h_cls[a:b]) * self._h_v[a:b],
-                    self._h_seg[a:b] - np.int32(lo),
+                    self._h_seg[a:b] - (lo if tf.is_tensor(lo) else np.int32(lo)),
                     hi - lo,
                 )
             gv = v if gv is None else gv + v
