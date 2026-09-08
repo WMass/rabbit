@@ -205,22 +205,55 @@ class ChunkTable:
 
 
 class JacChunkTable:
-    """``term._jac_chunks``: the sparse ``D`` rows of candidate chunk ``ci``.
+    """``term._jac_chunks``: the ``D`` rows of candidate chunk ``ci``.
 
-    The eager path keeps the pre-built per-chunk :class:`tf.SparseTensor`
-    blocks it always had -- slicing a 46-million-nonzero sparse tensor once
-    per chunk would be a real cost there. A *traced* index cannot index a
-    python list, so it slices the whole-sample sparse tensor instead, which is
-    assembled lazily on the first such access and only then (a card with no
-    ``jac`` never builds it, and neither does a fit that stays on the host
-    loop).
+    The eager path keeps the pre-built per-chunk blocks it always had --
+    slicing a 46-million-nonzero tensor once per chunk would be a real cost
+    there. A *traced* index cannot index a python list, so it slices a
+    whole-sample tensor instead, assembled lazily on the first such access and
+    only then (a card with no ``jac`` never builds it, and neither does a fit
+    that stays on the host loop).
+
+    DENSE OR SPARSE
+    ---------------
+    ``tf.sparse.sparse_dense_matmul`` **has no deterministic GPU kernel**, and
+    ``rabbit_fit.py`` calls ``tf.config.experimental.enable_op_determinism()``
+    at import. A card whose ``D`` blocks are sparse therefore dies on a GPU
+    with ``UNIMPLEMENTED: A deterministic GPU implementation of
+    SparseTensorDenseMatmulOp is not currently available`` -- at the first
+    loss evaluation, so the whole fit is lost.
+
+    Densifying is not a workaround here, it is the better representation. In
+    COO a nonzero costs two int64 indices plus its value (24 bytes at float64)
+    against 8 bytes for a dense entry, so sparse storage only pays below ~1/3
+    density; the joint cards of this campaign carry ``D`` blocks that are
+    **79-82 % dense**, where sparse is both larger and slower. So the default
+    is dense, with ``dense=False`` available for a genuinely sparse ``D`` (and
+    then only the host loop can run it under determinism).
     """
 
-    def __init__(self, blocks, chunks, njac):
-        self.blocks = list(blocks)
+    # below this fill fraction COO is smaller than dense at float64, so a
+    # genuinely sparse D is left alone unless the caller forces it
+    DENSE_THRESHOLD = 1.0 / 3.0
+
+    def __init__(self, blocks, chunks, njac, dense=None):
+        blocks = list(blocks)
         self.chunks = chunks
         self.njac = int(njac)
         self._whole = None
+        self._whole_d = None
+        nnz = sum(int(b.values.shape[0]) for b in blocks
+                  if isinstance(b, tf.sparse.SparseTensor))
+        ntot = max(1, int(chunks.n) * self.njac)
+        self.density = nnz / ntot
+        if dense is None:
+            dense = self.density >= self.DENSE_THRESHOLD
+        self.is_dense = bool(dense)
+        if self.is_dense:
+            blocks = [tf.sparse.to_dense(b)
+                      if isinstance(b, tf.sparse.SparseTensor) else b
+                      for b in blocks]
+        self.blocks = blocks
 
     def __len__(self):
         return len(self.blocks)
@@ -229,6 +262,10 @@ class JacChunkTable:
         return iter(self.blocks)
 
     def _whole_sparse(self):
+        if self.is_dense:
+            raise RuntimeError(
+                "JacChunkTable holds dense D blocks; use _whole_dense()"
+            )
         # `tf.init_scope()` because the first *traced* access is what builds
         # this: without it the constants land inside the tf.while_loop's own
         # FuncGraph and cannot be read from anywhere else ("cannot be accessed
@@ -256,16 +293,41 @@ class JacChunkTable:
             [self.chunks.n, self.njac],
         )
 
+    def _whole_dense(self):
+        """``[n, njac]`` dense ``D``, for the traced path. See ``_whole_sparse``
+        for why ``tf.init_scope`` is needed."""
+        if self._whole_d is None:
+            with tf.init_scope():
+                self._whole_d = tf.concat(self.blocks, axis=0)
+        return self._whole_d
+
     def __getitem__(self, ci):
         if not tf.is_tensor(ci):
             return self.blocks[int(ci)]
         lo, hi = self.chunks[ci]
+        if self.is_dense:
+            return tf.slice(
+                self._whole_dense(),
+                tf.stack([tf.cast(lo, tf.int32), tf.constant(0, tf.int32)]),
+                tf.stack(
+                    [tf.cast(hi - lo, tf.int32), tf.constant(self.njac, tf.int32)]
+                ),
+            )
         return tf.sparse.slice(
             self._whole_sparse(),
             tf.stack([tf.cast(lo, tf.int64), tf.constant(0, tf.int64)]),
             tf.stack(
                 [tf.cast(hi - lo, tf.int64), tf.constant(self.njac, tf.int64)]
             ),
+        )
+
+    def matvec(self, ci, theta):
+        """``(D theta)`` over the candidates of chunk ``ci``."""
+        blk = self[ci]
+        if self.is_dense:
+            return tf.linalg.matvec(blk, theta)
+        return tf.squeeze(
+            tf.sparse.sparse_dense_matmul(blk, theta[:, None]), axis=-1
         )
 
 # Default preconditioning units, see module docstring.
@@ -945,6 +1007,7 @@ class MassCFTerm(UnbinnedTerm):
         bkg_frac_unit=FBKG_UNIT,
         jac=None,
         jac_params=(),
+        jac_dense=None,
         floor="softplus",
         floor_scale=FLOOR_SCALE,
         chunk=32768,
@@ -1304,7 +1367,16 @@ class MassCFTerm(UnbinnedTerm):
                     )
                 )
             self._jac_chunks = JacChunkTable(
-                blocks, self._chunks, len(self.jac_params)
+                blocks, self._chunks, len(self.jac_params), dense=jac_dense
+            )
+            logger.info(
+                f"unbinned term '{name}': D is {self._jac_chunks.density:.1%} "
+                f"dense over {self._chunks.n} x {len(self.jac_params)}, stored "
+                + ("DENSE (sparse_dense_matmul has no deterministic GPU kernel, "
+                   "and below ~1/3 density COO is the larger representation "
+                   "anyway)" if self._jac_chunks.is_dense else
+                   "SPARSE -- note this cannot run on a GPU under "
+                   "tf.config.experimental.enable_op_determinism()")
             )
         elif jac is not None:
             raise ValueError("jac given without jac_params")
@@ -1482,11 +1554,7 @@ class MassCFTerm(UnbinnedTerm):
         delta = self.mobs[lo:hi] if shift is None else self.mobs[lo:hi] - shift
         if self._jac_chunks is not None:
             theta = tf.stack([values[p] for p in self.jac_params])
-            dj = tf.squeeze(
-                tf.sparse.sparse_dense_matmul(self._jac_chunks[ci], theta[:, None]),
-                axis=-1,
-            )
-            delta = delta - dj
+            delta = delta - self._jac_chunks.matvec(ci, theta)
         ms = self._chunk_mean_shift(values, ci)
         if ms is not None:
             delta = delta - ms
@@ -1811,17 +1879,17 @@ class MassCFTerm(UnbinnedTerm):
         out._jensen_u = {}
         out._jensen_clipped = {}
         if self._jac_chunks is not None:
-            whole = self._jac_chunks._whole_sparse()
-            sub = tf.sparse.slice(
-                whole, [start, 0], [n, self._jac_chunks.njac]
-            )
-            blocks = []
-            for lo, hi in out._chunks:
-                blocks.append(
-                    tf.sparse.slice(sub, [lo, 0], [hi - lo, self._jac_chunks.njac])
-                )
+            njac = self._jac_chunks.njac
+            if self._jac_chunks.is_dense:
+                sub = tf.slice(self._jac_chunks._whole_dense(), [start, 0], [n, njac])
+                blocks = [sub[lo:hi] for lo, hi in out._chunks]
+            else:
+                whole = self._jac_chunks._whole_sparse()
+                sub = tf.sparse.slice(whole, [start, 0], [n, njac])
+                blocks = [tf.sparse.slice(sub, [lo, 0], [hi - lo, njac])
+                          for lo, hi in out._chunks]
             out._jac_chunks = JacChunkTable(
-                blocks, out._chunks, self._jac_chunks.njac
+                blocks, out._chunks, njac, dense=self._jac_chunks.is_dense
             )
         return out
 
