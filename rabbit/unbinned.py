@@ -229,23 +229,32 @@ class JacChunkTable:
         return iter(self.blocks)
 
     def _whole_sparse(self):
+        # `tf.init_scope()` because the first *traced* access is what builds
+        # this: without it the constants land inside the tf.while_loop's own
+        # FuncGraph and cannot be read from anywhere else ("cannot be accessed
+        # from here, ... out of scope"). init_scope lifts them into the eager
+        # context, where they are ordinary constants the graph captures.
         if self._whole is None:
-            idx, val = [], []
-            for ci, b in enumerate(self.blocks):
-                lo, _ = self.chunks[ci]
-                bi = b.indices.numpy().copy()
-                bi[:, 0] += lo
-                idx.append(bi)
-                val.append(b.values.numpy())
-            self._whole = tf.sparse.SparseTensor(
-                np.concatenate(idx, axis=0) if idx else np.zeros((0, 2), np.int64),
-                tf.constant(
-                    np.concatenate(val, axis=0) if val else np.zeros(0),
-                    self.blocks[0].values.dtype if self.blocks else tf.float64,
-                ),
-                [self.chunks.n, self.njac],
-            )
+            with tf.init_scope():
+                self._whole = self._build_whole_sparse()
         return self._whole
+
+    def _build_whole_sparse(self):
+        idx, val = [], []
+        for ci, b in enumerate(self.blocks):
+            lo, _ = self.chunks[ci]
+            bi = b.indices.numpy().copy()
+            bi[:, 0] += lo
+            idx.append(bi)
+            val.append(b.values.numpy())
+        return tf.sparse.SparseTensor(
+            np.concatenate(idx, axis=0) if idx else np.zeros((0, 2), np.int64),
+            tf.constant(
+                np.concatenate(val, axis=0) if val else np.zeros(0),
+                self.blocks[0].values.dtype if self.blocks else tf.float64,
+            ),
+            [self.chunks.n, self.njac],
+        )
 
     def __getitem__(self, ci):
         if not tf.is_tensor(ci):
