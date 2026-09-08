@@ -84,7 +84,12 @@ def tf_edmval(grad, hess):
     # Compute EDM = 0.5 * g^T x
     edm = 0.5 * tf.squeeze(tf.matmul(tf.transpose(grad), x))
 
-    return edmval
+    # NB `return edmval` here returned the module-level FUNCTION of that name,
+    # so on a GPU -- the only branch that reaches this -- `edmval(grad, hess)`
+    # handed back a function and `--diagnostics` printed
+    # "<function edmval at 0x...>" instead of the EDM. The CPU branch
+    # (scipy_edmval) was always right, which is why it went unnoticed.
+    return edm
 
 
 def edmval(grad, hess):

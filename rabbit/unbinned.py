@@ -1696,10 +1696,17 @@ class MassCFTerm(UnbinnedTerm):
         start, stop = int(start), int(stop)
         if not 0 <= start < stop <= self.n:
             raise ValueError(f"candidate range [{start}, {stop}) outside [0, {self.n})")
-        if not self.graph_chunkable:
+        if getattr(self, "g_ptr", None) is not None or getattr(
+            self, "h_ptr", None
+        ) is not None:
+            # the CSR group / hit blocks are indexed by a POINTER array of
+            # length n+1 into a flat nnz axis; slicing candidates means
+            # re-cutting both, which the leading-dimension detection below
+            # cannot do. Refuse rather than hand a shard the wrong rows.
             raise ValueError(
-                f"term '{self.name}' cannot be candidate-sliced: its per-chunk "
-                "slicing does not go through ChunkTable"
+                f"term '{self.name}' carries CSR group / hit blocks, which "
+                "candidate_slice does not re-cut; multi-device sharding of "
+                "such a term is not supported"
             )
         out = _copy.copy(self)
         n = stop - start
@@ -2586,6 +2593,9 @@ class MaterialCFTerm(MassCFTerm):
             if nnz and (g_id.min() < 0 or g_id.max() >= len(self.group_params)):
                 raise ValueError("grp_id out of range of group_params")
             self.g_ptr = g_ptr
+            # a tf copy as well: with a traced chunk index the CSR bounds have
+            # to be gathered rather than read as python ints
+            self._g_ptr_t = tf.constant(np.asarray(g_ptr, np.int32), tf.int32)
             self._g_id = tf.constant(g_id, tf.int32)
             self._g_seg = tf.constant(
                 np.repeat(np.arange(self.n, dtype=np.int64), np.diff(g_ptr)),
@@ -2647,6 +2657,7 @@ class MaterialCFTerm(MassCFTerm):
             if len(h_cls) and (h_cls.min() < 0 or h_cls.max() >= len(self.hit_params)):
                 raise ValueError("hit_cls out of range of hit_params")
             self.h_ptr = h_ptr
+            self._h_ptr_t = tf.constant(np.asarray(h_ptr, np.int32), tf.int32)
             self._h_cls = tf.constant(h_cls, tf.int32)
             self._h_v = tf.constant(h_v, self.dtype)
             self._h_seg = tf.constant(
@@ -2682,12 +2693,20 @@ class MaterialCFTerm(MassCFTerm):
             return tf.exp(e)
         return tf.maximum(tf.constant(1.0, self.dtype) + e, self.npdt(0.0))
 
-    @property
-    def graph_chunkable(self):
-        # the CSR group / hit blocks are indexed as `int(self.g_ptr[lo])`,
-        # i.e. a python int out of a numpy pointer array: a traced chunk index
-        # cannot do that, so a term that carries them stays on the host loop.
-        return self.g_ptr is None and self.h_ptr is None
+    @staticmethod
+    def _csr_bounds(ptr_np, ptr_tf, lo, hi):
+        """``(ptr[lo], ptr[hi])`` for a python OR a traced chunk bound.
+
+        The CSR group / hit blocks used to be indexed as ``int(self.g_ptr[lo])``
+        -- a python int out of a numpy pointer array -- which is the one thing
+        a traced chunk index cannot do, and it is what kept this class off the
+        graph loop. Gathering from a tf copy fixes that; the python branch
+        still returns python ints, so the eager path's slices stay static and
+        bit-for-bit what they were.
+        """
+        if tf.is_tensor(lo) or tf.is_tensor(hi):
+            return tf.gather(ptr_tf, lo), tf.gather(ptr_tf, hi)
+        return int(ptr_np[lo]), int(ptr_np[hi])
 
     def _chunk_resolution_parts(self, values, ci):
         # any LEGACY per-family knobs first (empty in the physical model)
@@ -2696,10 +2715,12 @@ class MaterialCFTerm(MassCFTerm):
         dtype = self.dtype
 
         if self.g_ptr is not None and len(self.group_families):
-            a, b = int(self.g_ptr[lo]), int(self.g_ptr[hi])
+            a, b = self._csr_bounds(self.g_ptr, self._g_ptr_t, lo, hi)
             w = self._amount(values)
             wrow = tf.gather(w, self._g_id[a:b])[:, None]
-            seg = self._g_seg[a:b] - np.int32(lo)
+            seg = self._g_seg[a:b] - (
+                lo if tf.is_tensor(lo) else np.int32(lo)
+            )
             nseg = hi - lo
             for f in self.group_families:
                 for comp, tgt in (("re", 0), ("im", 1)):
@@ -2727,11 +2748,11 @@ class MaterialCFTerm(MassCFTerm):
         if self.h_ptr is not None:
             v = self.vg_other[lo:hi]
             if len(self.hit_params):
-                a, b = int(self.h_ptr[lo]), int(self.h_ptr[hi])
+                a, b = self._csr_bounds(self.h_ptr, self._h_ptr_t, lo, hi)
                 hw = self._hitscale(values)
                 v = v + tf.math.unsorted_segment_sum(
                     tf.gather(hw, self._h_cls[a:b]) * self._h_v[a:b],
-                    self._h_seg[a:b] - np.int32(lo),
+                    self._h_seg[a:b] - (lo if tf.is_tensor(lo) else np.int32(lo)),
                     hi - lo,
                 )
             gv = v if gv is None else gv + v
