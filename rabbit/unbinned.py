@@ -1467,6 +1467,88 @@ class MassCFTerm(UnbinnedTerm):
             )
         return self
 
+    def candidate_slice(self, start, stop, device=None, chunk=None):
+        """A view of this term over candidates ``[start, stop)``.
+
+        The unbinned analogue of `rabbit.sharding.ShardIndataView`: that class
+        slices the BINS axis of `FitInputData`, and an unbinned term has
+        candidates instead. A shallow copy is taken and every per-candidate
+        tensor is re-materialised on ``device``, so a multi-device fit can put
+        one candidate range on each GPU and add the partial gradients -- the
+        parameter vector is the only thing that crosses.
+
+        Which tensors are per-candidate is DETECTED, not listed: every tf
+        tensor attribute whose leading dimension is ``n`` is sliced, as are the
+        ``(n, nt)`` blocks inside :attr:`families`. A hand-written list would
+        silently stop covering a tensor added later, and the failure mode --
+        one shard reading another shard's candidates -- is a wrong answer
+        rather than an error.
+
+        Everything that is NOT per-candidate (the tau grid, the kernel CF
+        tabulation, the resolution-class arrays behind ``norm_window``, the
+        spline differentiation matrices) is shared: it is small, and every
+        shard needs all of it.
+
+        Returns a term that behaves exactly like a term built from those
+        candidates alone -- including ``n``, ``nchunk`` and ``_chunks``.
+        """
+        import copy as _copy
+
+        start, stop = int(start), int(stop)
+        if not 0 <= start < stop <= self.n:
+            raise ValueError(f"candidate range [{start}, {stop}) outside [0, {self.n})")
+        if not self.graph_chunkable:
+            raise ValueError(
+                f"term '{self.name}' cannot be candidate-sliced: its per-chunk "
+                "slicing does not go through ChunkTable"
+            )
+        out = _copy.copy(self)
+        n = stop - start
+
+        def place(t):
+            if device is None:
+                return tf.identity(t)
+            with tf.device(device):
+                return tf.identity(t)
+
+        for key, val in list(vars(self).items()):
+            if not tf.is_tensor(val):
+                continue
+            shape = val.shape
+            if len(shape) == 0 or shape[0] != self.n:
+                continue
+            setattr(out, key, place(val[start:stop]))
+
+        out.families = []
+        for f in self.families:
+            e = dict(f)
+            for comp in ("re", "im", "fix_re", "fix_im"):
+                arr = e.get(comp)
+                if tf.is_tensor(arr) and arr.shape[0] == self.n:
+                    e[comp] = place(arr[start:stop])
+            out.families.append(e)
+
+        out.n = n
+        out.chunk = int(min(chunk or self.chunk, n))
+        out.nchunk = int(np.ceil(n / out.chunk))
+        out._chunks = ChunkTable(out.chunk, n, out.nchunk)
+        out._jensen_u = {}
+        out._jensen_clipped = {}
+        if self._jac_chunks is not None:
+            whole = self._jac_chunks._whole_sparse()
+            sub = tf.sparse.slice(
+                whole, [start, 0], [n, self._jac_chunks.njac]
+            )
+            blocks = []
+            for lo, hi in out._chunks:
+                blocks.append(
+                    tf.sparse.slice(sub, [lo, 0], [hi - lo, self._jac_chunks.njac])
+                )
+            out._jac_chunks = JacChunkTable(
+                blocks, out._chunks, self._jac_chunks.njac
+            )
+        return out
+
     @staticmethod
     def _memo_key(ci):
         """Hashable key for a chunk index that may be a traced tensor."""
