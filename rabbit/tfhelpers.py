@@ -100,9 +100,19 @@ def edmval(grad, hess):
         return scipy_edmval(grad.__array__(), hess.__array__())
 
 
+def tf_cond_number(hess):
+    # `tf.linalg.cond` does not exist -- TF has no such symbol -- so the GPU
+    # branch used to raise AttributeError the first time --diagnostics asked
+    # for it, which the fitter reports as "Minimizer raised" and turns into a
+    # failed fit. The 2-norm condition number is the ratio of the extreme
+    # singular values, which tf does have.
+    s = tf.linalg.svd(hess, compute_uv=False)
+    return s[0] / s[-1]
+
+
 def cond_number(hess):
     if is_on_gpu(hess):
-        return tf.linalg.cond(hess)
+        return tf_cond_number(hess)
     else:
         return scipy_cond_number(hess.__array__())
 
