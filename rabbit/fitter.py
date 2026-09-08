@@ -1108,10 +1108,54 @@ class Fitter:
         with the zero row. All it changes is that the matrix is invertible, so
         the solver sees an ordinary problem of the floating dimension.
         """
+        self.warn_unconstrained(hess)
         if not len(self.frozen_params):
             return hess
+        # ONLY the frozen entries. A parameter that is floating but that no
+        # term constrains has a zero row for a PHYSICS reason, and it must
+        # stay singular so the fit fails loudly rather than quietly returning
+        # a number for a direction the data does not determine.
         mask = tf.cast(self.frozen_params_mask, hess.dtype)
         return hess + tf.linalg.diag(mask)
+
+    def warn_unconstrained(self, hess, rtol=1e-12):
+        """Name the FLOATING parameters no term constrains, once.
+
+        A zero Hessian row on a floating parameter means nothing in the
+        likelihood depends on it -- a material group no candidate touches, a
+        mode outside the acceptance. The subproblem is then singular for a
+        physics reason, and the honest outcome is to say which parameter it is
+        and let the fit fail, not to regularise it into a number. (This is
+        why :meth:`hess_for_minimizer` adds its unit diagonal on the FROZEN
+        entries only.)
+        """
+        if getattr(self, "_warned_unconstrained", False):
+            return
+        self._warned_unconstrained = True
+        try:
+            d = np.abs(np.asarray(tf.linalg.diag_part(hess)))
+        except Exception:  # pragma: no cover - diagnostics only
+            return
+        scale = d.max()
+        if not np.isfinite(scale) or scale <= 0:
+            return
+        free = np.ones(d.shape, dtype=bool)
+        if len(self.frozen_params):
+            free = ~np.asarray(self.frozen_params_mask)
+        bad = np.where(free & (d < rtol * scale))[0]
+        if not bad.size:
+            return
+        names = np.asarray(self.parms).astype(str)
+        logger.warning(
+            f"{bad.size} floating parameter(s) have an essentially zero "
+            f"Hessian diagonal ({d[bad].max():.3g} against a scale of "
+            f"{scale:.3g}): {list(names[bad][:12])}"
+            + (" ..." if bad.size > 12 else "")
+            + ". Nothing in the likelihood constrains them, so the "
+            "trust-region subproblem is singular. Freeze them or give them a "
+            "prior; this is NOT the frozen-parameter case and is deliberately "
+            "not regularised away."
+        )
 
     def log_diagnostics(self, grad, hess):
         """Condition number and EDM of the CURRENT point, for --diagnostics."""
