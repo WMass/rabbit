@@ -1089,6 +1089,30 @@ class Fitter:
         subh = tf.gather(subh, self.floating_indices, axis=1)
         return sub, subh
 
+    def hess_for_minimizer(self, hess):
+        """The Hessian with the FROZEN directions made non-singular.
+
+        `get_x` stop-gradients a frozen parameter, so its row and column of the
+        Hessian are exactly zero -- and handing a singular matrix to a
+        trust-region subproblem is handing it the "hard case" on every single
+        iteration. `trust-exact` then never returns an interior Newton step,
+        so `hits_boundary` is False, so the trust radius never doubles, and the
+        fit converges LINEARLY: measured on `z_n300k` with four parameters
+        frozen, the EDM fell 16495 -> 210 in five iterations and then moved
+        about 1 % per iteration for the next twenty-five. `--precondition` does
+        not help, because a singular block cannot be whitened.
+
+        Putting 1 on the frozen diagonal is EXACT, not a regularisation: the
+        frozen gradient components are zero, so the subproblem's solution has
+        `p_frozen = -0/1 = 0` for any positive value there, exactly as it did
+        with the zero row. All it changes is that the matrix is invertible, so
+        the solver sees an ordinary problem of the floating dimension.
+        """
+        if not len(self.frozen_params):
+            return hess
+        mask = tf.cast(self.frozen_params_mask, hess.dtype)
+        return hess + tf.linalg.diag(mask)
+
     def log_diagnostics(self, grad, hess):
         """Condition number and EDM of the CURRENT point, for --diagnostics."""
         subgrad, subhess = self._floating_block(grad, hess)
@@ -2723,7 +2747,7 @@ class Fitter:
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
                 self.log_diagnostics(grad, hess)
-            return pc.hess_to_internal(hess.__array__())
+            return pc.hess_to_internal(self.hess_for_minimizer(hess).__array__())
 
         # Native (TF) minimizer counterparts of the callbacks above. Same
         # contract and the same internal coordinates, but the gradient and
@@ -2740,6 +2764,7 @@ class Fitter:
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
                 self.log_diagnostics(grad, hess)
+            hess = self.hess_for_minimizer(hess)
             if pc.enabled:
                 grad = tf.constant(pc.grad_to_internal(grad.__array__()))
                 hess = tf.constant(pc.hess_to_internal(hess.__array__()))
