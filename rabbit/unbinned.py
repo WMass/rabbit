@@ -1535,12 +1535,17 @@ class MassCFTerm(UnbinnedTerm):
                 return tf.identity(t)
 
         for key, val in list(vars(self).items()):
-            if not tf.is_tensor(val):
-                continue
-            shape = val.shape
-            if len(shape) == 0 or shape[0] != self.n:
-                continue
-            setattr(out, key, place(val[start:stop]))
+            if tf.is_tensor(val):
+                shape = val.shape
+                if len(shape) and shape[0] == self.n:
+                    setattr(out, key, place(val[start:stop]))
+            elif isinstance(val, np.ndarray):
+                # numpy per-candidate arrays too (`corr_mass`, the `_*_np`
+                # copies): they stay on the host, but a shard that reads one --
+                # `set_corrections` rebuilds the fluctuation constants from
+                # `corr_mass` -- must see its own candidates
+                if val.ndim and val.shape[0] == self.n:
+                    setattr(out, key, val[start:stop].copy())
 
         out.families = []
         for f in self.families:
