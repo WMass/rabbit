@@ -1271,6 +1271,7 @@ class MassCFTerm(UnbinnedTerm):
             float(norm_window[0]), float(norm_window[1]))
         self.norm_tpoints = int(norm_tpoints)
         self._norm = None
+        self.norm_fixed = []
         if self.norm_window is not None:
             if norm is None:
                 raise ValueError(
@@ -2254,18 +2255,26 @@ class MassCFTerm(UnbinnedTerm):
         s_re = None
         s_im = None
         for f in self._norm_families:
-            k = values[f["param"]]
+            # `param` is None for a FIXED norm family (coefficient 1). That is
+            # what a `MaterialCFTerm` uses: its per-candidate resolution is the
+            # per-GROUP decomposition, which has no per-class counterpart, so
+            # the truncation normalisation is evaluated at the production's own
+            # exponents -- exactly the constant a `MassCFTerm` with its `k_*`
+            # knobs fixed at 1 evaluates it at.
+            k = None if f["param"] is None else values[f["param"]]
             if f["kind"] == "gauss":
-                contrib = k * (
-                    self.npdt(-0.5) * self._norm_vgf[:, None] * t[None, :] ** 2
-                )
+                contrib = self.npdt(-0.5) * self._norm_vgf[:, None] * t[None, :] ** 2
+                if k is not None:
+                    contrib = k * contrib
                 s_re = contrib if s_re is None else s_re + contrib
                 continue
             if "re" in f:
-                contrib = k * tf.cast(f["re"], dtype)
+                contrib = tf.cast(f["re"], dtype)
+                contrib = contrib if k is None else k * contrib
                 s_re = contrib if s_re is None else s_re + contrib
             if "im" in f:
-                contrib = k * tf.cast(f["im"], dtype)
+                contrib = tf.cast(f["im"], dtype)
+                contrib = contrib if k is None else k * contrib
                 s_im = contrib if s_im is None else s_im + contrib
 
         k_re, k_im = self.kernel.log_cf(values, t_abs)
@@ -2360,6 +2369,46 @@ class MassCFTerm(UnbinnedTerm):
                             )
                         entry[comp] = tf.constant(up, self.dtype)
             self._norm_families.append(entry)
+
+        # FIXED norm families: same arrays, no parameter (see `_norm_z`).  They
+        # are declared structurally in `norm_fixed` so the card round-trips.
+        self.norm_fixed = []
+        for f in norm.get("fixed", []):
+            entry = {"name": f["name"], "param": None,
+                     "kind": f.get("kind", "tab")}
+            if entry["kind"] != "gauss":
+                for comp in ("re", "im"):
+                    arr = f.get(comp)
+                    if arr is None:
+                        continue
+                    arr = np.asarray(arr, dtype=np.float64)
+                    if arr.shape[0] != self._nclass:
+                        raise ValueError(
+                            f"fixed norm family '{f['name']}' component "
+                            f"'{comp}' has shape {arr.shape}, expected "
+                            f"({self._nclass}, {self.nt})"
+                        )
+                    if arr.shape[1] == nt:
+                        up = arr
+                    elif arr.shape[1] == self.nt:
+                        up = CubicSpline(tsrc, arr, axis=1)(tmid)
+                    else:
+                        raise ValueError(
+                            f"fixed norm family '{f['name']}' component "
+                            f"'{comp}' has {arr.shape[1]} t points, expected "
+                            f"{self.nt} or {nt}"
+                        )
+                    entry[comp] = tf.constant(up, self.dtype)
+                if "re" not in entry and "im" not in entry:
+                    raise ValueError(
+                        f"fixed norm family '{f['name']}' has neither re nor im"
+                    )
+            elif self._norm_vgf is None:
+                raise ValueError(
+                    "a fixed norm family of kind 'gauss' needs norm['vgf']"
+                )
+            self._norm_families.append(entry)
+            self.norm_fixed.append({"name": entry["name"], "kind": entry["kind"]})
 
         if phik is None and (self.phik_re is not None or self.phik_tab is not None):
             raise ValueError(
@@ -2506,6 +2555,7 @@ class MassCFTerm(UnbinnedTerm):
             "kernel": self.kernel.config(),
             "background": self.background.config(),
             "jac_params": list(self.jac_params),
+            **({"norm_fixed": list(self.norm_fixed)} if self.norm_fixed else {}),
         }
 
 
@@ -2964,6 +3014,7 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
                         entry[comp] = data.pop(key)
             families.append(entry)
 
+        norm_fixed = cfg.pop("norm_fixed", [])
         norm = None
         if "norm_sigma" in data:
             norm = {
@@ -2981,6 +3032,14 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
                     if key in data:
                         entry[comp] = data.pop(key)
                 norm["families"].append(entry)
+            norm["fixed"] = []
+            for fam in norm_fixed:
+                entry = {"name": fam["name"], "kind": fam.get("kind", "tab")}
+                for comp in ("re", "im"):
+                    key = f"S_{comp}_{fam['name']}_norm"
+                    if key in data:
+                        entry[comp] = data.pop(key)
+                norm["fixed"].append(entry)
 
         phik = None
         if "phik_t" in data:
