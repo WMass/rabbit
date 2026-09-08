@@ -150,6 +150,115 @@ from rabbit.h5pyutils_read import maketensor
 
 logger = logging.child_logger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# candidate chunking
+# ---------------------------------------------------------------------------
+class ChunkTable:
+    """``term._chunks``: the ``(lo, hi)`` bounds of candidate chunk ``ci``.
+
+    A plain list of python pairs would do for the eager loop the terms have
+    always run (``for ci in range(self.nchunk)``). This exists because the
+    same loop has to be expressible as a ``tf.while_loop`` on the device: the
+    loop variable is then a *traced int32 tensor*, and every ``arr[lo:hi]``
+    in the chunk path has to become a dynamic ``strided_slice`` rather than a
+    static one.
+
+    Indexing with a python int returns python ints and is bit-identical to
+    the list it replaces; indexing with a tensor returns tensors. Nothing
+    else in the term has to know which mode it is in -- that is the whole
+    point of putting the branch here.
+
+    The last chunk is short (``n`` is not in general a multiple of
+    ``chunk``), so the traced slice has a dynamic length. That is legal
+    everywhere in the chunk path -- only the ``nt`` axis needs a static size
+    -- and it means the graph is traced once, for all chunks, instead of once
+    per chunk size.
+    """
+
+    def __init__(self, chunk, n, nchunk):
+        self.chunk = int(chunk)
+        self.n = int(n)
+        self.nchunk = int(nchunk)
+
+    def __len__(self):
+        return self.nchunk
+
+    def __iter__(self):
+        for i in range(self.nchunk):
+            yield self[i]
+
+    def __getitem__(self, ci):
+        if tf.is_tensor(ci):
+            lo = tf.cast(ci, tf.int32) * tf.constant(self.chunk, tf.int32)
+            return lo, tf.minimum(lo + self.chunk, tf.constant(self.n, tf.int32))
+        ci = int(ci)
+        if ci < 0:
+            ci += self.nchunk
+        if not 0 <= ci < self.nchunk:
+            raise IndexError(ci)
+        lo = ci * self.chunk
+        return lo, min(self.n, lo + self.chunk)
+
+    def __repr__(self):
+        return f"ChunkTable(chunk={self.chunk}, n={self.n}, nchunk={self.nchunk})"
+
+
+class JacChunkTable:
+    """``term._jac_chunks``: the sparse ``D`` rows of candidate chunk ``ci``.
+
+    The eager path keeps the pre-built per-chunk :class:`tf.SparseTensor`
+    blocks it always had -- slicing a 46-million-nonzero sparse tensor once
+    per chunk would be a real cost there. A *traced* index cannot index a
+    python list, so it slices the whole-sample sparse tensor instead, which is
+    assembled lazily on the first such access and only then (a card with no
+    ``jac`` never builds it, and neither does a fit that stays on the host
+    loop).
+    """
+
+    def __init__(self, blocks, chunks, njac):
+        self.blocks = list(blocks)
+        self.chunks = chunks
+        self.njac = int(njac)
+        self._whole = None
+
+    def __len__(self):
+        return len(self.blocks)
+
+    def __iter__(self):
+        return iter(self.blocks)
+
+    def _whole_sparse(self):
+        if self._whole is None:
+            idx, val = [], []
+            for ci, b in enumerate(self.blocks):
+                lo, _ = self.chunks[ci]
+                bi = b.indices.numpy().copy()
+                bi[:, 0] += lo
+                idx.append(bi)
+                val.append(b.values.numpy())
+            self._whole = tf.sparse.SparseTensor(
+                np.concatenate(idx, axis=0) if idx else np.zeros((0, 2), np.int64),
+                tf.constant(
+                    np.concatenate(val, axis=0) if val else np.zeros(0),
+                    self.blocks[0].values.dtype if self.blocks else tf.float64,
+                ),
+                [self.chunks.n, self.njac],
+            )
+        return self._whole
+
+    def __getitem__(self, ci):
+        if not tf.is_tensor(ci):
+            return self.blocks[int(ci)]
+        lo, hi = self.chunks[ci]
+        return tf.sparse.slice(
+            self._whole_sparse(),
+            tf.stack([tf.cast(lo, tf.int64), tf.constant(0, tf.int64)]),
+            tf.stack(
+                [tf.cast(hi - lo, tf.int64), tf.constant(self.njac, tf.int64)]
+            ),
+        )
+
 # Default preconditioning units, see module docstring.
 ALPHA_UNIT = 1e-3
 FBKG_UNIT = 1e-3
@@ -490,6 +599,19 @@ class UnbinnedTerm:
     def nparams(self):
         return len(self.param_names)
 
+    @property
+    def graph_chunkable(self):
+        """Can the candidate-chunk loop run as a ``tf.while_loop``?
+
+        True when every per-chunk slice in the term goes through
+        :class:`ChunkTable` (or :class:`JacChunkTable`) and so accepts a
+        *traced* chunk index. A subclass that indexes a numpy pointer array
+        with ``int(...)`` -- :class:`MaterialCFTerm`'s CSR group / hit blocks
+        do -- must say so, and the caller then keeps that term on the host
+        loop. See ``calibration_studies/fullscale/devobj.py``.
+        """
+        return True
+
     def nll(self, params, full_nll=False):
         """Scalar NLL contribution. ``params`` is ordered as ``param_names``."""
         raise NotImplementedError
@@ -694,10 +816,7 @@ class MassCFTerm(UnbinnedTerm):
 
         self.chunk = int(min(chunk, self.n)) if self.n else 1
         self.nchunk = int(np.ceil(self.n / self.chunk)) if self.n else 0
-        self._chunks = [
-            (i * self.chunk, min(self.n, (i + 1) * self.chunk))
-            for i in range(self.nchunk)
-        ]
+        self._chunks = ChunkTable(self.chunk, self.n, self.nchunk)
 
         self.sigma = tf.constant(sigma, dtype)
         self.mobs = tf.constant(mobs, dtype)
@@ -933,19 +1052,22 @@ class MassCFTerm(UnbinnedTerm):
                     f"jac has {shape[1]} columns but {len(self.jac_params)} "
                     "jac_params were given"
                 )
-            self._jac_chunks = []
+            blocks = []
             for lo, hi in self._chunks:
                 m = (idx[:, 0] >= lo) & (idx[:, 0] < hi)
                 sub = idx[m].copy()
                 sub[:, 0] -= lo
                 order = np.lexsort((sub[:, 1], sub[:, 0]))
-                self._jac_chunks.append(
+                blocks.append(
                     tf.sparse.SparseTensor(
                         sub[order],
                         tf.constant(val[m][order], dtype),
                         [hi - lo, len(self.jac_params)],
                     )
                 )
+            self._jac_chunks = JacChunkTable(
+                blocks, self._chunks, len(self.jac_params)
+            )
         elif jac is not None:
             raise ValueError("jac given without jac_params")
 
@@ -2231,6 +2353,13 @@ class MaterialCFTerm(MassCFTerm):
         if self.hit_mode == "exp":
             return tf.exp(e)
         return tf.maximum(tf.constant(1.0, self.dtype) + e, self.npdt(0.0))
+
+    @property
+    def graph_chunkable(self):
+        # the CSR group / hit blocks are indexed as `int(self.g_ptr[lo])`,
+        # i.e. a python int out of a numpy pointer array: a traced chunk index
+        # cannot do that, so a term that carries them stays on the host loop.
+        return self.g_ptr is None and self.h_ptr is None
 
     def _chunk_resolution_parts(self, values, ci):
         # any LEGACY per-family knobs first (empty in the physical model)
