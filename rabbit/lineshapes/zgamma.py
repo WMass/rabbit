@@ -216,6 +216,18 @@ DEFAULT_LUMI = "nnpdf31_nnlo_13tev"
 DEFAULT_TERMS = ("gamma", "int", "z")
 
 
+def _vmap(m, p):
+    """`v(m) = Int dm/m^p`, the variable in which the smearing is a convolution."""
+    m = np.asarray(m, dtype=np.float64)
+    return np.log(m) if p == 1.0 else m ** (1.0 - p) / (1.0 - p)
+
+
+def _vinv(v, p):
+    """The inverse of :func:`_vmap`."""
+    v = np.asarray(v, dtype=np.float64)
+    return np.exp(v) if p == 1.0 else ((1.0 - p) * v) ** (1.0 / (1.0 - p))
+
+
 def _load_fsr(fsr):
     """Normalise an FSR-kernel spec to ``{"r", "w", "m_lo", "m_hi"}`` float64.
 
@@ -395,6 +407,7 @@ class ZGammaLineshape:
         fsr_mmax=None,
         shape=0,
         shape_window=None,
+        vpow=None,
         dtype=tf.float64,
     ):
         if width_scheme not in ("fixed", "running"):
@@ -579,6 +592,86 @@ class ZGammaLineshape:
 
         self._npad = self.nfft - self.nm
         self._cache = None
+        self._build_v(vpow, dtype)
+
+    # ----------------------------------------------------------------------
+    def _build_v(self, vpow, dtype):
+        """The `v = Int dm/m^p` grid, on which the smearing is a CONVOLUTION.
+
+        WHY.  The mass resolution of a track pair is not a fixed width: the
+        CURVATURE resolution is what is constant, so `sigma_m ~ m^{p}` with
+        `p = 1 + f_hit`.  A likelihood that convolves this lineshape with a
+        kernel of FIXED width `sigma_i`, and conditions each candidate on that
+        `sigma_i`, is wrong twice over -- and the second is the worse of the
+        two, because `sigma_i` as a conditioning label carries information
+        about the TRUE mass (measured on the Z sample: `<m_gen>` runs from
+        84.94 GeV in the lowest `sigma` octile to 91.28 in the highest,
+        `rho = 0.168`), so `p(m_true | sigma_i) != p(m_true)`.  That is Punzi's
+        variable-resolution problem and it is worth -11 MeV on `m_Z` here.
+
+        Substituting `v(m) = Int dm/m^p = m^{1-p}/(1-p)` (`ln m` at `p = 1`)
+        makes the smearing a fixed-width convolution in `v` with the width
+        `k_i = sigma_i / m_i^p`, and `k_i` carries no mass information
+        (`rho(k, m_gen) = -0.01` at the measured `p = 1.25`, against
+        `rho(sigma, m_gen) = +0.17`).  Both defects go at once.
+
+        WHAT CHANGES HERE, and it is only this: the density is resampled onto a
+        grid uniform in `v`, carrying the Jacobian `dm/dv = m^p`, and the CF is
+        the transform of THAT.  Everything upstream -- the Born spectrum, the
+        acceptance, the FSR fold, `K(m)` -- is untouched and still lives on the
+        mass grid, because all of it is a property of the mass and none of it
+        of the smearing.
+
+        The resampling weights and the Jacobian are CONSTANTS (`p` is fixed),
+        so this costs one gather and one multiply per evaluation.
+        """
+        self.vpow = None if vpow is None else float(vpow)
+        if self.vpow is None:
+            return
+        p = self.vpow
+        self.v_grid = np.linspace(_vmap(self.window[0], p),
+                                  _vmap(self.window[1], p), self.nm)
+        self.dv = float(self.v_grid[1] - self.v_grid[0])
+        m_of_v = _vinv(self.v_grid, p)
+        # linear interpolation from the (uniform) mass grid onto m(v)
+        u = np.clip((m_of_v - self.window[0]) / self.dm, 0.0, self.nm - 1 - 1e-12)
+        i0 = np.floor(u).astype(np.int64)
+        self._v_i0 = tf.constant(i0, tf.int32)
+        self._v_w = tf.constant(u - i0, self.dtype)
+        # p_v(v) = p(m(v)) (dm/dv) = p(m) m^p
+        self._v_jac = tf.constant(m_of_v ** p, self.dtype)
+        self.v_ref = _vmap(float(self.m_ref), p)
+        # the CF prefactors, in v
+        # `tau_max` is given in units conjugate to the MASS. The term evaluates
+        # the kernel CF at `t_abs = tgrid / width`, and the width in `v` is
+        # `k = sigma / m^p`, so `t_abs` is larger by `m^p` and the tau range
+        # has to grow with it. `dv` shrinks by exactly the same factor, so
+        # `ntau` is unchanged -- this is a change of units, not of resolution.
+        # `window[1]^p` rather than `m_ref^p` because the largest mass gives
+        # the largest `t_abs` and running short there is silent (the lookup
+        # clamps).
+        self.vtau_max = self.tau_max * self.window[1] ** p
+        dtau_v = 2.0 * np.pi / (self.nfft * self.dv)
+        ntau_v = min(int(np.ceil(self.vtau_max / dtau_v)) + 4, self.nfft // 2 + 1)
+        if ntau_v < 8:
+            raise ValueError("v tau grid too short; raise tau_max or nm")
+        self.dtau, self.ntau = dtau_v, ntau_v
+        self.tau_tab = np.arange(ntau_v) * dtau_v
+        theta = self.tau_tab * self.dv
+        with np.errstate(invalid="ignore"):
+            khat = np.where(theta == 0.0, 1.0,
+                            (np.sin(0.5 * theta) / (0.5 * theta)) ** 2)
+        psi = self.tau_tab * (self.v_grid[0] - self.v_ref)
+        self._pref_re = tf.constant(self.dv * khat * np.cos(psi), dtype)
+        self._pref_im = tf.constant(self.dv * khat * np.sin(psi), dtype)
+
+    def pdf_v(self, values=None, **kw):
+        """The lineshape as a density in `v`, normalised on the `v` grid."""
+        y = self.pdf(values, **kw)
+        y = tf.gather(y, self._v_i0) * (self.npdt(1.0) - self._v_w) + \
+            tf.gather(y, tf.minimum(self._v_i0 + 1, self.nm - 1)) * self._v_w
+        y = y * self._v_jac
+        return y / (tf.reduce_sum(y) * self.npdt(self.dv))
 
     def _acceptance_on(self, m):
         """The acceptance factor ``A(m)`` on masses ``m``, or ``None``.
@@ -909,7 +1002,7 @@ class ZGammaLineshape:
         return out
 
     def _cf_tab(self, values):
-        p = self.pdf(values)
+        p = self.pdf(values) if self.vpow is None else self.pdf_v(values)
         if self._npad:
             p = tf.concat([p, tf.zeros([self._npad], self.dtype)], axis=0)
         f = tf.signal.rfft(p)[: self.ntau]

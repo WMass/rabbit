@@ -783,6 +783,7 @@ class MassCFTerm(UnbinnedTerm):
         corr_form="residual",
         corr_coeff_max=0.08,
         corr_mass=None,
+        vpow=None,
         sigma_floor=SIGMA_FLOOR,
         norm_window=None,
         norm_tpoints=8192,
@@ -934,6 +935,38 @@ class MassCFTerm(UnbinnedTerm):
         self.corr_form = corr_form
         self.corr_coeff_max = float(corr_coeff_max)
         self._fluct = corr_form == "fluctuation"
+        # THE v FORMULATION.  When `vpow = p` is set, this term's `sigma` is
+        # the width in `v(m) = Int dm/m^p` -- the resolution CONSTANT
+        # `k_i = sigma_phys_i / m_i^p` -- and `mobs` is `v(m_i) - v(m_ref)`.
+        # The kernel CF must be the transform of the lineshape's density in `v`
+        # (`ZGammaLineshape(vpow=p)`), and `corr_mass` must carry the PHYSICAL
+        # mass, since the corrections' coefficients are ratios `sigma/m`.
+        #
+        # It is not a reparameterisation for its own sake.  The mass resolution
+        # of a track pair scales as `m^p` with `p = 1 + f_hit` (the curvature
+        # resolution is what is constant), so a fixed-width convolution in `m`
+        # is wrong at the true mass AND -- the worse of the two -- makes
+        # `sigma_i` a conditioning label that carries information about the
+        # true mass.  Measured on the Z sample, `<m_gen>` runs from 84.94 GeV
+        # in the lowest `sigma` octile to 91.28 in the highest and
+        # `rho(sigma, m_gen) = +0.168`, against `rho(k, m_gen) = -0.011` at the
+        # measured `p = 1.25`; the likelihood's own assumption
+        # `p(m_true | width) = p(m_true)` is false for the first and true for
+        # the second.  That is Punzi's variable-resolution problem and it is
+        # the whole of the -11.06 +- 2.27 MeV `m_Z` closure failure on the DY
+        # sample: reweighting it away gives -0.12 +- 2.42.
+        self.vpow = None if vpow is None else float(vpow)
+        if self.vpow is not None:
+            if not self._fluct:
+                raise ValueError(
+                    "vpow requires corr_form='fluctuation': the corrections'"
+                    " coefficients differ in v and only that form has them"
+                )
+            if corr_mass is None:
+                raise ValueError(
+                    "vpow requires corr_mass, the PHYSICAL per-candidate mass:"
+                    " `mobs` is v(m) - v(m_ref) and cannot supply it"
+                )
         if self._fluct and jensen_mode == "shift":
             raise ValueError(
                 "jensen_mode='shift' has no meaning in the fluctuation form: "
@@ -1384,8 +1417,37 @@ class MassCFTerm(UnbinnedTerm):
             and bool(np.any(self._jensen_s2_np != 0.0))
         )
         sig = np.asarray(sigma, dtype=np.float64)
-        # c_i / sigma_i  (the linear scale is sigma_i itself)
-        g = -a + (sig / mden if jen else 0.0)
+        if self.vpow is None:
+            # c_i / sigma_i  (the linear scale is sigma_i itself)
+            g = -a + (sig / mden if jen else 0.0)
+        else:
+            # THE v FORMULATION.  `sigma` here is the width in `v`, i.e.
+            # `k_i = sigma_phys_i / m_i^p`, and the map is
+            #     v_i = v(m_true) + k_i x + c^v_i x^2 + d^v_i .
+            # Three pieces, and the substitution changes two of them:
+            #
+            #  * the SELF-CONSISTENT width. `a_i` is `d ln sigma / d ln m`
+            #    times `sigma/m`, and the substitution absorbs `p` of that
+            #    exactly -- `k_obs = k_bar` to first order in `x` when
+            #    `a = p sigma/m`, which is the identity the whole formulation
+            #    rests on.  What is left is the per-candidate residual
+            #    `a^v_i = a_i - p sigma_i/m_i`, which is zero on average by
+            #    construction when `p = 1 + <f_hit>` and carries the spread of
+            #    `f_hit` about it.  Carrying the FULL `a_i` over would be the
+            #    double count.
+            #  * the SUBSTITUTION's own curvature, `-(p/2) sigma_i/m_i` in
+            #    units of `k_i`, from the second derivative of `v(m)`.  It is
+            #    new, it is not optional, and it is validated by scan in
+            #    `calibration_studies/fullscale/proto_vmass.py`: the optimum
+            #    there is `-0.625` against `-(p/2) = -0.632`, and with it the
+            #    modelled density reproduces a mass-dependent-width smearing to
+            #    0.01 MeV where the fixed-width form is wrong by 7-31 MeV.
+            #  * the JENSEN `u^2` term, `+sigma_i/m_i`, unchanged in units of
+            #    `k_i` (it is `sigma^2/m` in `m`, divided by `m^p`).
+            sig_phys = sig * mden ** self.vpow
+            r = sig_phys / mden
+            a = a - self.vpow * r
+            g = -a + ((1.0 - 0.5 * self.vpow) * r if jen else -0.5 * self.vpow * r)
         # THE DOMAIN OF THE EXPANSION, as a bound on the COEFFICIENT (not on
         # any argument -- that was `corr_clip`'s mistake).  The quadratic term
         # of the map contributes `g_i x^2` against the linear `x`, so `g_i` IS
@@ -1415,8 +1477,10 @@ class MassCFTerm(UnbinnedTerm):
                     f"quadratic coefficient is bounded there"
                 )
             g = np.clip(g, -self.corr_coeff_max, self.corr_coeff_max)
+        # `d_i = m_i s_i^2 / 2` in `m`; in `v` it is that divided by `m^p`
+        dscale = m if self.vpow is None else m ** (1.0 - self.vpow)
         d = (
-            0.5 * self.jensen_scale * self._jensen_s2_np * m
+            0.5 * self.jensen_scale * self._jensen_s2_np * dscale
             if jen
             else np.zeros(n)
         )
@@ -2216,6 +2280,7 @@ class MassCFTerm(UnbinnedTerm):
             "corr_clip": self.corr_clip,
             "corr_form": self.corr_form,
             "corr_coeff_max": self.corr_coeff_max,
+            "vpow": self.vpow,
             "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,
             "norm_window": None if self.norm_window is None else list(self.norm_window),
