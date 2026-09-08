@@ -142,7 +142,15 @@ def _minimize_trust_region(
         # the callback may raise (NaN loss, early stopping); the caller's
         # restart machinery relies on that propagating
         if callback is not None:
-            callback(OptimizeResult(x=np.copy(x), fun=float(m.fun)))
+            # trust_radius travels with the iterate so a snapshot can record
+            # it: resuming a long fit at radius 1.0 throws away however many
+            # rejections it took to find the right scale, and on an expensive
+            # objective those are the whole cost of the first iterations.
+            callback(
+                OptimizeResult(
+                    x=np.copy(x), fun=float(m.fun), trust_radius=trust_radius
+                )
+            )
 
         if m.jac_mag < gtol:
             warnflag = 0
@@ -158,6 +166,7 @@ def _minimize_trust_region(
     return OptimizeResult(
         x=x,
         fun=float(m.fun),
+        trust_radius=trust_radius,
         jac=np.asarray(m.jac),
         success=success,
         status=warnflag,
@@ -168,7 +177,10 @@ def _minimize_trust_region(
     )
 
 
-def minimize_trust_exact(fun, closure, x0, gtol=0.0, maxiter=None, callback=None):
+def minimize_trust_exact(
+    fun, closure, x0, gtol=0.0, maxiter=None, callback=None,
+    initial_trust_radius=1.0,
+):
     """Native nearly-exact trust-region minimization (cf. scipy trust-exact).
 
     Parameters
@@ -203,6 +215,7 @@ def minimize_trust_exact(fun, closure, x0, gtol=0.0, maxiter=None, callback=None
         gtol=gtol,
         maxiter=maxiter,
         callback=callback,
+        initial_trust_radius=initial_trust_radius,
     )
 
 
@@ -216,6 +229,7 @@ def minimize_trust_ncg(
     maxiter=None,
     callback=None,
     cg_maxiter=None,
+    initial_trust_radius=1.0,
 ):
     """Native matrix-free trust-region minimization (cf. scipy trust-ncg).
 
@@ -254,6 +268,7 @@ def minimize_trust_ncg(
         gtol=gtol,
         maxiter=maxiter,
         callback=callback,
+        initial_trust_radius=initial_trust_radius,
         subproblem_kwargs=dict(
             solver=solver, set_point=set_point, cg_maxiter=cg_maxiter
         ),
@@ -270,6 +285,7 @@ def minimize_trust_krylov(
     maxiter=None,
     callback=None,
     cg_maxiter=None,
+    initial_trust_radius=1.0,
 ):
     """Native GLTR trust-region minimization (cf. scipy trust-krylov).
 
@@ -294,6 +310,7 @@ def minimize_trust_krylov(
         gtol=gtol,
         maxiter=maxiter,
         callback=callback,
+        initial_trust_radius=initial_trust_radius,
         subproblem_kwargs=dict(
             solver=solver, set_point=set_point, cg_maxiter=cg_maxiter
         ),
