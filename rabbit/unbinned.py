@@ -949,6 +949,11 @@ class MassCFTerm(UnbinnedTerm):
         self._build_fluct(sigma, mobs, jensen_mode, tgrid)
         # `_chunk_residual` computes u and `_chunk_logjac` needs it; both are
         # called once per chunk, residual first, inside one graph.
+        # per-chunk memo passing `u` from `_jensen_exact` to `_chunk_logjac`.
+        # Keyed through `_memo_key` because a traced chunk index is a Tensor,
+        # and a Tensor is unhashable -- inside one `tf.while_loop` trace the
+        # write and the read see the SAME tensor object, so its `.ref()` is a
+        # valid key for exactly the scope the memo is meant to cover.
         self._jensen_u = {}
         self._jensen_clipped = {}
 
@@ -1462,6 +1467,11 @@ class MassCFTerm(UnbinnedTerm):
             )
         return self
 
+    @staticmethod
+    def _memo_key(ci):
+        """Hashable key for a chunk index that may be a traced tensor."""
+        return ci.ref() if tf.is_tensor(ci) else ci
+
     def _fluct_w(self, values, ci):
         """``(w_re, w_im)`` of the fluctuation-form correction factor
         ``Phi_i/phi_i = 1 + w_i(tau)`` -- see :meth:`_build_fluct`."""
@@ -1491,8 +1501,9 @@ class MassCFTerm(UnbinnedTerm):
         has no meaning either way.
         """
         if not self._jensen or self.jensen_mode != "exact":
-            self._jensen_u.pop(ci, None)
-            self._jensen_clipped.pop(ci, None)
+            key = self._memo_key(ci)
+            self._jensen_u.pop(key, None)
+            self._jensen_clipped.pop(key, None)
             return delta
         lo, hi = self._chunks[ci]
         m = self._jensen_m[lo:hi]
@@ -1504,8 +1515,9 @@ class MassCFTerm(UnbinnedTerm):
             self.npdt(self.jensen_disc_floor),
         )
         u = self.npdt(0.5) * (tf.sqrt(disc) - self.npdt(1.0))
-        self._jensen_u[ci] = u
-        self._jensen_clipped[ci] = (
+        key = self._memo_key(ci)
+        self._jensen_u[key] = u
+        self._jensen_clipped[key] = (
             None if self.corr_clip <= 0.0
             else tf.abs(delta - dc) > self.npdt(0.0))
         # inside the clip this IS `u m`; outside, the map is continued with
@@ -1526,14 +1538,14 @@ class MassCFTerm(UnbinnedTerm):
         """
         if not self._jensen or self.jensen_mode != "exact":
             return None
-        u = self._jensen_u.get(ci)
+        u = self._jensen_u.get(self._memo_key(ci))
         if u is None:
             raise RuntimeError(
                 "_chunk_logjac was called before _chunk_residual for chunk "
                 f"{ci}; the Jensen Jacobian has nothing to report"
             )
         lj = -tf.math.log(self.npdt(1.0) + self.npdt(2.0) * u)
-        clipped = self._jensen_clipped.get(ci)
+        clipped = self._jensen_clipped.get(self._memo_key(ci))
         if clipped is not None:
             # unit slope beyond the clip -> no change of measure there
             lj = tf.where(clipped, tf.zeros_like(lj), lj)
