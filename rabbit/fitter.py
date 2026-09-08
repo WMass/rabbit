@@ -1072,6 +1072,33 @@ class Fitter:
         else:
             return edmval_cov(grad, hess)
 
+    def _floating_block(self, grad, hess):
+        """``(grad, hess)`` restricted to the parameters that are floating.
+
+        A frozen parameter contributes an exactly zero row and column to the
+        Hessian (``get_x`` stop-gradients it), so the full matrix is singular
+        as soon as anything is frozen. :meth:`edmval_cov` has always masked
+        them; the ``--diagnostics`` line did not, and solved the singular
+        system instead -- "Input matrix is not invertible", which the fitter
+        reports as "Minimizer raised" and turns into a failed fit.
+        """
+        if not len(self.frozen_params):
+            return grad, hess
+        sub = tf.gather(grad, self.floating_indices, axis=0)
+        subh = tf.gather(hess, self.floating_indices, axis=0)
+        subh = tf.gather(subh, self.floating_indices, axis=1)
+        return sub, subh
+
+    def log_diagnostics(self, grad, hess):
+        """Condition number and EDM of the CURRENT point, for --diagnostics."""
+        subgrad, subhess = self._floating_block(grad, hess)
+        try:
+            logger.info(f"  - Condition number: {tfh.cond_number(subhess)}")
+            logger.info(f"  - edmval: {tfh.edmval(subgrad, subhess)}")
+        except Exception as ex:  # pragma: no cover - diagnostics only
+            # a diagnostic must never be able to fail a fit
+            logger.warning(f"  - diagnostics unavailable at this point: {ex}")
+
     def edmval_cov_rows_hessfree(self, grad, row_indices, rtol=1e-10, maxiter=None):
         """Hessian-free edmval + selected rows of the covariance matrix.
 
@@ -2695,10 +2722,7 @@ class Fitter:
             self.x.assign(pc.to_physical(yval))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
+                self.log_diagnostics(grad, hess)
             return pc.hess_to_internal(hess.__array__())
 
         # Native (TF) minimizer counterparts of the callbacks above. Same
@@ -2715,10 +2739,7 @@ class Fitter:
             self.x.assign(pc.to_physical(yval))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
+                self.log_diagnostics(grad, hess)
             if pc.enabled:
                 grad = tf.constant(pc.grad_to_internal(grad.__array__()))
                 hess = tf.constant(pc.hess_to_internal(hess.__array__()))
