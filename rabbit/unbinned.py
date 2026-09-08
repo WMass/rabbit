@@ -782,6 +782,7 @@ class MassCFTerm(UnbinnedTerm):
         corr_clip=0.0,
         corr_form="residual",
         corr_coeff_max=0.08,
+        corr_mass=None,
         sigma_floor=SIGMA_FLOOR,
         norm_window=None,
         norm_tpoints=8192,
@@ -953,9 +954,22 @@ class MassCFTerm(UnbinnedTerm):
             # effects are carried instead by `_build_fluct`, INSIDE the
             # convolution.
             self._dyn_sigma = False
-        # the OBSERVED mass, the denominator of r = delta/m. Truth-free.
-        self._jensen_m = tf.constant(mobs + float(m_ref), dtype)
-        self._build_fluct(sigma, mobs, jensen_mode, tgrid)
+        # THE PHYSICAL MASS of the candidate, which is the denominator of
+        # `r = delta/m` and of `c_i = ... + sigma_i^2/m_i`.  Normally that IS
+        # `mobs + m_ref`, and `corr_mass` is None.  It is NOT when the term is
+        # built on a RESIDUAL (`mobs = m_reco - m_gen`, delta kernel, no
+        # lineshape): there `mobs + m_ref` is ~m_ref for every candidate and the
+        # corrections would be evaluated at the wrong mass.  Passing the real
+        # per-candidate mass here keeps them right without the caller having to
+        # patch private attributes.
+        cm = (mobs + float(m_ref)) if corr_mass is None else \
+            np.asarray(corr_mass, dtype=np.float64).ravel()
+        if cm.shape != (self.n,):
+            raise ValueError(
+                f"corr_mass has shape {cm.shape}, expected {(self.n,)}")
+        self.corr_mass = None if corr_mass is None else cm
+        self._jensen_m = tf.constant(cm, dtype)
+        self._build_fluct(sigma, cm - float(m_ref), jensen_mode, tgrid)
         # `_chunk_residual` computes u and `_chunk_logjac` needs it; both are
         # called once per chunk, residual first, inside one graph.
         # per-chunk memo passing `u` from `_jensen_exact` to `_chunk_logjac`.
@@ -1470,10 +1484,10 @@ class MassCFTerm(UnbinnedTerm):
             and np.any(self._jensen_s2_np != 0.0)
         )
         if self._fluct:
-            self._build_fluct(
-                self.sigma.numpy(), self.mobs.numpy(),
-                self.jensen_mode, self.tgrid.numpy(),
-            )
+            cm = (self.corr_mass if self.corr_mass is not None
+                  else self.mobs.numpy() + self.m_ref)
+            self._build_fluct(self.sigma.numpy(), cm - self.m_ref,
+                              self.jensen_mode, self.tgrid.numpy())
         return self
 
     def candidate_slice(self, start, stop, device=None, chunk=None):
@@ -2719,6 +2733,7 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
             weights=data.pop("weights", None),
             a_res=data.pop("a_res", None),
             jensen_s2=data.pop("jensen_s2", None),
+            corr_mass=data.pop("corr_mass", None),
             phik=phik,
             phik_grid=phik_grid,
             norm=norm,
