@@ -1128,27 +1128,56 @@ class Fitter:
         and let the fit fail, not to regularise it into a number. (This is
         why :meth:`hess_for_minimizer` adds its unit diagonal on the FROZEN
         entries only.)
+
+        THE TEST IS ON THE WHOLE ROW, NOT THE DIAGONAL. "Nothing in the
+        likelihood depends on it" means the parameter's entire Hessian row
+        vanishes, and that is scale-free. Testing the DIAGONAL against the
+        global maximum is not: on a card that mixes an external quadratic term
+        with unbinned mass terms the curvatures differ by twelve orders of
+        magnitude -- measured, a hit-chi2 block at 7.12e13 against `m_Z` at
+        0.0608 -- so every mass parameter falls below `rtol * max(diag)` and is
+        reported as unconstrained while its error is a perfectly sensible
+        5.78 MeV. A parameter that IS unconstrained has a zero row as well as a
+        zero diagonal, so the row test keeps every true positive (a material
+        group no candidate touches is blind to every term at once) and drops
+        the worst of the block-scale false positives: on the joint card `m_Z`
+        goes from a diagonal of 0.0608 (below the 71.2 threshold) to a row
+        maximum of ~2e4 (five orders above it), because the mass term couples
+        it to the field modes.
+
+        NOT a complete fix. A whole BLOCK whose curvature sits below
+        `rtol * max|H|` is still flagged -- the `K(m)` shapes are the candidate
+        on this card -- because the threshold is still global. The complete
+        answer is a per-block scale: group the parameters by which term
+        declares them (`Fitter` knows, from the unbinned and external terms'
+        `param_names`) and compare each row against the largest entry in its
+        OWN group. That is left for the rabbit branch; the row test is the part
+        that removes the false positive actually observed.
         """
         if getattr(self, "_warned_unconstrained", False):
             return
         self._warned_unconstrained = True
         try:
+            h = np.abs(np.asarray(hess))
             d = np.abs(np.asarray(tf.linalg.diag_part(hess)))
         except Exception:  # pragma: no cover - diagnostics only
             return
-        scale = d.max()
+        scale = h.max()
         if not np.isfinite(scale) or scale <= 0:
             return
         free = np.ones(d.shape, dtype=bool)
         if len(self.frozen_params):
             free = ~np.asarray(self.frozen_params_mask)
-        bad = np.where(free & (d < rtol * scale))[0]
+        # the whole row, not the diagonal: see the note above
+        rowmax = h.max(axis=1)
+        bad = np.where(free & (rowmax < rtol * scale))[0]
         if not bad.size:
             return
         names = np.asarray(self.parms).astype(str)
         logger.warning(
             f"{bad.size} floating parameter(s) have an essentially zero "
-            f"Hessian diagonal ({d[bad].max():.3g} against a scale of "
+            f"Hessian ROW (largest entry {rowmax[bad].max():.3g}, diagonal "
+            f"{d[bad].max():.3g}, against a scale of "
             f"{scale:.3g}): {list(names[bad][:12])}"
             + (" ..." if bad.size > 12 else "")
             + ". Nothing in the likelihood constrains them, so the "
