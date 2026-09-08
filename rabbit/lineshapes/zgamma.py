@@ -781,6 +781,13 @@ class ZGammaLineshape:
             "sin2": self.sin2,
             "sin2_unit": self.sin2_unit,
             "fsr_mmax": self.fsr_mmax,
+            # WITHOUT THIS the card round trip silently rebuilds the provider in
+            # the MASS variable while the term goes on treating its CF as the
+            # one in `v`. The density then has no resonance peak at all -- it
+            # was flat, and the fit ran away to NLL -10.3 M -- and nothing else
+            # in the card looks wrong. Any new constructor argument that
+            # changes what `_cf_tab` transforms belongs here.
+            "vpow": self.vpow,
             "shape": self.shape,
             "shape_window": list(self.shape_window),
             "terms": list(self.terms),
