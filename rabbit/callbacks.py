@@ -23,9 +23,15 @@ logger = logging.child_logger(__name__)
 
 
 class FitterCallback:
-    def __init__(self, xv, early_stopping=-1, snapshotter=None):
+    def __init__(self, xv, early_stopping=-1, snapshotter=None, expand=None):
         self.iiter = 0
         self.xval = xv
+        # The minimiser may be working in a REDUCED coordinate vector (the
+        # fitter removes the frozen subspace from the minimisation), while
+        # everything that reads `xval` -- the snapshotter, the rollback after
+        # an exception, the restart loop -- wants the full one. `expand` maps
+        # the iterate back; None when the two coincide.
+        self.expand = expand
         # Optional rabbit.snapshot.Snapshotter. The callback is the only place
         # that sees the accepted iterate every iteration, which is exactly what
         # a snapshot wants: trial points the trust region goes on to reject are
@@ -69,7 +75,11 @@ class FitterCallback:
         self.loss_history.append(loss)
         self.time_history.append(elapsed)
 
-        self.xval = intermediate_result.x
+        self.xval = (
+            intermediate_result.x
+            if self.expand is None
+            else self.expand(intermediate_result.x)
+        )
         self.iiter += 1
 
         # After the update, so the snapshot and the loss recorded with it are

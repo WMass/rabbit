@@ -2880,6 +2880,148 @@ class Fitter:
         # transform was built.
         xval = pc_cell[0].from_physical(self.x.numpy())
 
+        # THE FROZEN SUBSPACE IS REMOVED FROM THE MINIMISATION, not only from
+        # the derivatives.
+        #
+        # `--freezeParameters` is implemented with `tf.stop_gradient` (see
+        # `get_poi` / `get_model_nui` / `get_theta`): it zeroes the parameter's
+        # gradient and its Hessian row and column, but the likelihood is still
+        # EVALUATED at whatever the vector holds. Hand the minimiser the full
+        # vector and each frozen parameter is a direction on which the model is
+        # exactly flat -- and a trust-region method does not leave a flat
+        # direction alone. `hess_for_minimizer` puts 1 on the frozen diagonal
+        # against ~1e8 elsewhere, so the frozen block is the SMALLEST-curvature
+        # eigenspace of the matrix scipy factorises, and `trust-exact`'s hard
+        # case deliberately walks to the trust-region boundary along that
+        # eigenvector; `trust-krylov`/`trust-ncg` see zero curvature there and
+        # do the same. Measured over the stored results of the Z-mass campaign:
+        # 8 of 36 fits came back with the four frozen resolution knobs
+        # displaced from the value they were frozen at, by up to 0.126, always
+        # along (1,1,1,1) or (1,-1,1,-1) -- an arbitrary vector of a degenerate
+        # block, which is the signature. The likelihood was evaluated there, so
+        # those fits did not have what they froze held fixed.
+        #
+        # Minimising over the floating coordinates only is EXACT, not a
+        # regularisation: the frozen gradient components are identically zero,
+        # so no descent direction is discarded, and the reduced Hessian is the
+        # one `edmval_cov` already uses for the EDM and the covariance.
+        ifree = np.asarray(self.floating_indices, dtype=np.int64)
+        ifrozen = np.asarray(
+            np.where(np.asarray(self.frozen_params_mask))[0], dtype=np.int64
+        )
+        nfull = int(xval.size)
+        reduce_frozen = ifrozen.size > 0
+        if reduce_frozen and pc_cell[0].enabled:
+            # A block-diagonal preconditioner passes non-block indices through,
+            # so holding an internal coordinate fixed holds the physical one
+            # fixed -- but only if no frozen index sits inside a block. If one
+            # does, the two operations do not commute and the reduction would
+            # silently move a frozen parameter.
+            inblock = set()
+            for b in pc_cell[0].blocks:
+                inblock.update(int(i) for i in np.asarray(b.idx).ravel())
+            clash = sorted(inblock.intersection(int(i) for i in ifrozen))
+            if clash:
+                raise ValueError(
+                    "preconditioning a FROZEN parameter is not supported: "
+                    f"{[str(np.asarray(self.parms)[i]) for i in clash[:8]]} "
+                    "are frozen and inside a preconditioner block, so the "
+                    "transform mixes them with floating directions. Drop "
+                    "--precondition or unfreeze them."
+                )
+        # captured by reference so a restart, which rebuilds both the transform
+        # and `xval`, refreshes what the frozen coordinates are held at
+        frozen_ref = [xval[ifrozen].copy() if reduce_frozen else None]
+
+        def expand(u):
+            """Reduced -> full internal vector, frozen entries restored."""
+            u = np.asarray(u, dtype=np.float64)
+            if not reduce_frozen:
+                return u
+            v = np.empty(nfull, dtype=np.float64)
+            v[ifree] = u
+            v[ifrozen] = frozen_ref[0]
+            return v
+
+        def restrict(v):
+            v = np.asarray(v, dtype=np.float64)
+            return v[ifree] if reduce_frozen else v
+
+        ifree_tf = tf.constant(ifree[:, None], tf.int32)
+
+        def expand_dir_tf(v):
+            """Reduced DIRECTION -> full, zeros on the frozen entries."""
+            if not reduce_frozen:
+                return v
+            return tf.scatter_nd(ifree_tf, v, [nfull])
+
+        def gather_tf(v):
+            return v if not reduce_frozen else tf.gather(v, ifree, axis=0)
+
+        def gather2_tf(m):
+            """Both axes of a square matrix, i.e. the floating BLOCK."""
+            if not reduce_frozen:
+                return m
+            return tf.gather(tf.gather(m, ifree, axis=0), ifree, axis=1)
+
+        if reduce_frozen:
+            _full = (scipy_loss, scipy_hess, scipy_hessp)
+
+            def scipy_loss(u, _f=_full[0]):
+                val, grad = _f(expand(u))
+                return val, np.asarray(grad)[ifree]
+
+            def scipy_hess(u, _f=_full[1]):
+                return np.asarray(_f(expand(u)))[np.ix_(ifree, ifree)]
+
+            def scipy_hessp(u, p, _f=_full[2]):
+                pfull = np.zeros(nfull, dtype=np.float64)
+                pfull[ifree] = np.asarray(p, dtype=np.float64)
+                return np.asarray(_f(expand(u), pfull))[ifree]
+
+            _nat = (native_loss, native_closure, native_grad_closure,
+                    native_set_point, native_hessp)
+
+            def native_loss(u, _f=_nat[0]):
+                return _f(expand(u))
+
+            def native_closure(u, _f=_nat[1]):
+                val, grad, hess = _f(expand(u))
+                return val, gather_tf(grad), gather2_tf(hess)
+
+            def native_grad_closure(u, _f=_nat[2]):
+                val, grad = _f(expand(u))
+                return val, gather_tf(grad)
+
+            def native_set_point(u, _f=_nat[3]):
+                return _f(expand(u))
+
+            def native_hessp(_f=_nat[4]):
+                hp = _f()
+
+                def hessp(v):
+                    return gather_tf(hp(expand_dir_tf(v)))
+
+                return hessp
+
+            # Name the values too. Freezing holds a parameter where `self.x`
+            # currently has it, which under --externalPostfit is the SNAPSHOT
+            # value, not the card default -- and a snapshot written before this
+            # fix can carry a frozen parameter that the old minimiser had
+            # already displaced. Printing it is how a warm start that is not
+            # frozen where it thinks it is becomes visible.
+            _pn = np.asarray(self.parms).astype(str)
+            _held = pc_cell[0].to_physical(xval)
+            logger.info(
+                f"[minimize] minimising over {ifree.size} floating parameter(s); "
+                f"{ifrozen.size} frozen one(s) are removed from the vector the "
+                "minimiser sees, not merely stop-gradiented, and are held at: "
+                + ", ".join(
+                    f"{_pn[i]}={_held[i]:.10g}" for i in ifrozen[:12]
+                )
+                + (" ..." if ifrozen.size > 12 else "")
+            )
+
         if self.minimizer_method in [
             "trust-krylov",
             "trust-ncg",
@@ -2935,13 +3077,18 @@ class Fitter:
 
         with snapshot_on_signal(snapshotter):
             while True:
-                cb = FitterCallback(xval, self.earlyStopping, snapshotter=snapshotter)
+                cb = FitterCallback(
+                    xval,
+                    self.earlyStopping,
+                    snapshotter=snapshotter,
+                    expand=expand if reduce_frozen else None,
+                )
                 try:
                     if self.minimizer_method == "tf-trust-exact":
                         res = minimize_trust_exact(
                             native_loss,
                             native_closure,
-                            xval,
+                            restrict(xval),
                             gtol=sci_opts.get("gtol", 0.0),
                             maxiter=sci_opts.get("maxiter"),
                             callback=cb,
@@ -2952,7 +3099,7 @@ class Fitter:
                             native_grad_closure,
                             native_hessp(),
                             native_set_point,
-                            xval,
+                            restrict(xval),
                             gtol=sci_opts.get("gtol", 0.0),
                             maxiter=sci_opts.get("maxiter"),
                             callback=cb,
@@ -2963,7 +3110,7 @@ class Fitter:
                             native_grad_closure,
                             native_hessp(),
                             native_set_point,
-                            xval,
+                            restrict(xval),
                             gtol=sci_opts.get("gtol", 0.0),
                             maxiter=sci_opts.get("maxiter"),
                             callback=cb,
@@ -2971,7 +3118,7 @@ class Fitter:
                     else:
                         res = scipy.optimize.minimize(
                             scipy_loss,
-                            xval,
+                            restrict(xval),
                             method=self.minimizer_method,
                             jac=True,
                             tol=0.0,
@@ -2995,7 +3142,7 @@ class Fitter:
                         )
                     logger.debug(ex)
                 else:
-                    xval = res["x"]
+                    xval = expand(res["x"])
                     self.minimizer_result = res
                     logger.debug(res)
 
@@ -3040,6 +3187,10 @@ class Fitter:
                 self.x.assign(pc_cell[0].to_physical(xval))
                 pc_cell[0] = self._build_preconditioner()
                 xval = pc_cell[0].from_physical(self.x.numpy())
+                # a new transform means new internal coordinates, so what the
+                # frozen entries are held at has to be re-read in them
+                if reduce_frozen:
+                    frozen_ref[0] = xval[ifrozen].copy()
 
         # xval (and callback.xval) are internal coordinates; everything outside
         # fit() expects physical parameters.
