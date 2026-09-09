@@ -257,6 +257,27 @@ def common_parser():
         "least-occupied selection). The number given should match --nDevices.",
     )
     parser.add_argument(
+        "--unbinnedCorrAMax",
+        default=None,
+        type=float,
+        help="Override the fluctuation form's FIRST-order coefficient bound "
+        "|a_i| on every unbinned term, at load time. The map is truncated at "
+        "first order in a_i and in c_i/sigma_i and only the second had a "
+        "declared domain; outside its domain the modelled density can go "
+        "negative and log of it is a NaN. 0 disables the bound (the default "
+        "the cards carry). This CHANGES THE MODEL -- a_i carries the "
+        "(1 - a_i x) Jacobian that removes a bias of order a_i sigma_i -- so "
+        "it exists to be scanned and costed, not to be set casually.",
+    )
+    parser.add_argument(
+        "--unbinnedCorrCoeffMax",
+        default=None,
+        type=float,
+        help="Override the fluctuation form's QUADRATIC coefficient bound "
+        "|c_i/sigma_i| on every unbinned term, at load time (the cards carry "
+        "0.08). Same warning as --unbinnedCorrAMax.",
+    )
+    parser.add_argument(
         "--precondition",
         action="store_true",
         help="Reparameterise a block of parameters so the reference Hessian is the "

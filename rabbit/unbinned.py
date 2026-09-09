@@ -943,6 +943,17 @@ class MassCFTerm(UnbinnedTerm):
         Bound on the fluctuation form's quadratic coefficient ``|c_i/sigma_i|``
         -- the expansion parameter itself. A per-candidate constant, so it is
         parameter-independent; see :meth:`_build_fluct`. 0 disables it.
+    corr_a_max : float
+        The SAME device on the fluctuation form's FIRST-order coefficient
+        ``|a_i|``. The truncation is first order in both coefficients and only
+        the quadratic one had a declared domain, because the Z leg never
+        exercised the other; the J/psi leg does (see :meth:`_build_fluct`).
+        0 -- the default -- disables it, which is the behaviour before it
+        existed. Bounding ``a`` is NOT equivalent to bounding ``g``: ``a``
+        carries the ``(1 - a_i x)`` Jacobian that recovers the unconditional
+        width, which removes a bias of order ``a_i sigma_i``, so its cost has
+        to be measured on its own rather than inherited from
+        ``corr_coeff_max``.
     corr_form : {"residual", "fluctuation"}
         WHERE the two corrections act. ``"residual"`` is the historical form
         measured on the J/psi: the width is evaluated at ``delta_i(theta)`` and
@@ -1021,6 +1032,7 @@ class MassCFTerm(UnbinnedTerm):
         corr_clip=0.0,
         corr_form="residual",
         corr_coeff_max=0.08,
+        corr_a_max=0.0,
         corr_mass=None,
         vpow=None,
         sigma_floor=SIGMA_FLOOR,
@@ -1173,6 +1185,7 @@ class MassCFTerm(UnbinnedTerm):
             )
         self.corr_form = corr_form
         self.corr_coeff_max = float(corr_coeff_max)
+        self.corr_a_max = float(corr_a_max)
         self._fluct = corr_form == "fluctuation"
         # THE v FORMULATION.  When `vpow = p` is set, this term's `sigma` is
         # the width in `v(m) = Int dm/m^p` -- the resolution CONSTANT
@@ -1664,7 +1677,7 @@ class MassCFTerm(UnbinnedTerm):
         sig = np.asarray(sigma, dtype=np.float64)
         if self.vpow is None:
             # c_i / sigma_i  (the linear scale is sigma_i itself)
-            g = -a + (sig / mden if jen else 0.0)
+            gextra = sig / mden if jen else 0.0
         else:
             # THE v FORMULATION.  `sigma` here is the width in `v`, i.e.
             # `k_i = sigma_phys_i / m_i^p`, and the map is
@@ -1692,7 +1705,42 @@ class MassCFTerm(UnbinnedTerm):
             sig_phys = sig * mden ** self.vpow
             r = sig_phys / mden
             a = a - self.vpow * r
-            g = -a + ((1.0 - 0.5 * self.vpow) * r if jen else -0.5 * self.vpow * r)
+            gextra = (
+                (1.0 - 0.5 * self.vpow) * r if jen else -0.5 * self.vpow * r
+            )
+        # THE FIRST-ORDER COEFFICIENT HAS A DOMAIN TOO.  `corr_coeff_max` below
+        # bounds the QUADRATIC coefficient because that is the one the Z leg
+        # exercised; the map is truncated at first order in `a_i` as well, and
+        # on the J/psi leg it is `a_i` that leaves its domain.  Measured on
+        # `joint_ok_full` at the DEFAULT parameter point: two candidates of
+        # 3 000 000 have a NEGATIVE density -- both `sigma/m` ~ 11 %, both ~4
+        # sigma above the peak, and both with `|g_i| = 0.022`, a factor 3.6
+        # INSIDE `corr_coeff_max`, so the quadratic bound cannot reach them.
+        # `corr_a_max` is the same device on `a_i`: a per-candidate CONSTANT
+        # computed from observables, theta-independent, so it cannot deform the
+        # likelihood's dependence on the parameters.  It is applied BEFORE `g`
+        # is formed, because `c_i = -a_i sigma_i + sigma_i^2/m_i` is defined in
+        # terms of `a_i` and bounding one without the other would leave the two
+        # coefficients describing different maps.
+        #
+        # It defaults to OFF.  `a_i` is load-bearing in a way `g_i` is not: it
+        # carries the `(1 - a_i x)` Jacobian that recovers the unconditional
+        # width, without which the score at the truth is `+a_i/sigma_bar_i`,
+        # i.e. a bias of order `a_i sigma_i` -- 27 MeV at the Z.  Bounding `g`
+        # degrades a correction; bounding `a` degrades the thing that removes a
+        # bias, so the value has to be chosen by its own scan and its own cost,
+        # not inherited from `corr_coeff_max`.
+        if self.corr_a_max > 0.0:
+            nlim = int(np.sum(np.abs(a) > self.corr_a_max))
+            if nlim:
+                logger.info(
+                    f"unbinned term '{self.name}': {nlim} of {n} candidates "
+                    f"({100.0 * nlim / max(n, 1):.4f} %) have |a_i| above "
+                    f"corr_a_max = {self.corr_a_max:g}; the first-order "
+                    f"coefficient is bounded there"
+                )
+            a = np.clip(a, -self.corr_a_max, self.corr_a_max)
+        g = -a + gextra
         # THE DOMAIN OF THE EXPANSION, as a bound on the COEFFICIENT (not on
         # any argument -- that was `corr_clip`'s mistake).  The quadratic term
         # of the map contributes `g_i x^2` against the linear `x`, so `g_i` IS
@@ -1749,6 +1797,21 @@ class MassCFTerm(UnbinnedTerm):
         sp = CubicSpline(tsrc, np.eye(len(tsrc)), axis=0)
         for k in (1, 2):
             self._dmat[k] = tf.constant(sp(tfine, k), self.dtype)
+
+    def set_corr_bounds(self, a_max=None, coeff_max=None):
+        """Change the coefficient DOMAINS after construction, at load time.
+
+        The bounds are applied to per-candidate constants inside
+        :meth:`_build_fluct`, so they can be changed without rebuilding the
+        datacard -- which matters, because scanning a bound the way
+        ``corr_coeff_max = 0.08`` was scanned would otherwise mean rebuilding a
+        10 GB card per rung. Returns ``self``.
+        """
+        if a_max is not None:
+            self.corr_a_max = float(a_max)
+        if coeff_max is not None:
+            self.corr_coeff_max = float(coeff_max)
+        return self.set_corrections()
 
     def set_corrections(self, self_consistent_sigma=None, jensen_mode=None):
         """Switch either correction on or off AFTER construction.
@@ -2610,6 +2673,7 @@ class MassCFTerm(UnbinnedTerm):
             "corr_clip": self.corr_clip,
             "corr_form": self.corr_form,
             "corr_coeff_max": self.corr_coeff_max,
+            "corr_a_max": self.corr_a_max,
             "vpow": self.vpow,
             "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,

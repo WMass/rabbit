@@ -500,7 +500,23 @@ class Fitter:
         raw_unbinned = getattr(self.indata, "unbinned_terms", []) or []
         want_chunk = int(getattr(self._fit_options, "unbinnedChunk", 0) or 0)
         want_mode = getattr(self._fit_options, "unbinnedChunkMode", "graph")
+        # The coefficient DOMAINS of the fluctuation form, also from the CLI.
+        # Unlike the chunking these DO change the model, so they are not
+        # defaults: they exist so the bound can be scanned -- the way
+        # `corr_coeff_max = 0.08` was scanned -- without rebuilding a card that
+        # is tens of GB. `None` leaves whatever the card declared.
+        want_a_max = getattr(self._fit_options, "unbinnedCorrAMax", None)
+        want_coeff_max = getattr(self._fit_options, "unbinnedCorrCoeffMax", None)
         for term in raw_unbinned:
+            if (want_a_max is not None or want_coeff_max is not None) and hasattr(
+                term, "set_corr_bounds"
+            ):
+                term.set_corr_bounds(a_max=want_a_max, coeff_max=want_coeff_max)
+                logger.info(
+                    f"unbinned term '{term.name}': coefficient domains set "
+                    f"from the CLI to corr_a_max={term.corr_a_max:g}, "
+                    f"corr_coeff_max={term.corr_coeff_max:g}"
+                )
             if want_chunk:
                 term.rechunk(want_chunk)
             if want_mode == "eager":
