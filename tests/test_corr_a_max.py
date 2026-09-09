@@ -130,3 +130,60 @@ def test_set_corr_bounds_is_reversible():
 def test_it_survives_the_card_round_trip():
     t = _term([0.01, 0.05, 0.20], corr_a_max=0.03)
     assert t.config()["corr_a_max"] == 0.03
+
+
+# --------------------------------------------------------------------------
+# `set_corr_form`: the same two corrections, applied where they are EXACT
+# --------------------------------------------------------------------------
+def test_set_corr_form_round_trips_to_the_constructed_term():
+    """Flipping the form at load time must reach the same term as building it."""
+    a_res = np.array([0.01, 0.05, 0.20])
+    js = np.full(3, 1e-4)
+    rng = np.random.default_rng(7)
+    sigma = np.full(3, 0.9)
+    mobs = rng.normal(0.0, 1.0, 3)
+    built = build(sigma, mobs, a_res=a_res, jensen_s2=js, corr_form="residual")
+    flipped = build(sigma, mobs, a_res=a_res, jensen_s2=js,
+                    corr_form="fluctuation").set_corr_form("residual")
+    assert flipped.corr_form == "residual" and not flipped._fluct
+    # the fluctuation block must be switched OFF, not left stale
+    assert flipped._fl_a is None and flipped._fl_g is None
+    assert not flipped._fluct_active
+    assert flipped._dyn_sigma == built._dyn_sigma
+    assert flipped._jensen == built._jensen
+    np.testing.assert_array_equal(dens(flipped), dens(built))
+
+
+def test_set_corr_form_is_reversible():
+    a_res = np.array([0.01, 0.05, 0.20])
+    js = np.full(3, 1e-4)
+    rng = np.random.default_rng(7)
+    t = build(np.full(3, 0.9), rng.normal(0.0, 1.0, 3), a_res=a_res,
+              jensen_s2=js, corr_form="fluctuation")
+    d0 = dens(t)
+    a0 = np.asarray(t._fl_a).copy()
+    t.set_corr_form("residual")
+    t.set_corr_form("fluctuation")
+    np.testing.assert_array_equal(np.asarray(t._fl_a), a0)
+    np.testing.assert_array_equal(dens(t), d0)
+
+
+def test_the_residual_form_cannot_produce_a_negative_density():
+    """The point of the switch, on a candidate that breaks the other form.
+
+    Wide, far out in the tail, and with a first-order coefficient big enough
+    that the truncated Fourier factor overshoots -- the configuration measured
+    on the J/psi leg. The residual form has no such factor: it is a positive
+    kernel evaluated at a shifted residual with a positive Jacobian.
+    """
+    sigma = np.array([9.0])
+    mobs = np.array([36.0])          # 4 sigma out, where the density is tiny
+    a_res = np.array([0.35])
+    js = np.array([1e-4])
+    fl = build(sigma, mobs, a_res=a_res, jensen_s2=js,
+               corr_form="fluctuation", corr_coeff_max=0.0)
+    res = build(sigma, mobs, a_res=a_res, jensen_s2=js, corr_form="residual")
+    assert dens(fl)[0] <= 0.0 < dens(res)[0], (dens(fl)[0], dens(res)[0])
+    # and the load-time flip fixes it in place
+    fl.set_corr_form("residual")
+    assert dens(fl)[0] > 0.0

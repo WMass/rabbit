@@ -257,6 +257,19 @@ def common_parser():
         "least-occupied selection). The number given should match --nDevices.",
     )
     parser.add_argument(
+        "--unbinnedDeltaKernelForm",
+        default="auto",
+        choices=["auto", "residual", "fluctuation", "off"],
+        help="Which form the two resolution corrections of an unbinned mass "
+        "term are applied in. 'auto' (default) puts DELTA-kernel terms in the "
+        "residual form, where the corrections are exact and the density is "
+        "positive by construction, and leaves wide-kernel terms in the "
+        "fluctuation form, which is the treatment there. 'residual' / "
+        "'fluctuation' force one form on every term; 'off' leaves whatever the "
+        "card declared. A term in the v formulation is never moved (the v form "
+        "exists only in the fluctuation form).",
+    )
+    parser.add_argument(
         "--unbinnedCorrAMax",
         default=None,
         type=float,

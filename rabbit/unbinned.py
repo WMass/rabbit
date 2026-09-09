@@ -1855,12 +1855,67 @@ class MassCFTerm(UnbinnedTerm):
             and self.jensen_scale != 0.0
             and np.any(self._jensen_s2_np != 0.0)
         )
-        if self._fluct:
-            cm = (self.corr_mass if self.corr_mass is not None
-                  else self.mobs.numpy() + self.m_ref)
-            self._build_fluct(self.sigma.numpy(), cm - self.m_ref,
-                              self.jensen_mode, self.tgrid.numpy())
+        # unconditionally: `_build_fluct` resets the block to inactive when the
+        # term is in the RESIDUAL form, which is what has to happen when the
+        # form is flipped by :meth:`set_corr_form`
+        cm = (self.corr_mass if self.corr_mass is not None
+              else self.mobs.numpy() + self.m_ref)
+        self._build_fluct(self.sigma.numpy(), cm - self.m_ref,
+                          self.jensen_mode, self.tgrid.numpy())
         return self
+
+    def set_corr_form(self, corr_form):
+        """Switch between the RESIDUAL and the FLUCTUATION form after loading.
+
+        WHY IT IS A LOAD-TIME CHOICE AND NOT A CARD CHOICE. The two forms are
+        not two models: they are two ways of applying the same two corrections,
+        and which one is right depends on the KERNEL.
+
+        * At a **delta kernel** -- the J/psi leg, a fixed mass -- the residual
+          form is EXACT. ``delta_i(theta)`` IS the resolution fluctuation
+          there, so the self-consistent width ``sigma_bar_i = sigma_i - a_i
+          delta_i`` and the exact Jensen map
+          ``u = (sqrt(1 + 4(r - s^2/2)) - 1)/2`` with the ``1/(1 + 2u)``
+          Jacobian are the corrections themselves rather than an expansion of
+          them, and the density is positive by construction.
+        * At a **wide kernel** -- the Z -- it is not: the window is +-27 sigma
+          and what sits out there is the Breit-Wigner tail and FSR, not
+          resolution, so the residual form feeds the corrections something that
+          is not the fluctuation. The fluctuation form is the treatment there,
+          at the price of a FIRST-ORDER truncation in Fourier space, which is a
+          computational device valid only where the correction is small.
+
+        Where that truncation is not small the modelled density can go
+        NEGATIVE: measured on `joint_ok_full` at the default parameter point,
+        two J/psi candidates of 3 000 000 do, and `log` of them takes the whole
+        joint NLL, gradient and Hessian non-finite. The first-principles fix is
+        to evaluate the map EXACTLY where the expansion does not hold -- for a
+        delta kernel that is simply the residual form, which the two agree with
+        to the order of the expansion (0.0009e-3 on the J/psi gate) and which
+        cannot produce a negative density at all.
+
+        Returns ``self``.
+        """
+        if corr_form not in ("residual", "fluctuation"):
+            raise ValueError(
+                f"corr_form must be 'residual' or 'fluctuation', got "
+                f"'{corr_form}'"
+            )
+        if corr_form == self.corr_form:
+            return self
+        if corr_form == "residual" and self.vpow is not None:
+            raise ValueError(
+                "the v formulation exists only in the fluctuation form: the "
+                "corrections' coefficients differ in v and the residual form "
+                "does not have them"
+            )
+        if corr_form == "fluctuation" and self.jensen_mode == "shift":
+            raise ValueError(
+                "jensen_mode='shift' has no meaning in the fluctuation form"
+            )
+        self.corr_form = corr_form
+        self._fluct = corr_form == "fluctuation"
+        return self.set_corrections()
 
     def candidate_slice(self, start, stop, device=None, chunk=None):
         """A view of this term over candidates ``[start, stop)``.

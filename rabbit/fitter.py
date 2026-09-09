@@ -507,7 +507,40 @@ class Fitter:
         # is tens of GB. `None` leaves whatever the card declared.
         want_a_max = getattr(self._fit_options, "unbinnedCorrAMax", None)
         want_coeff_max = getattr(self._fit_options, "unbinnedCorrCoeffMax", None)
+        # WHICH FORM the two corrections are applied in. At a DELTA kernel the
+        # residual form is exact and positive by construction, and the
+        # fluctuation form is a first-order Fourier-space truncation of the
+        # same thing -- a computational device valid only where the correction
+        # is small. Where it is not, the modelled density can go negative and
+        # `log` of it takes the whole NLL, gradient and Hessian non-finite; that
+        # is what killed the phase-2 full-card fit at its own start point. So
+        # "auto" puts every delta-kernel term in the residual form and leaves
+        # wide-kernel terms (the Z, where `delta` is NOT the fluctuation) in the
+        # fluctuation form, which is the treatment there.
+        want_form = getattr(self._fit_options, "unbinnedDeltaKernelForm", "auto")
         for term in raw_unbinned:
+            if want_form != "off" and hasattr(term, "set_corr_form"):
+                kern = getattr(term, "kernel", None)
+                is_delta = getattr(kern, "kind", None) == "delta"
+                target = (
+                    ("residual" if is_delta else None)
+                    if want_form == "auto"
+                    else want_form
+                )
+                if (
+                    target is not None
+                    and target != term.corr_form
+                    and getattr(term, "vpow", None) is None
+                ):
+                    before = term.corr_form
+                    term.set_corr_form(target)
+                    logger.info(
+                        f"unbinned term '{term.name}': kernel is "
+                        f"'{getattr(kern, 'kind', '?')}', so the corrections "
+                        f"move from the {before} form to the {target} form -- "
+                        "exact there, and not a first-order truncation that "
+                        "can go negative"
+                    )
             if (want_a_max is not None or want_coeff_max is not None) and hasattr(
                 term, "set_corr_bounds"
             ):
