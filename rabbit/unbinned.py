@@ -1037,6 +1037,7 @@ class MassCFTerm(UnbinnedTerm):
         vpow=None,
         sigma_floor=SIGMA_FLOOR,
         norm_window=None,
+        norm_window_sigma=False,
         norm_tpoints=8192,
         upsample=1,
         norm=None,
@@ -1345,6 +1346,17 @@ class MassCFTerm(UnbinnedTerm):
         # ---- truncation normalisation -------------------------------------
         self.norm_window = None if norm_window is None else (
             float(norm_window[0]), float(norm_window[1]))
+        # IS THE WINDOW IN MASS UNITS OR IN SIGMA?  A Z channel is selected in
+        # a MASS window (60-120 GeV), the same for every candidate.  A
+        # CONSTRAINT RESIDUAL is selected on its PULL (`|z_v| < 5`), which is
+        # a window of +-5 sigma_i -- a different physical width for every
+        # candidate.  The truncation integral is evaluated per resolution
+        # CLASS, and a class IS a sigma, so the pull case is exactly
+        # `d = window * sigma_c`.  Getting this wrong is not a small error:
+        # a window of 5 read as centimetres against a sigma_v of 0.004-0.04 cm
+        # is 125-1250 sigma, `Z = 1` to 1e-7, and the normalisation silently
+        # does nothing.
+        self.norm_window_sigma = bool(norm_window_sigma)
         self.norm_tpoints = int(norm_tpoints)
         self._norm = None
         self.norm_fixed = []
@@ -2441,12 +2453,13 @@ class MassCFTerm(UnbinnedTerm):
         s_re = None
         s_im = None
         for f in self._norm_families:
-            # `param` is None for a FIXED norm family (coefficient 1). That is
-            # what a `MaterialCFTerm` uses: its per-candidate resolution is the
-            # per-GROUP decomposition, which has no per-class counterpart, so
-            # the truncation normalisation is evaluated at the production's own
-            # exponents -- exactly the constant a `MassCFTerm` with its `k_*`
-            # knobs fixed at 1 evaluates it at.
+            # `param` is None for a FIXED norm family (coefficient 1), i.e.
+            # a part of the class-level resolution no parameter scales. A
+            # `MaterialCFTerm`'s parameterised parts come through
+            # `_norm_extra` instead (its per-GROUP and per-hit-class
+            # decomposition, averaged per class), so that `Z` carries the
+            # dependence on the material amounts and the hit scales rather
+            # than being a constant.
             k = None if f["param"] is None else values[f["param"]]
             if f["kind"] == "gauss":
                 contrib = self.npdt(-0.5) * self._norm_vgf[:, None] * t[None, :] ** 2
@@ -2463,6 +2476,15 @@ class MassCFTerm(UnbinnedTerm):
                 contrib = contrib if k is None else k * contrib
                 s_im = contrib if s_im is None else s_im + contrib
 
+        # A SUBCLASS whose resolution is NOT a sum of flat families adds its
+        # own class-level parts here.  `MaterialCFTerm` is the case that
+        # matters: its width depends on the material amounts and the hit-class
+        # scales, so `Z` depends on them too, and a truncated fit that held
+        # `Z` fixed would be exactly as biased as one with no `Z` at all.  The
+        # base returns its arguments unchanged, so nothing else moves by a
+        # float.
+        s_re, s_im = self._norm_extra(values, s_re, s_im, t)
+
         k_re, k_im = self.kernel.log_cf(values, t_abs)
         if k_re is not None:
             s_re = k_re if s_re is None else s_re + k_re
@@ -2470,8 +2492,12 @@ class MassCFTerm(UnbinnedTerm):
             s_im = k_im if s_im is None else s_im + k_im
 
         shift = self._mass_shift(values)
-        d_lo = tf.constant(lo - self.m_ref, dtype)
-        d_hi = tf.constant(hi - self.m_ref, dtype)
+        if self.norm_window_sigma:
+            d_lo = tf.constant(lo, dtype) * sigma[:, None]
+            d_hi = tf.constant(hi, dtype) * sigma[:, None]
+        else:
+            d_lo = tf.constant(lo - self.m_ref, dtype)
+            d_hi = tf.constant(hi - self.m_ref, dtype)
         if shift is not None:
             d_lo = d_lo - shift
             d_hi = d_hi - shift
@@ -2492,6 +2518,14 @@ class MassCFTerm(UnbinnedTerm):
         return tf.reduce_sum(g / t[None, :], axis=1) * self.npdt(
             self._norm_dt / np.pi
         )
+
+    def _norm_extra(self, values, s_re, s_im, t):
+        """Subclass parts of the CLASS-level resolution exponent.
+
+        Called from :meth:`_norm_z` after the flat families and before the
+        kernel, with `t` the standardized norm grid.  A no-op here.
+        """
+        return s_re, s_im
 
     def _build_norm(self, norm, phik):
         """Tabulate the resolution classes of the truncation normalisation."""
@@ -2733,6 +2767,7 @@ class MassCFTerm(UnbinnedTerm):
             "sigma_floor": self.sigma_floor,
             "chunk": self.chunk,
             "norm_window": None if self.norm_window is None else list(self.norm_window),
+            "norm_window_sigma": self.norm_window_sigma,
             "norm_tpoints": self.norm_tpoints,
             "upsample": self.upsample,
             "families": [
@@ -2972,6 +3007,115 @@ class MaterialCFTerm(MassCFTerm):
         elif len(self.hit_params):
             raise ValueError("hit_params given without hit_share")
         del npdt
+
+    # -- the truncation normalisation --------------------------------------
+    #
+    # THE POINT.  A sample selected in a window of the residual carries the
+    # TRUNCATED density `L_i / Z_i`, and `Z` depends on the WIDTH: a wider
+    # model loses more of itself out of the window.  For a `MassCFTerm` whose
+    # width knobs are the flat `k_f`, the base class already carries that
+    # dependence.  For THIS class the width is the material amounts and the
+    # hit-class scales, so `Z` must depend on THEM -- otherwise `Z` is a
+    # constant, drops out of the gradient, and the truncated fit is exactly
+    # as biased as the untruncated one.  That bias is measured on the J/psi
+    # gun in `resolution/vtxres/STATE.md` section 14.
+    #
+    # `Z` is evaluated per RESOLUTION CLASS, so the class needs a class-level
+    # copy of the per-group exponents and of the per-hit-class variance
+    # shares: `norm["group_families"]` with `(K, ngroups, nt)` arrays (and
+    # `(K, nt)` pinned baselines), `norm["hit_v"]` `(K, ncls)` and
+    # `norm["vg_other"]` `(K,)`.  A class row is the MEAN of its members,
+    # which is the same approximation the class-representative `sigma` is.
+    def _build_norm(self, norm, phik):
+        super()._build_norm(norm, phik)
+        dtype = self.dtype
+        nt = self.norm_tpoints
+        tsrc = np.asarray(self.tgrid_stored, dtype=np.float64)
+        tmid = np.asarray(self._norm_tgrid.numpy() if hasattr(self._norm_tgrid,
+                          "numpy") else self._norm_tgrid, dtype=np.float64)
+
+        def _resample(arr, want_rows):
+            """Put a `(..., nt_stored or nt_norm)` array on the norm grid."""
+            from scipy.interpolate import CubicSpline
+            arr = np.asarray(arr, dtype=np.float64)
+            if arr.shape[0] != want_rows:
+                raise ValueError(
+                    f"norm group array has {arr.shape[0]} rows, expected "
+                    f"{want_rows}")
+            if arr.shape[-1] == nt:
+                return arr
+            if arr.shape[-1] != self.nt:
+                raise ValueError(
+                    f"norm group array has {arr.shape[-1]} t points, expected "
+                    f"{self.nt} or {nt}")
+            return CubicSpline(tsrc, arr, axis=-1)(tmid)
+
+        self._norm_gfam = []
+        for f in norm.get("group_families", []):
+            entry = {"name": f["name"]}
+            for comp in ("re", "im"):
+                a = f.get(comp)
+                if a is not None:
+                    a = _resample(a, self._nclass)
+                    if a.shape[1] != len(self.group_params):
+                        raise ValueError(
+                            f"norm group family '{f['name']}' has "
+                            f"{a.shape[1]} groups, expected "
+                            f"{len(self.group_params)}")
+                    entry[comp] = tf.constant(a, dtype)
+                fx = f.get("fix_" + comp)
+                if fx is not None:
+                    entry["fix_" + comp] = tf.constant(
+                        _resample(fx, self._nclass), dtype)
+            if len(entry) > 1:
+                self._norm_gfam.append(entry)
+
+        vgo = norm.get("vg_other")
+        self._norm_vgother = (None if vgo is None else
+                              tf.constant(np.asarray(vgo, np.float64).ravel(),
+                                          dtype))
+        hv = norm.get("hit_v")
+        if hv is None:
+            self._norm_hitv = None
+        else:
+            hv = np.asarray(hv, np.float64)
+            if hv.shape != (self._nclass, len(self.hit_params)):
+                raise ValueError(
+                    f"norm hit_v has shape {hv.shape}, expected "
+                    f"{(self._nclass, len(self.hit_params))}")
+            self._norm_hitv = tf.constant(hv, dtype)
+        if self._norm_gfam and self._norm_vgother is None and self.h_ptr is not None:
+            raise ValueError(
+                "a MaterialCF truncation normalisation needs norm['vg_other'] "
+                "whenever the term carries a Gaussian hit share")
+
+    def _norm_extra(self, values, s_re, s_im, t):
+        dtype = self.dtype
+        if getattr(self, "_norm_gfam", None):
+            w = self._amount(values)                      # (G,)
+            for f in self._norm_gfam:
+                for comp, tgt in (("re", 0), ("im", 1)):
+                    arr = f.get(comp)
+                    fx = f.get("fix_" + comp)
+                    contrib = None
+                    if arr is not None:
+                        contrib = tf.einsum("g,kgt->kt", w, arr)
+                    if fx is not None:
+                        contrib = fx if contrib is None else contrib + fx
+                    if contrib is None:
+                        continue
+                    if tgt == 0:
+                        s_re = contrib if s_re is None else s_re + contrib
+                    else:
+                        s_im = contrib if s_im is None else s_im + contrib
+        vgo = getattr(self, "_norm_vgother", None)
+        if vgo is not None:
+            v = vgo
+            if self._norm_hitv is not None and len(self.hit_params):
+                v = v + tf.linalg.matvec(self._norm_hitv, self._hitscale(values))
+            gauss = self.npdt(-0.5) * v[:, None] * t[None, :] ** 2
+            s_re = gauss if s_re is None else s_re + gauss
+        return s_re, s_im
 
     # -- internals ---------------------------------------------------------
     def _extra_param_names(self):
@@ -3238,7 +3382,7 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
         extra = {}
         if kind == "MaterialCF":
             gfam = []
-            for fam in cfg.pop("group_families", []):
+            for fam in cfg.get("group_families", []):
                 entry = {"name": fam["name"]}
                 for comp in ("re", "im"):
                     for pref, key in (("", f"Sg_{comp}_{fam['name']}"),
@@ -3257,6 +3401,28 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
                     data.pop("hit_v"),
                     data.pop("vg_other"),
                 )
+            # the CLASS-level copies the truncation normalisation needs, so
+            # that `Z` carries the material / hit-class dependence (see
+            # `MaterialCFTerm._build_norm`)
+            if norm is not None and "norm_vg_other" in data:
+                norm["vg_other"] = data.pop("norm_vg_other")
+                if "norm_hit_v" in data:
+                    norm["hit_v"] = data.pop("norm_hit_v")
+                ngf = []
+                for fam in cfg.get("group_families", []):
+                    entry = {"name": fam["name"]}
+                    for comp in ("re", "im"):
+                        for pref, key in (
+                                ("", f"Sg_{comp}_{fam['name']}_norm"),
+                                ("fix_", f"Sgfix_{comp}_{fam['name']}_norm")):
+                            if key in data:
+                                entry[pref + comp] = data.pop(key)
+                    if len(entry) > 1:
+                        ngf.append(entry)
+                norm["group_families"] = ngf
+            # consumed by `extra` (and by the norm block above); `cfg` is
+            # splatted into the constructor, so it must not carry it too
+            cfg.pop("group_families", None)
 
         jac = None
         if "jac_indices" in data:
