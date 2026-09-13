@@ -48,7 +48,7 @@ name: Hodor AI review
 #   variable HODOR_LLM_MODEL     optional model-id override
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, ready_for_review]
   workflow_dispatch:
     inputs:
