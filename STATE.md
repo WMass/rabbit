@@ -210,7 +210,12 @@ preconditioned 73 s, GPU 70-90 % across the fitting phase in both (the ~35 s
 before it is import, card load and tracing, at 0 %). The plain fit is
 bit-identical with the preconditioner compiled in and switched off:
 `nllvalreduced` 150648.54430236336, `edmval` 128.6403736418085 and all eleven
-parameters to the last digit.
+parameters to the last digit. The same preconditioned fit forced onto the CPU
+takes 1258 s against 73 s and lands in the same place to float64 rounding:
+`nllvalreduced` 1.9e-13 relative, `edmval` 1.4e-9, every parameter within
+2e-8 of its own sigma. At a FIXED point -- the reference Hessian of the
+`z_V_s7` control, where no trajectory divergence can accumulate -- CPU and GPU
+give `edmval` 9427.109084638501 vs 9427.109084639122, 6.6e-14 relative.
 
 A preconditioned fit that reports **0 % / 0 MiB** on the GPU is an environment
 fault, not the transform. `setup_env_engaging.sh` puts the CUDA wheel lib dirs
