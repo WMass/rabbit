@@ -29,10 +29,22 @@ from .test_sparse_fit import make_options, make_test_tensor, run_fit
 # --- 1. subproblem vs scipy ----------------------------------------------
 
 
-def _random_model(n, rng, definite):
+def _random_model(n, rng, definite, cond=None):
+    """Random quadratic model. ``cond`` spreads the spectrum logarithmically
+    over that condition number; the default (None) keeps the O(1) spectrum.
+
+    Conditioning matters for the More-Sorensen lambda search: the secular
+    Newton step is exact in exact arithmetic, so an error in it is masked by
+    the safeguarded bracket at cond ~ 100 and only shows up once the spectrum
+    spans several decades -- which is the regime the native solver exists for.
+    """
     A = rng.standard_normal((n, n))
     Q, _ = np.linalg.qr(A)
-    if definite:
+    if cond is not None:
+        eigs = np.logspace(-np.log10(cond) / 2, np.log10(cond) / 2, n)
+        if not definite:
+            eigs[0] = -eigs[0]
+    elif definite:
         eigs = rng.uniform(0.1, 10.0, n)
     else:
         eigs = rng.uniform(-5.0, 10.0, n)
@@ -71,12 +83,13 @@ def _exact_subproblem_solution(g, H, tr_radius):
 
 @pytest.mark.parametrize("definite", [True, False])
 @pytest.mark.parametrize("tr_radius", [0.01, 1.0, 100.0])
-def test_subproblem_matches_scipy(definite, tr_radius):
+@pytest.mark.parametrize("cond", [None, 1e6])
+def test_subproblem_matches_scipy(definite, tr_radius, cond):
     from scipy.optimize._trustregion_exact import IterativeSubproblem as ScipySubproblem
 
     rng = np.random.default_rng(1234)
     for trial in range(5):
-        g, H = _random_model(10, rng, definite)
+        g, H = _random_model(10, rng, definite, cond=cond)
 
         m_tf = IterativeSubproblem(
             0.0, tf.constant(g, tf.float64), tf.constant(H, tf.float64)
@@ -102,7 +115,12 @@ def test_subproblem_matches_scipy(definite, tr_radius):
         # that band plus achieving ~all of the optimal model reduction.
         assert np.linalg.norm(p_tf) <= tr_radius * (1 + m_tf.k_easy + 1e-6)
         assert model(p_tf) <= 0.95 * best  # >= 95% of the exact reduction
-        assert model(p_sp) <= 0.95 * best  # scipy meets the same bar
+        # scipy is the reference, not a guarantee: on the ill-conditioned
+        # indefinite models at the largest radius it drops to ~0.90 of the
+        # optimum, where the native solver still reaches 0.987. So hold the
+        # native solver to the absolute bar and only require that it is not
+        # materially worse than scipy.
+        assert model(p_tf) <= 0.98 * model(p_sp)
         if hb_tf != hb_sp:
             # can only disagree when the interior/boundary distinction is
             # marginal, i.e. the unconstrained step ~ on the boundary
@@ -218,13 +236,14 @@ def test_callback_and_early_stopping():
 # --- 3. full fit through the Fitter ---------------------------------------
 
 
-def run_fit_native(filename, method="tf-trust-exact", precondition=False):
+def run_fit_native(filename, method="tf-trust-exact", precondition=False, **extra):
     indata_obj = inputdata.FitInputData(filename)
     param_model = load_model("Mu", indata_obj)
 
     kwargs = dict(minimizerMethod=method)
     if precondition:
         kwargs.update(precondition=True, preconditionParams=[".*"])
+    kwargs.update(extra)
     options = make_options(**kwargs)
     f = fitter.Fitter(indata_obj, param_model, options)
     f.set_nobs(indata_obj.data_obs)
@@ -242,21 +261,60 @@ def run_fit_native(filename, method="tf-trust-exact", precondition=False):
     }
 
 
+def test_unconsumed_minimizer_option_warns(caplog):
+    """--minimizerFtol reaches the native methods and none of them read it.
+
+    scipy raises an OptimizeWarning for an option its solver does not know;
+    without this the option was echoed in the [minimize] line and then
+    silently dropped, so the user got no signal either way.
+    """
+    import logging
+
+    from rabbit.fitter import NATIVE_MINIMIZER_OPTIONS
+
+    assert "ftol" not in NATIVE_MINIMIZER_OPTIONS["tf-trust-exact"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = make_test_tensor(tmpdir)
+        with caplog.at_level(logging.WARNING):
+            run_fit_native(fname, "tf-trust-exact", False, minimizerFtol=1e-8)
+        assert any(
+            "does not implement ftol" in r.message and "--minimizerFtol" in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+        # and no warning when the option was not given
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            run_fit_native(fname, "tf-trust-exact", False)
+        assert not any("does not implement" in r.message for r in caplog.records)
+
+
+@pytest.fixture(scope="module")
+def scipy_reference():
+    """The tensor and the scipy trust-krylov fit of it, built once.
+
+    Both are independent of the parametrization below, so building them per
+    case ran six identical reference fits (~3.2 s each) where one suffices.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fname = make_test_tensor(tmpdir)
+        yield fname, run_fit(fname)  # trust-krylov: same likelihood, same minimum
+
+
 @pytest.mark.parametrize(
     "method", ["tf-trust-exact", "tf-trust-ncg", "tf-trust-krylov"]
 )
 @pytest.mark.parametrize("precondition", [False, True])
-def test_fit_matches_scipy(method, precondition):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fname = make_test_tensor(tmpdir)
+def test_fit_matches_scipy(method, precondition, scipy_reference):
+    fname, res_ref = scipy_reference
 
-        res_native = run_fit_native(fname, method, precondition)
-        res_ref = run_fit(fname)  # trust-krylov: same likelihood, same minimum
+    res_native = run_fit_native(fname, method, precondition)
 
-        x_ref = np.concatenate([res_ref["param"], res_ref["theta"]])
-        np.testing.assert_allclose(res_native["x"], x_ref, atol=1e-5, rtol=1e-4)
-        assert res_native["edmval"] < 1e-4
-        assert res_native["status"]["nit"] > 0
+    x_ref = np.concatenate([res_ref["param"], res_ref["theta"]])
+    np.testing.assert_allclose(res_native["x"], x_ref, atol=1e-5, rtol=1e-4)
+    assert res_native["edmval"] < 1e-4
+    assert res_native["status"]["nit"] > 0
 
 
 # --- 4. Steihaug-CG (tf-trust-ncg) ----------------------------------------
@@ -423,13 +481,21 @@ def test_gltr_subproblem_near_exact(definite, tr_radius):
 
 def test_gltr_hard_case():
     """g orthogonal to the bottom eigenvector, indefinite H, radius large
-    enough that the secular equation has no root: the classic hard case."""
+    enough that the secular equation has no root: the classic hard case.
+
+    The ordering matters. g = gamma0 * e1, so the bottom mode is decoupled
+    from g only if e1 does not couple to it: with diag = [-2, 1, 3] and
+    off = [0, 0.5] the bottom eigenvector IS e1, gproj = [1, 0, 0], and
+    ||h(lam_eps)|| = 5e11 >> Delta -- the ordinary bisection path, not the
+    hard case. Putting the negative curvature last decouples it: gproj =
+    [0, 0.23, -0.97], ||h(lam_eps)|| = 0.21 < Delta, and lam comes back at
+    exactly -lambda_min.
+    """
     from rabbit.minimizer.gltr import solve_tridiag_trust_region
 
-    diag = np.array([-2.0, 1.0, 3.0])
-    off = np.array([0.0, 0.5])  # decouples the bottom mode from g
-    gamma0 = 1.0  # g = e1... wait e1 couples to mode 1
-    # build instead directly: T diagonal-ish with g on a non-minimal mode
+    diag = np.array([3.0, 1.0, -2.0])
+    off = np.array([0.5, 0.0])  # decouples the bottom mode from g = e1
+    gamma0 = 1.0
     h, lam, hb = solve_tridiag_trust_region(diag, off, gamma0, 10.0)
     T = np.diag(diag) + np.diag(off, 1) + np.diag(off, -1)
     g = np.array([gamma0, 0.0, 0.0])
@@ -438,6 +504,10 @@ def test_gltr_hard_case():
     assert np.linalg.norm(h) <= 10.0 * (1 + 1e-9)
     wmin = np.linalg.eigvalsh(T)[0]
     assert lam >= -wmin - 1e-9
+    # in the hard case lam sits exactly AT -lambda_min (the secular equation
+    # has no root above it); asserting that pins the degenerate/pseudo-inverse
+    # branch rather than the ordinary bisection one
+    assert abs(lam + wmin) <= 1e-9 * max(1.0, abs(wmin))
     # and it must beat any interior point along -g
     m = g @ h + 0.5 * h @ T @ h
     assert m < 0
@@ -464,12 +534,23 @@ def test_gltr_warm_restart_reuses_krylov_data():
     solver = GLTRSolver(hessp)
     m = GLTRSubproblem(0.0, tf.constant(g, tf.float64), np.zeros(30), solver)
     p1, _ = m.solve(1.0)
-    n_first = count[0]
-    assert n_first > 0
+    k_first = len(m._deltas)
+    assert k_first > 1
 
     p2, hb2 = m.solve(0.25)  # shrunken radius, same point
-    n_second = count[0] - n_first
-    assert n_second <= 2  # essentially free re-solve
+    # The Lanczos basis is radius-independent, so the re-solve must KEEP the
+    # k_first vectors it already has and extend by at most a step or two.
+    # Both bounds matter: the lower one fails if the basis is rebuilt from
+    # scratch, the upper one if the re-solve redoes the work.
+    #
+    # Assert on len(m._deltas), NOT on a python-side HVP counter: `hessp`'s
+    # python body runs only while GLTRSolver._step is TRACING, and every
+    # step() call after the first has an identical input signature and reuses
+    # the cached graph. A counter therefore reads 1 for the whole first solve
+    # and 0 for the second whether or not the Krylov data is reused, and stays
+    # green even with the `if not self._started` guard deleted.
+    assert k_first <= len(m._deltas) <= k_first + 2
+    assert count[0] > 0  # the traced graph really did call hessp
 
     # and the shrunken-radius solution is still near-optimal
     def model(p):

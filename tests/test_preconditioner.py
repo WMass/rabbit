@@ -404,6 +404,44 @@ def test_fit_is_invariant_for_either_reference_source(source):
         assert check_results("plain", plain, f"precond[{source}]", pre)
 
 
+@pytest.mark.parametrize("transform", ["ridge", "spectral"])
+def test_fit_is_invariant_for_either_transform(transform):
+    """Both transforms are only a change of variables, so neither may move the
+    fit. This is what justifies offering the choice at all: the block algebra
+    below shows T^T H T = I, but only a fit shows the minimum staying put."""
+    with tempfile.TemporaryDirectory() as tmp:
+        filename = make_polynomial_tensor(tmp, order=6)
+        plain, _ = _run(filename, "trust-krylov")
+        pre, pc = _run(
+            filename,
+            "trust-krylov",
+            precondition=True,
+            preconditionTransform=transform,
+        )
+        assert pc.enabled and pc.nblock > 1
+        assert check_results("plain", plain, f"precond[{transform}]", pre)
+
+
+def test_default_transform_is_ridge_in_the_parser_and_the_fitter():
+    """The transform default lives in three places (parser, Fitter getattr,
+    _factorise signature). The third is pinned in test_preconditioner_spectral;
+    these are the two that decide what a real run actually does."""
+    from rabbit import parsing
+
+    # get_default rather than parse_args: common_parser has a required
+    # positional (filename), so parsing an empty argv exits
+    assert parsing.common_parser().get_default("preconditionTransform") == "ridge"
+
+    # the Fitter's getattr fallback, for callers whose options predate the flag
+    with tempfile.TemporaryDirectory() as tmp:
+        filename = make_test_tensor(tmp)
+        indata_obj = inputdata.FitInputData(filename)
+        options = make_options()
+        assert not hasattr(options, "preconditionTransform")
+        f = fitter.Fitter(indata_obj, load_model("Mu", indata_obj), options)
+        assert f.precondition_transform == "ridge"
+
+
 @pytest.mark.parametrize("method", ["trust-krylov", "trust-exact"])
 def test_fit_is_invariant_on_an_ill_conditioned_block(method):
     """The case this feature exists for: many correlated unconstrained params.
@@ -418,7 +456,10 @@ def test_fit_is_invariant_on_an_ill_conditioned_block(method):
 
         # default scope must have found the unconstrained polynomial block
         assert pc.enabled and pc.nblock > 1
-        # and it must actually be badly conditioned before, well conditioned after
+        # and it must actually be badly conditioned before, well conditioned
+        # after. These are TRUE condition numbers at both ends, not the
+        # scale-free degeneracy (pc.blocks[i].corr_before) -- see WHAT THE
+        # NUMBERS MEAN in preconditioner.py.
         assert pc.cond_before > 1e3
         assert pc.cond_after < 1e2
         assert check_results("plain", plain, "preconditioned", pre)

@@ -12,6 +12,7 @@ import tempfile
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from rabbit import fitter, inputdata
 from rabbit.callbacks import FitterCallback, merge_callbacks
@@ -206,3 +207,128 @@ def test_preconditioner_is_rebuilt_before_every_restart():
                 f"refresh {i} happened at the same point ({moved}); "
                 "the transform was reused, not rebuilt"
             )
+
+
+# -- the stall THRESHOLD -------------------------------------------------
+#
+# --stallRelTol is the only part of this that touches a default-on path
+# (--earlyStopping defaults to 20), so the equivalence at 0.0 is what most
+# wants pinning: it is what guarantees existing callers see no change.
+
+
+def _feed(losses, early_stopping=3, stall_rel_tol=0.0):
+    """Run a loss trajectory through the callback; did it call it a stall?"""
+    cb = FitterCallback(
+        np.zeros(2), early_stopping=early_stopping, stall_rel_tol=stall_rel_tol
+    )
+    for i, loss in enumerate(losses):
+        try:
+            cb(_result(loss, [i, i]))
+        except ValueError:
+            return True, cb
+    return False, cb
+
+
+# healthy descent, a hard flat, a crawl, one that gets worse, and the inputs
+# where the algebra stops holding: ref == 0.0 (the relative form would divide
+# by zero) and a loss pinned at an infinity (inf - inf and 0.0 * inf are both
+# NaN, and every NaN comparison is False). +inf is REACHABLE -- __call__ raises
+# on a NaN loss but not an infinite one, and a Poisson term with a
+# non-positive prediction and non-zero data gives exactly +inf -- so an
+# equivalence claim that excluded it would be the wrong claim.
+TRAJECTORIES = [
+    [10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+    [10.0, 9.0, 9.0, 9.0, 9.0, 9.0],
+    [1e4, 1e4 * (1 - 1e-5), 1e4 * (1 - 2e-5), 1e4 * (1 - 3e-5), 1e4 * (1 - 4e-5)],
+    [10.0, 9.0, 9.5, 10.0, 10.5, 11.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0],
+    [np.inf] * 5,
+    [-np.inf] * 5,
+    [np.inf, np.inf, 5.0, 5.0, 5.0, 5.0],
+    [np.inf, np.inf, np.inf, np.inf, 1.0, 1.0],
+]
+
+
+@pytest.mark.parametrize("losses", TRAJECTORIES)
+def test_stall_rel_tol_zero_is_exactly_the_original_test(losses):
+    """The default must be bit-identical to the test it generalises.
+
+    ``gained <= 0`` is ``ref - loss <= 0`` is ``ref <= loss``, so this is
+    algebraically guaranteed; pinned because it is the whole basis for calling
+    the new option opt-in. Includes ref == 0.0, the one input where the
+    relative form would divide by zero and has to fall back.
+    """
+    stalled, _ = _feed(losses, stall_rel_tol=0.0)
+
+    # the predicate as it stood before --stallRelTol existed
+    hist, exact = [], False
+    for loss in losses:
+        if len(hist) > 3 and hist[-3] <= loss:
+            exact = True
+            break
+        hist.append(loss)
+
+    assert stalled == exact
+
+
+def test_stall_rel_tol_detects_a_crawl_the_exact_test_misses():
+    """The gap the option exists for: improving, but not meaningfully."""
+    crawl = [1e4 * (1 - 1e-5 * i) for i in range(8)]
+    assert not _feed(crawl, stall_rel_tol=0.0)[0]  # invisible to the exact test
+    assert _feed(crawl, stall_rel_tol=1e-3)[0]
+
+
+def test_stall_rel_tol_leaves_a_healthy_descent_alone():
+    """It must not fire on a fit that is still making real progress."""
+    healthy = [1e4 * 0.5**i for i in range(8)]
+    for tol in (0.0, 1e-4, 1e-3, 1e-2):
+        assert not _feed(healthy, stall_rel_tol=tol)[0], f"fired at tol={tol}"
+
+
+def test_stall_rel_tol_defaults_to_zero_everywhere_it_is_set():
+    """Three places hold this default; a flip in any of them is a behaviour
+    change on a default-on path, so pin all three."""
+    assert FitterCallback(np.zeros(2)).stall_rel_tol == 0.0
+
+    from rabbit import parsing
+
+    assert parsing.common_parser().get_default("stallRelTol") == 0.0
+
+    # and the Fitter's getattr fallback, for callers whose options predate it
+    with tempfile.TemporaryDirectory() as tmp:
+        filename = make_test_tensor(tmp)
+        indata_obj = inputdata.FitInputData(filename)
+        options = make_options()
+        assert not hasattr(options, "stallRelTol")
+        f = fitter.Fitter(indata_obj, load_model("Mu", indata_obj), options)
+        assert f.stallRelTol == 0.0
+
+
+def test_default_path_keeps_the_original_early_stopping_message():
+    """Every existing user sees this string; the default path must not reword it."""
+    stalled, cb = _feed([10.0, 9.0, 9.0, 9.0, 9.0, 9.0], stall_rel_tol=0.0)
+    assert stalled
+    with pytest.raises(ValueError, match=r"No reduction in loss after 3 iterations"):
+        _raise(cb_losses=[10.0, 9.0, 9.0, 9.0, 9.0, 9.0], stall_rel_tol=0.0)
+
+    # and the relative phrasing only appears when a threshold is in play
+    with pytest.raises(ValueError, match=r"Loss improved only .* relative"):
+        _raise(cb_losses=[1e4 * (1 - 1e-5 * i) for i in range(8)], stall_rel_tol=1e-3)
+
+
+def _raise(cb_losses, stall_rel_tol):
+    cb = FitterCallback(np.zeros(2), early_stopping=3, stall_rel_tol=stall_rel_tol)
+    for i, loss in enumerate(cb_losses):
+        cb(_result(loss, [i, i]))
+
+
+def test_negative_stall_rel_tol_is_rejected():
+    """A negative threshold would require the loss to WORSEN to count as
+    stalled -- it weakens the test, so it is a footgun rather than an option."""
+    with pytest.raises(ValueError, match=r"must be >= 0"):
+        FitterCallback(np.zeros(2), early_stopping=3, stall_rel_tol=-1e-4)
+
+    from rabbit import parsing
+
+    with pytest.raises(SystemExit):
+        parsing.common_parser().parse_args(["d.hdf5", "--stallRelTol", "-1e-4"])

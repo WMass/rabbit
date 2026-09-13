@@ -40,7 +40,6 @@ References
 import math
 
 import numpy as np
-import scipy.linalg
 import tensorflow as tf
 from wums import logging
 
@@ -60,50 +59,15 @@ def gershgorin_bounds(hess):
     return float(lb), float(ub)
 
 
-def estimate_smallest_singular_value(L):
-    """Estimate the smallest singular value/vector of lower-triangular ``L``.
-
-    Direct port of scipy's version (Cline et al. 1979), which works on the
-    upper factor U; here U = L^T so U^T = L and the recurrence reads off
-    columns of L. O(n^2), host-side numpy: it is inherently sequential and
-    only runs in the rare hard case.
-    """
-    L = np.atleast_2d(L)
-    n = L.shape[0]
-
-    p = np.zeros(n)
-    w = np.empty(n)
-
-    for k in range(n):
-        wp = (1 - p[k]) / L[k, k]
-        wm = (-1 - p[k]) / L[k, k]
-        pp = p[k + 1 :] + L[k + 1 :, k] * wp
-        pm = p[k + 1 :] + L[k + 1 :, k] * wm
-
-        if abs(wp) + np.linalg.norm(pp, 1) >= abs(wm) + np.linalg.norm(pm, 1):
-            w[k] = wp
-            p[k + 1 :] = pp
-        else:
-            w[k] = wm
-            p[k + 1 :] = pm
-
-    # w solves L w = e (e in {+1,-1}^n chosen for growth); now L^T v = w
-    v = scipy.linalg.solve_triangular(L, w, lower=True, trans="T")
-    v_norm = np.linalg.norm(v)
-
-    s_min = np.linalg.norm(w) / v_norm
-    z_min = v / v_norm
-    return s_min, z_min
-
-
 def estimate_smallest_singular_value_device(L, iters=8):
-    """Device-side counterpart of :func:`estimate_smallest_singular_value`.
+    """Smallest singular value/vector of lower-triangular ``L``, on device.
 
     Inverse iteration on L L^T: z <- (L L^T)^-1 z, normalized -- each pass
     two O(n^2) triangular solves on the device, so nothing but two scalars
-    and one n-vector ever cross to the host, where the Cline et al.
-    recurrence above is inherently sequential and needs the full factor
-    downloaded (measured ~1 s/outer-iteration at n=4000 over PCIe).
+    and one n-vector ever cross to the host. The host-side alternative is
+    scipy's Cline et al. (1979) recurrence, which is inherently sequential
+    and needs the full factor downloaded (measured ~1 s/outer-iteration at
+    n=4000 over PCIe).
 
     Convergence is governed by the eigenvalue separation of L L^T, which is
     extreme precisely in the near-singular regime the trust-region hard
@@ -185,7 +149,11 @@ class IterativeSubproblem:
         self.maxiter = self.MAXITER_DEFAULT if maxiter is None else maxiter
 
         self.dimension = int(self.hess.shape[0])
-        self._eye = tf.eye(self.dimension, dtype=self.hess.dtype)
+        # H + lambda I is formed with set_diag rather than H + lambda*eye:
+        # a dense n x n identity is 1.4 GB at n=13000 and a new subproblem
+        # is built on every accepted outer step, so the eye would coexist
+        # with the previous one and the Hessian itself.
+        self.hess_diag = tf.linalg.diag_part(self.hess)
         self.hess_gersh_lb, self.hess_gersh_ub = gershgorin_bounds(self.hess)
         # NB axis=[-2, -1] requests the *matrix* norms; tf.norm's default
         # axis=None flattens the tensor, and the resulting max|H_ij| can sit
@@ -212,7 +180,7 @@ class IterativeSubproblem:
         the factor with NaNs (never raising) on every backend, so success is
         a NaN check -- one scalar readback.
         """
-        H = self.hess + lambda_current * self._eye
+        H = tf.linalg.set_diag(self.hess, self.hess_diag + lambda_current)
         L = tf.linalg.cholesky(H)
         ok = not bool(tf.reduce_any(tf.math.is_nan(L)))
         return L, ok
@@ -225,12 +193,10 @@ class IterativeSubproblem:
         )
 
     @staticmethod
-    def _tri_solve_t(L, b):
-        """Solve L^T x = b for vector b."""
+    def _tri_solve(L, b):
+        """Solve L x = b for vector b."""
         return tf.squeeze(
-            tf.linalg.triangular_solve(
-                L, tf.expand_dims(b, axis=-1), lower=True, adjoint=True
-            ),
+            tf.linalg.triangular_solve(L, tf.expand_dims(b, axis=-1), lower=True),
             axis=-1,
         )
 
@@ -315,7 +281,29 @@ class IterativeSubproblem:
                     else:
                         t = min(tr_radius / g_norm, g_norm**2 / gHg)
                     candidates.append(-t * g)
+                if not candidates:
+                    # No candidate at all: an exact saddle (grad == 0 with an
+                    # indefinite H) leaves p unset and contributes no Cauchy
+                    # step. min([]) would raise, and the outer loop turns that
+                    # into warnflag=3 -- terminating the fit at the starting
+                    # point rather than stepping off the saddle. Move along the
+                    # estimated bottom eigenvector instead, which is a descent
+                    # direction for the model wherever H is indefinite.
+                    if L is not None and factorized_ok:
+                        _, z_min = estimate_smallest_singular_value_device(L)
+                        step = tr_radius * z_min.__array__()
+                        candidates.append(
+                            step if self.model_value(step) <= 0.0 else -step
+                        )
+                    else:
+                        candidates.append(np.zeros(n, dtype=np.float64))
                 p = min(candidates, key=self.model_value)
+                # Report the boundary status of the step actually returned: the
+                # clipped p and the Cauchy step can both be strictly interior,
+                # and the outer loop DOUBLES the trust radius on
+                # (rho > 0.75 and hits_boundary) -- so claiming the boundary
+                # here makes the next subproblem harder right after a failure.
+                hits_boundary = bool(np.linalg.norm(p) >= tr_radius * (1.0 - 1e-12))
                 break
             niter += 1
 
@@ -329,8 +317,12 @@ class IterativeSubproblem:
                     hits_boundary = False
                     break
 
-                # Newton step on the secular equation, [2]_ (4.44) p. 87
-                w = self._tri_solve_t(L, p)
+                # Newton step on the secular equation, [2]_ (4.44) p. 87.
+                # The step needs w = L^-1 p, not L^-T p: with H + lambda I =
+                # L L^T, d||p||/dlambda = -p^T (H + lambda I)^-1 p / ||p|| =
+                # -||L^-1 p||^2 / ||p||. (scipy factors H + lambda I = U^T U
+                # with U = L^T and takes U^-T p, which is the same thing.)
+                w = self._tri_solve(L, p)
                 w_norm = float(tf.norm(w))
                 delta_lambda = (p_norm / w_norm) ** 2 * (p_norm - tr_radius) / tr_radius
                 # The Newton correction is negative in the interior case and

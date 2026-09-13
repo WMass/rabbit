@@ -86,6 +86,16 @@ def make_fitter(indata, param_model, options, **kwargs):
     return Fitter(indata, param_model, options, **kwargs)
 
 
+# Options from --minimizerMaxiter/--minimizerGtol/--minimizerFtol that each
+# native minimizer actually reads. Anything else passed for these methods is
+# warned about rather than silently dropped (see Fitter.fit).
+NATIVE_MINIMIZER_OPTIONS = {
+    "tf-trust-exact": {"gtol", "maxiter"},
+    "tf-trust-ncg": {"gtol", "maxiter"},
+    "tf-trust-krylov": {"gtol", "maxiter"},
+}
+
+
 class Fitter:
     # Dynamically-built tf.function wrappers holding un-copyable FuncGraph
     # state; stripped on deepcopy and rebuilt. Subclasses extend this with
@@ -111,6 +121,7 @@ class Fitter:
         self.indata = indata
 
         self.earlyStopping = options.earlyStopping
+        self.stallRelTol = getattr(options, "stallRelTol", 0.0)
         self.globalImpactsFromJVP = globalImpactsFromJVP
 
         if self.indata.systematic_type not in Fitter.valid_systematic_types:
@@ -145,6 +156,7 @@ class Fitter:
         self.precondition_params = getattr(options, "preconditionParams", None)
         self.precondition_from = getattr(options, "preconditionFrom", "hessian")
         self.precondition_blocks = getattr(options, "preconditionBlocks", "auto")
+        self.precondition_transform = getattr(options, "preconditionTransform", "ridge")
         self.precondition_block_threshold = getattr(
             options, "preconditionBlockThreshold", 0.1
         )
@@ -2797,7 +2809,16 @@ class Fitter:
         # formed (memory, or a tracing failure on a large model) fall back to an
         # unpreconditioned fit rather than taking the whole job down.
         try:
+            _t_ref = time.time()
             hess_np = self._reference_matrix()
+            # Time it: this is a FULL Hessian at the current point, and it is
+            # the entire cost of a preconditioner rebuild. Whether restarting
+            # aggressively is worth it is exactly this number against the
+            # remaining iterations, so it should not have to be guessed.
+            logger.debug(
+                f"Preconditioner reference matrix ({self.precondition_from}) "
+                f"took {time.time() - _t_ref:.1f} s"
+            )
         except Exception as ex:
             logger.warning(
                 f"Could not compute the reference Hessian for preconditioning ({ex}); "
@@ -2831,6 +2852,13 @@ class Fitter:
             theta_ref,
             index_blocks,
             ridge=self.precondition_ridge,
+            transform=self.precondition_transform,
+            # names so the per-block log says WHICH parameters each block holds;
+            # "block of 14 parameters" alone leaves no way to tell from a log
+            # which directions the transform actually helped. astype(str), not
+            # str() per element: indata.systs comes out of h5py as an object
+            # array of bytes, so str() would render every name as b'...'.
+            names=self.parms.astype(str),
         )
 
     def fit(self):
@@ -3099,6 +3127,24 @@ class Fitter:
             sci_opts["ftol"] = float(self.minimizer_ftol)
         logger.info(f"[minimize] method={self.minimizer_method} options={sci_opts}")
 
+        # The native minimizers take gtol and maxiter and nothing else, so any
+        # other key here is silently dropped -- scipy at least raises an
+        # OptimizeWarning for an option its method does not recognize, and
+        # without this the user sees the option echoed in the line above and
+        # then has no signal that it did nothing. --minimizerFtol is the one
+        # that reaches this today.
+        if self.minimizer_method in NATIVE_MINIMIZER_OPTIONS:
+            ignored = sorted(
+                set(sci_opts) - NATIVE_MINIMIZER_OPTIONS[self.minimizer_method]
+            )
+            if ignored:
+                logger.warning(
+                    f"{self.minimizer_method} does not implement "
+                    f"{', '.join(ignored)}; ignoring "
+                    f"{', '.join(f'--minimizer{o.capitalize()}' for o in ignored)}. "
+                    "Use a scipy --minimizerMethod if you need it."
+                )
+
         # Restart loop. scipy's trust-region methods shrink the trust radius by
         # 4x on every rejected step with no lower bound, and the radius is a
         # local of scipy's loop -- so once it has collapsed the method takes
@@ -3111,6 +3157,7 @@ class Fitter:
         callback = None
         prev_loss = None
         attempt = 0
+
         # to_physical is the whole reason this is built here rather than in the
         # callback: under preconditioning the minimiser's iterate is in internal
         # coordinates, and a snapshot of those would load without complaint and
@@ -3131,6 +3178,7 @@ class Fitter:
                     self.earlyStopping,
                     snapshotter=snapshotter,
                     expand=expand if reduce_frozen else None,
+                    stall_rel_tol=self.stallRelTol,
                 )
                 try:
                     if self.minimizer_method == "tf-trust-exact":
@@ -3197,6 +3245,7 @@ class Fitter:
 
                 callback = merge_callbacks(callback, cb)
                 last_loss = cb.loss_history[-1] if cb.loss_history else None
+
                 if not cb.stopped_early:
                     break
                 # The only reason to stop restarting is that the last restart

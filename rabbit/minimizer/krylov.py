@@ -183,7 +183,12 @@ class CGSteihaugSubproblem:
         # scipy's forcing sequence: superlinear local convergence
         tolerance = min(0.5, math.sqrt(self.jac_mag)) * self.jac_mag
 
-        if self.jac_mag < tolerance:  # only at an exactly-zero gradient
+        # tolerance = min(0.5, sqrt(jac_mag)) * jac_mag <= 0.5 * jac_mag, so
+        # `jac_mag < tolerance` is false for every jac_mag >= 0 -- including 0.
+        # Test the gradient directly, or an exactly-zero gradient falls into
+        # the CG graph and comes back as p = 0 with hits_boundary=True, which
+        # then feeds the outer loop's radius-doubling test.
+        if self.jac_mag == 0.0:
             p = np.zeros(int(self.jac.shape[0]), dtype=np.float64)
             self._last_p, self._last_model = p, self.fun
             return p, False
@@ -191,7 +196,9 @@ class CGSteihaugSubproblem:
         if self._set_point is not None:
             self._set_point(self._x_point)
 
-        maxiter = self._cg_maxiter or int(self.jac.shape[0])
+        maxiter = (
+            int(self.jac.shape[0]) if self._cg_maxiter is None else self._cg_maxiter
+        )
         p, mval, hb, k = self._solver.solve(self.jac, tr_radius, tolerance, maxiter)
 
         self.niter = int(k)

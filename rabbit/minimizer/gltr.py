@@ -122,7 +122,7 @@ class GLTRSolver:
         self._step = tf.function(self._step_impl)
 
     def ensure(self, n, dtype):
-        kmax = self.kmax or min(n, 1000)
+        kmax = min(n, 1000) if self.kmax is None else self.kmax
         if self.Q is None or self.Q.shape != (kmax, n):
             self.Q = tf.Variable(tf.zeros([kmax, n], dtype=dtype), trainable=False)
         self.kmax = kmax
@@ -191,6 +191,11 @@ class GLTRSubproblem:
         self._q = None
         self._q_prev = None
         self._started = False
+        # Lanczos breakdown is a property of the linearization point, not of a
+        # single solve: once the subspace is invariant, a re-solve at a shrunken
+        # radius must not call _extend() again on the post-breakdown q, which is
+        # normalized roundoff rather than a genuine Lanczos direction.
+        self._can_extend = True
         self.niter = 0
 
     # breakdown threshold: an invariant subspace has been found and the
@@ -234,7 +239,6 @@ class GLTRSubproblem:
             self._started = True
 
         h = lam = hits_boundary = None
-        can_extend = True
         while True:
             k = len(self._deltas)
             if k > 0:
@@ -249,7 +253,7 @@ class GLTRSubproblem:
                 # step within the full space, not just distance to a Newton
                 # point the outer loop would refine anyway
                 tol_eff = 0.1 * tolerance if hits_boundary else tolerance
-                if residual <= tol_eff or not can_extend:
+                if residual <= tol_eff or not self._can_extend:
                     break
                 if k >= kmax:
                     logger.warning(
@@ -258,7 +262,7 @@ class GLTRSubproblem:
                         "returning the best step in the subspace"
                     )
                     break
-            can_extend = self._extend()
+            self._can_extend = self._extend()
 
         p = self._solver.retransform(h)
         p_np = p.__array__()
