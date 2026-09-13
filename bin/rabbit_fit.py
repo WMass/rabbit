@@ -895,6 +895,38 @@ def main():
     global logger
     logger = logging.setup_logger(__file__, args.verbose, args.noColorLogger)
 
+    # SAY WHICH DEVICES THE FIT WILL RUN ON, and say it loudly when there are
+    # none. When the CUDA libraries cannot be dlopened (a missing
+    # LD_LIBRARY_PATH entry is enough) TF logs "Cannot dlopen some GPU
+    # libraries ... Skipping registering GPU devices" at a level that the
+    # TF_CPP_MIN_LOG_LEVEL every batch script sets suppresses, reports no GPU,
+    # and runs the whole fit on the CPU. Nothing fails, nothing is logged, and
+    # the only symptom is a fit ~100x slower than the same fit yesterday --
+    # which reads as a hard model, not as a broken environment (measured: two
+    # 4 h H200 allocations that never executed a single op on the GPU,
+    # 2026-09-13). One line at startup is the difference between diagnosing
+    # that in a minute and in a day.
+    _visible_gpus = tf.config.get_visible_devices("GPU")
+    if _visible_gpus:
+        logger.info(
+            f"TensorFlow sees {len(_visible_gpus)} GPU(s): "
+            + ", ".join(d.name for d in _visible_gpus)
+        )
+    elif _os.environ.get("CUDA_VISIBLE_DEVICES") == "":
+        logger.info(
+            "GPUs are hidden by CUDA_VISIBLE_DEVICES=''; running on the CPU."
+        )
+    elif tf.test.is_built_with_cuda():
+        logger.warning(
+            "No GPU is visible to TensorFlow although it was built with CUDA: "
+            "the fit will run on the CPU. If that is not intended, check "
+            "CUDA_VISIBLE_DEVICES and that LD_LIBRARY_PATH carries the CUDA "
+            "runtime (TF reports a failed dlopen only at a log level that "
+            "TF_CPP_MIN_LOG_LEVEL usually hides)."
+        )
+    else:
+        logger.info("TensorFlow has no GPU support in this build; running on the CPU.")
+
     # make list of fits with -1: asimov; 0: fit to data; >=1: toy
     fits = np.concatenate(
         [np.array([x]) if x <= 0 else 1 + np.arange(x, dtype=int) for x in args.toys]
