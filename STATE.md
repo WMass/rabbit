@@ -201,6 +201,29 @@ digit with its EDM 5.6e-12 -> 2.1e-16, a fit whose Hessian is singular for want
 of information is improved but not rescued, and a direction with no interior
 minimum is walked out to its boundary rather than hidden. RESOLUTION.md §3.3.
 
+**On the GPU.** The preconditioned path runs on the device exactly as the plain
+one does: objective, gradient, Hessian and HVPs are the same traced
+`tf.function`s, and the transform itself is small numpy at the scipy boundary
+(one dense `[npar, npar]` factorisation per build, `T`/`T^T` per call).
+Measured on `z_vzero.hdf5`, H200, 12 `trust-exact` iterations: plain 72 s,
+preconditioned 73 s, GPU 70-90 % across the fitting phase in both (the ~35 s
+before it is import, card load and tracing, at 0 %). The plain fit is
+bit-identical with the preconditioner compiled in and switched off:
+`nllvalreduced` 150648.54430236336, `edmval` 128.6403736418085 and all eleven
+parameters to the last digit.
+
+A preconditioned fit that reports **0 % / 0 MiB** on the GPU is an environment
+fault, not the transform. `setup_env_engaging.sh` puts the CUDA wheel lib dirs
+on `LD_LIBRARY_PATH` with a glob; a job script that sources it under `set -f`
+-- which `precond_refit.sbatch` did, because `--preconditionParams .*` has to
+word-split unquoted -- leaves the loader path without CUDA, TF then skips
+registering the GPU at a log level `TF_CPP_MIN_LOG_LEVEL=2` hides, and the fit
+runs on the CPU at about 1/40 the speed (0.6 Hessians/h against the 22-27/h of
+the certified GPU runs). Both ends are fixed (`calibration_studies` 6e320d3:
+the env script restores globbing around its own loop, the sbatch sources the
+environment before turning globbing off), and `rabbit_fit.py` logs the devices
+TF sees at startup, warning when it was built with CUDA and has none.
+
 ---
 
 ## 5. Environment
