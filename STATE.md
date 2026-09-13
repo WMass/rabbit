@@ -195,6 +195,11 @@ block. A block whose true condition number the transform would make worse is
 `--stallRelTol` makes the early-stopping test relative; with `--maxRestarts`
 the transform is rebuilt at the point actually reached. Preconditioning a
 **frozen** parameter is refused — the two operations do not commute.
+What it buys, measured on two 60-parameter CPU cards: the block whitens from
+1.03e8 / 7.78e7 to 1, an already-converged fit reproduces to every printed
+digit with its EDM 5.6e-12 -> 2.1e-16, a fit whose Hessian is singular for want
+of information is improved but not rescued, and a direction with no interior
+minimum is walked out to its boundary rather than hidden. RESOLUTION.md §3.3.
 
 ---
 
