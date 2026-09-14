@@ -1,3 +1,5 @@
+# Source this file (source setup.sh) — it exports into the current shell;
+# executing it would configure only the subshell and be a silent no-op.
 export RABBIT_BASE=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
 export PYTHONPATH="${RABBIT_BASE}:$PYTHONPATH"
 export PATH="$PATH:${RABBIT_BASE}/bin"
