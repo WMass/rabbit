@@ -521,6 +521,7 @@ class Fitter:
         # covariance (it does not when it was produced with --noHessian), so
         # callers can decide to recompute the Hessian at the loaded point.
         self.external_cov_loaded = False
+        self.external_cov_mask = None
         cov_ext = None
         with h5py.File(fitresult_file, "r") as fext:
             if "x" in fext.keys():
@@ -562,6 +563,14 @@ class Fitter:
             covval[np.ix_(idxs, idxs)] = cov_ext[np.ix_(idxs_ext, idxs_ext)]
             self.cov.assign(tf.constant(covval))
             self.external_cov_loaded = True
+            # Which parameters the loaded covariance actually covers. Partial
+            # overlap is supported (hence the intersect above), and the rest of
+            # self.cov keeps the prefit diagonal it was initialized with, so a
+            # caller reading diag(cov) as postfit uncertainties needs to know
+            # which entries are real.
+            mask = np.zeros(len(parms), dtype=bool)
+            mask[idxs] = True
+            self.external_cov_mask = mask
 
         if profile:
             self._profile_beta()

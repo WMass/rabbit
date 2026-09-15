@@ -271,3 +271,46 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def test_partial_external_covariance_leaves_uncovered_variances_nan():
+    """A partially-overlapping --externalPostfit must not report prefit widths.
+
+    load_fitresult fills only the intersection of the two parameter sets and
+    leaves the rest of fitter.cov on the prefit diagonal it was initialized
+    with, so diag(cov) is a postfit variance only for the covered parameters.
+    external_cov_mask records which those are; reporting the rest would hand
+    back a prefit width as a postfit uncertainty.
+    """
+    import h5py
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        build_writer().write(outfolder=tmpdir, outfilename="partial_cov")
+        indata_obj = inputdata.FitInputData(os.path.join(tmpdir, "partial_cov.hdf5"))
+        options = make_options()
+        param_model = load_model("Mu", indata_obj)
+        f = fitter.Fitter(indata_obj, param_model, options)
+        f.defaultassign()
+        f.set_nobs(indata_obj.data_obs)
+
+        n = int(f.x.shape[0])
+        assert n > 1, "need more than one parameter for a partial overlap"
+        keep = f.parms.astype(str)[: n - 1]
+
+        ext = os.path.join(tmpdir, "external.hdf5")
+        with h5py.File(ext, "w") as g:
+            g.create_dataset("x", data=np.zeros(len(keep)))
+            g.create_dataset("parms", data=np.array([p.encode() for p in keep]))
+            g.create_dataset("cov", data=np.eye(len(keep)) * 0.25)
+
+        f.load_fitresult(ext, None, profile=False)
+
+        mask = f.external_cov_mask
+        assert mask is not None and mask.sum() == len(keep) and not mask.all()
+
+        diag = np.diag(f.cov.numpy())
+        # the covered block carries the external covariance
+        np.testing.assert_allclose(diag[mask], 0.25)
+        # the uncovered entry is still the prefit variance, NOT a postfit one --
+        # which is why rabbit_fit.py masks it to NaN rather than reporting it
+        assert not np.isclose(diag[~mask][0], 0.25)

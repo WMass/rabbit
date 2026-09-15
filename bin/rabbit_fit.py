@@ -704,11 +704,21 @@ def fit(args, fitter, ws, dofit=True):
     # point instead — the two-pass recipe: fit once with --noHessian, then
     # rerun with --externalPostfit ... --noFit (without --noHessian) to get
     # the covariance.
-    if (
+    recompute_cov = (
         dofit
         or args.externalPostfit is None
         or not getattr(fitter, "external_cov_loaded", False)
-    ):
+    )
+    # Whether fitter.cov holds a usable covariance by the end of this block.
+    # Global impacts need only that and the parameter values -- never the
+    # Hessian (see Fitter.global_impacts_parms and
+    # gaussian_global_impacts_parms) -- so they must not be gated on the
+    # covariance having been *recomputed* here. They used to be, which meant
+    # "--externalPostfit <result with a covariance> --globalImpacts" skipped
+    # the whole block and wrote no impacts at all, while still exiting 0.
+    cov_available = False
+
+    if recompute_cov:
         if not args.noEDM and not args.noHessian:
             # compute the covariance matrix and estimated distance to minimum
             _, grad, hess = fitter.loss_val_grad_hess()
@@ -734,21 +744,8 @@ def fit(args, fitter, ws, dofit=True):
 
             del hess
 
-            if args.globalImpacts:
-                ws.add_impacts_hists(
-                    *fitter.global_impacts_parms(),
-                    base_name="global_impacts",
-                    global_impacts=True,
-                )
-
-            if args.gaussianGlobalImpacts:
-                ws.add_impacts_hists(
-                    *fitter.gaussian_global_impacts_parms(),
-                    base_name="gaussian_global_impacts",
-                    global_impacts=True,
-                )
-
             parms_variances = tf.linalg.diag_part(fitter.cov)
+            cov_available = True
         elif not args.noEDM:
             # --noHessian: avoid the full dense Hessian. Still compute edmval
             # and the POI+NOI uncertainties via a Hessian-free conjugate
@@ -787,6 +784,64 @@ def fit(args, fitter, ws, dofit=True):
             for k, i in enumerate(poi_noi_idx):
                 parms_variances_np[int(i)] = cov_rows[k, int(i)]
             parms_variances = tf.constant(parms_variances_np, dtype=fitter.indata.dtype)
+    else:
+        # The covariance came from --externalPostfit, so no Hessian was
+        # computed here. fitter.cov is populated, so the parameter
+        # uncertainties and the global impacts are available; only the
+        # traditional impacts are not, because impacts_parms() needs the
+        # Hessian itself (and a second, unprofiled one) rather than its
+        # inverse.
+        if args.doImpacts:
+            raise Exception(
+                "--doImpacts needs the Hessian, which is only computed when the "
+                "covariance is not read from --externalPostfit. Point "
+                "--externalPostfit at the fit result from before the Hessian "
+                "pass (the one without a covariance) so it is recomputed here, "
+                "or use --globalImpacts, which needs only the covariance."
+            )
+        # Only the parameters the external result actually covered have a
+        # postfit variance here: load_fitresult fills the intersection of the
+        # two parameter sets and leaves the rest of fitter.cov on the prefit
+        # diagonal it was initialized with. Reporting those would hand back a
+        # prefit width as a postfit uncertainty, which is exactly the
+        # "plausible-looking value" the NaN default above exists to avoid.
+        ext_var = tf.linalg.diag_part(fitter.cov).numpy()
+        ext_mask = getattr(fitter, "external_cov_mask", None)
+        if ext_mask is not None and not ext_mask.all():
+            n_missing = int((~ext_mask).sum())
+            logger.warning(
+                f"--externalPostfit covered {int(ext_mask.sum())} of "
+                f"{ext_mask.size} parameters; the remaining {n_missing} have no "
+                "postfit uncertainty and are written as NaN. Global impacts for "
+                "them are computed against a covariance block that is still the "
+                "prefit diagonal, so treat those rows as unreliable."
+            )
+            ext_var[~ext_mask] = np.nan
+        parms_variances = tf.constant(ext_var, dtype=fitter.indata.dtype)
+        cov_available = True
+
+    # Global impacts need the covariance and the parameter values, not the
+    # Hessian, so they run whether it was recomputed above or loaded from
+    # --externalPostfit.
+    if args.globalImpacts or args.gaussianGlobalImpacts:
+        if not cov_available:
+            raise Exception(
+                "--globalImpacts/--gaussianGlobalImpacts need the parameter "
+                "covariance. Either let it be computed here (drop --noHessian) "
+                "or supply a --externalPostfit result that contains one."
+            )
+        if args.globalImpacts:
+            ws.add_impacts_hists(
+                *fitter.global_impacts_parms(),
+                base_name="global_impacts",
+                global_impacts=True,
+            )
+        if args.gaussianGlobalImpacts:
+            ws.add_impacts_hists(
+                *fitter.gaussian_global_impacts_parms(),
+                base_name="gaussian_global_impacts",
+                global_impacts=True,
+            )
 
     nllvalreduced = fitter.reduced_nll().numpy()
 
