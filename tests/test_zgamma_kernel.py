@@ -711,6 +711,30 @@ def test_modifiers(args):
     print(f"  7f. config -> JSON -> from_config: max abs dev {d:.2e}")
     ok &= d == 0.0
 
+    # (g) the tabulated acceptance: linear interpolation, constant outside,
+    # and a fine grid rendering of a Bernstein acceptance reproduces it.  The
+    # per-leg factorised FSR kernel (calibration_studies/zchannel) delivers
+    # A(m) as a table on its own m_pre bands, so this is the form the
+    # selection-conditional model actually uses.
+    mg = np.array([70.0, 80.0, 90.0, 100.0])
+    ag = np.array([0.20, 0.35, 0.45, 0.50])
+    zg = ZGammaLineshape(acceptance={"kind": "grid", "m": mg, "a": ag}, **kw)
+    got = zg._acceptance_on(np.array([60.0, 75.0, 85.0, 95.0, 120.0]))
+    want = np.array([0.20, 0.275, 0.40, 0.475, 0.50])
+    d = np.max(np.abs(got - want))
+    print(f"  7g. grid acceptance, interp + constant outside: max abs dev {d:.2e}")
+    ok &= d < 1e-15
+
+    fine = np.linspace(W[0], W[1], 4001)
+    zb2 = ZGammaLineshape(acceptance=acc, **kw)
+    zg2 = ZGammaLineshape(
+        acceptance={"kind": "grid", "m": fine,
+                    "a": zb2._acceptance_on(fine)}, **kw)
+    d = np.max(np.abs(zg2.pdf(V).numpy() - zb2.pdf(V).numpy())) / np.max(
+        zb2.pdf(V).numpy())
+    print(f"  7g. grid rendering of a Bernstein A(m): max rel dev {d:.2e}")
+    ok &= d < 1e-6
+
     print("  PASS" if ok else "  FAIL")
     return ok
 
