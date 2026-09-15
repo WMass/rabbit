@@ -68,6 +68,26 @@ NC Drell-Yan spectrum folded with a parton-luminosity table
 `make_lumi_table.py`), the FSR kernel and the acceptance, differentiable in the
 POIs `m_Z` and `Gamma_Z`, with a smooth `K(m)` shape floated on top.
 
+The FSR fold is one constant `(nm, n_born)` matrix either way, but `fsr=` takes
+two representations of the kernel, dispatched on the keys of the mapping or
+npz. **Atoms** `(r, w, m_lo, m_hi)` are point masses at `r = m_post/m_pre`,
+optionally banded in `m_pre`: piecewise constant in mass, and merged in `u` at
+a `var_budget` / `sigma_cap`. A **table** `(m_nodes, u_edges, K, u_mean, p0)`
+is the cell-integrated probability mass of `u = -ln(m_post/m_pre)` at a ladder
+of mass nodes, and has neither discretisation: the rows are interpolated onto
+every Born grid point (no bands) and every cell is deposited whole, by the rule
+that is exact for its width — a point mass at the cell's first moment while the
+cell is narrower than the output spacing, the exact hat-basis projection of its
+own density once it is wider (no `sigma_cap`). Both are serialised in the card,
+a table by reference when it came from an npz that is still on disk and inline
+(zlib'd base64) otherwise. `calibration_studies/zchannel/fsr_table.py` writes
+the tables and `tests/test_zgamma_kernel.py` test 8 is the validation: a table
+of point-like cells reproduces the atom fold matrix to 1e-10 and its pdf to
+7e-13, the mass interpolation converges as the square of the node spacing
+(3.6e-4 / 8.2e-5 / 2.0e-5 / 4.8e-6 at 4 / 2 / 1 / 0.5 GeV; cubic at 4 GeV is
+3.0e-7), and both deposit rules reproduce their own naive transcription
+exactly.
+
 ### The v form
 
 `m_Z` and `Gamma_Z` are fitted in the **v formulation**: the convolution is

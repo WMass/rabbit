@@ -117,6 +117,14 @@ Approximations
   per-atom ``m_lo``/``m_hi`` bands make the kernel piecewise constant in
   ``m_pre``, which is *required* once a lepton ``p_T`` cut is applied (the cut
   removes hard emission at an ``m_pre``-dependent rate).
+  The alternative form -- and the one that has neither discretisation -- is a
+  **kernel table** (:func:`_load_fsr_table`): the cell-integrated probability
+  mass ``K[m_node, u_cell]`` of ``u = -ln(m_post/m_pre)`` on a fixed ``u``
+  grid at a ladder of mass nodes, from which the same constant fold matrix is
+  built one Born column at a time, with the table interpolated in ``m`` at
+  every column (no bands) and each cell deposited by the rule exact for its
+  own width (no ``sigma_cap``); see :meth:`ZGammaLineshape.fsr_matrix_from_table`.
+  Both kinds are passed as ``fsr=`` and dispatched on their keys.
   Without ``fsr`` the provider is the pre-FSR lineshape, and FSR has to be
   supplied as ``MassCFTerm``'s separate additive ``phi_K``.
 * **Acceptance** is *optional* (``acceptance=``): a smooth multiplicative
@@ -228,8 +236,105 @@ def _vinv(v, p):
     return np.exp(v) if p == 1.0 else ((1.0 - p) * v) ** (1.0 / (1.0 - p))
 
 
+#: the arrays of a cell-integrated kernel *table* (see :func:`_load_fsr_table`)
+TABLE_KEYS = ("m_nodes", "u_edges", "K", "u_mean", "p0")
+
+
+def _b64_arrays(d):
+    """``{name: array}`` from the compact base64 form of :func:`_table_config`."""
+    import base64
+    import zlib
+
+    out = {}
+    for k, v in d.items():
+        raw = zlib.decompress(base64.b64decode(v["b64"]))
+        out[k] = np.frombuffer(raw, dtype=np.dtype(v["dtype"])).reshape(v["shape"])
+    return out
+
+
+def _load_fsr_table(tab):
+    """Normalise a cell-integrated kernel table to float64 arrays.
+
+    The table is the ``m``-continuous, atom-free form of the FSR kernel:
+    ``K[i, c]`` is the probability *mass* the kernel puts in the ``u``-cell
+    ``[u_edges[c], u_edges[c+1])`` at the pre-FSR mass ``m_nodes[i]``, with
+    ``u = -ln(m_post/m_pre) >= 0``; ``u_mean[i, c]`` is that cell's first
+    moment ``<u>`` (so a cell narrower than the output grid can be deposited
+    at its mean with the first moment exact), and ``p0[i]`` an optional point
+    mass at ``u = 0`` -- the generator's unradiated fraction for a tabulated
+    Monte-Carlo kernel, zero for the analytic one, whose soft end is an
+    integrable singularity rather than a delta and whose first cell therefore
+    carries it with an exact cell integral.
+
+    Rows are renormalised to ``sum_c K + p0 = 1``, exactly as the atom form
+    renormalises each band.  The kernel is continuous in ``m``: the provider
+    interpolates the rows onto every Born grid point, so there are no bands.
+    """
+    if "b64" in tab:
+        tab = dict(tab, **_b64_arrays(tab["b64"]))
+    m_nodes = np.asarray(tab["m_nodes"], dtype=np.float64).ravel()
+    u_edges = np.asarray(tab["u_edges"], dtype=np.float64).ravel()
+    K = np.asarray(tab["K"], dtype=np.float64)
+    if m_nodes.size < 2 or np.any(np.diff(m_nodes) <= 0):
+        raise ValueError("the FSR table needs >= 2 strictly increasing m_nodes")
+    if u_edges.size < 2 or np.any(np.diff(u_edges) <= 0) or u_edges[0] < 0.0:
+        raise ValueError("u_edges must be strictly increasing and start at u >= 0")
+    if K.shape != (m_nodes.size, u_edges.size - 1):
+        raise ValueError(
+            f"K has shape {K.shape}, expected {(m_nodes.size, u_edges.size - 1)}"
+        )
+    if np.any(K < 0.0):
+        raise ValueError("FSR table cell masses must be non-negative")
+    ucen = 0.5 * (u_edges[:-1] + u_edges[1:])
+    if tab.get("u_mean") is None:
+        u_mean = np.broadcast_to(ucen, K.shape).copy()
+    else:
+        u_mean = np.array(tab["u_mean"], dtype=np.float64)
+        if u_mean.shape != K.shape:
+            raise ValueError("u_mean must have the same shape as K")
+        # empty cells carry no moment; give them the cell centre so that the
+        # m-interpolation of a cell that is empty at one node and filled at the
+        # next cannot place mass outside its own cell
+        bad = ~(np.isfinite(u_mean)) | (K <= 0.0)
+        u_mean = np.where(bad, ucen, u_mean)
+        lo = np.broadcast_to(u_edges[:-1], K.shape)
+        hi = np.broadcast_to(u_edges[1:], K.shape)
+        if np.any((u_mean < lo - 1e-12) | (u_mean > hi + 1e-12)):
+            raise ValueError("u_mean must lie inside its own cell")
+    p0 = (
+        np.zeros(m_nodes.size)
+        if tab.get("p0") is None
+        else np.asarray(tab["p0"], dtype=np.float64).ravel()
+    )
+    if p0.shape != m_nodes.shape or np.any(p0 < 0.0):
+        raise ValueError("p0 must be one non-negative number per m node")
+    tot = K.sum(axis=1) + p0
+    if np.any(tot <= 0.0):
+        raise ValueError("an FSR table row has zero total probability")
+    out = {
+        "kind": "table",
+        "m_nodes": m_nodes,
+        "u_edges": u_edges,
+        "K": K / tot[:, None],
+        "u_mean": u_mean,
+        "p0": p0 / tot,
+    }
+    if tab.get("path"):
+        out["path"] = str(tab["path"])
+    return out
+
+
 def _load_fsr(fsr):
-    """Normalise an FSR-kernel spec to ``{"r", "w", "m_lo", "m_hi"}`` float64.
+    """Normalise an FSR-kernel spec to atoms or to a cell-integrated table.
+
+    Two kinds, dispatched on the keys:
+
+    ``{"r", "w", "m_lo", "m_hi"}``
+        **atoms** -- point masses ``w`` at ``r = m_post/m_pre``, optionally
+        banded in ``m_pre``; see below.
+    ``{"m_nodes", "u_edges", "K", "u_mean", "p0"}``
+        a **table**, :func:`_load_fsr_table`: cell-integrated probability mass
+        on a fixed ``u`` grid at a ladder of ``m`` nodes, continuous in ``m``.
 
     ``fsr`` is either such a mapping (lists accepted) or the path to an npz
     holding those arrays. ``r = m_post / m_pre`` are the kernel's support
@@ -248,8 +353,15 @@ def _load_fsr(fsr):
     at a rate that itself depends on ``m_pre``.
     """
     if isinstance(fsr, str):
+        path = fsr
         with np.load(fsr, allow_pickle=False) as d:
-            fsr = {k: d[k] for k in ("r", "w", "m_lo", "m_hi") if k in d}
+            if "K" in d.files:
+                fsr = {k: d[k] for k in TABLE_KEYS if k in d.files}
+                fsr["path"] = path
+            else:
+                fsr = {k: d[k] for k in ("r", "w", "m_lo", "m_hi") if k in d}
+    if "K" in fsr or "u_edges" in fsr or "b64" in fsr or fsr.get("kind") == "table":
+        return _load_fsr_table(fsr)
     r = np.asarray(fsr["r"], dtype=np.float64).ravel()
     w = np.asarray(fsr["w"], dtype=np.float64).ravel()
     if r.shape != w.shape or r.size == 0:
@@ -377,6 +489,17 @@ class ZGammaLineshape:
         ``s2 = sin2 + sin2_unit * value``. ``None`` (default) keeps it fixed.
     sin2, sin2_unit : float
         Central value and unit of ``sin^2(theta_W)``.
+    fsr_minterp : {"linear", "cubic"}
+        How a ``fsr`` **table** is interpolated across its mass nodes when the
+        fold matrix is built (ignored by the atom kind). Both reproduce a
+        constant exactly, so the cell masses stay normalised; ``"cubic"`` is a
+        natural cubic spline and buys nothing once the nodes are 1 GeV apart.
+    fsr_deposit : {"interp", "mass"}
+        How a table cell narrower than the output grid is deposited:
+        ``"interp"`` (default) folds the piecewise-linear Born density
+        exactly, as the atom form does, and ``"mass"`` conserves the cell's
+        probability exactly instead. See
+        :meth:`ZGammaLineshape.fsr_matrix_from_table`.
     dtype : tf.DType
         Graph dtype (float64 strongly recommended).
     """
@@ -405,6 +528,8 @@ class ZGammaLineshape:
         acceptance=None,
         fsr=None,
         fsr_mmax=None,
+        fsr_minterp="linear",
+        fsr_deposit="interp",
         shape=0,
         shape_window=None,
         vpow=None,
@@ -469,6 +594,13 @@ class ZGammaLineshape:
             raise ValueError("at least one lineshape term must be kept")
         self.acceptance = None if acceptance is None else dict(acceptance)
         self.fsr = None if fsr is None else _load_fsr(fsr)
+        self.fsr_kind = None if self.fsr is None else self.fsr.get("kind", "atoms")
+        if fsr_minterp not in ("linear", "cubic"):
+            raise ValueError("fsr_minterp must be 'linear' or 'cubic'")
+        self.fsr_minterp = fsr_minterp
+        if fsr_deposit not in ("interp", "mass"):
+            raise ValueError("fsr_deposit must be 'interp' or 'mass'")
+        self.fsr_deposit = fsr_deposit
         self.fsr_mmax = None if fsr_mmax is None else float(fsr_mmax)
 
         # ---- mass grid and luminosities (constants) -----------------------
@@ -488,7 +620,12 @@ class ZGammaLineshape:
             m_hi_needed = self.window[1]
         else:
             cap = hi if self.fsr_mmax is None else self.fsr_mmax
-            m_hi_needed = min(self.window[1] / float(self.fsr["r"].min()), cap)
+            r_min = (
+                float(np.exp(-self.fsr["u_edges"][-1]))
+                if self.fsr_kind == "table"
+                else float(self.fsr["r"].min())
+            )
+            m_hi_needed = min(self.window[1] / r_min, cap)
         self.m_hi_born = m_hi_needed
         if self.window[0] < lo - 1e-9 or m_hi_needed > hi + 1e-9:
             raise ValueError(
@@ -535,7 +672,9 @@ class ZGammaLineshape:
         self._acc = None if acc is None else tf.constant(acc, dtype)
         self._build_shape_basis(shape_window)
 
-        if self.fsr is not None:
+        if self.fsr is not None and self.fsr_kind == "table":
+            self._fsr_mat = tf.constant(self.fsr_matrix_from_table(), dtype)
+        elif self.fsr is not None:
             # The fold is linear in the Born density and its coefficients do not
             # depend on any fitted parameter, so it collapses to one constant
             # (nm, n_born) matrix:  p_post = F p_born.  Building F sums the
@@ -673,6 +812,221 @@ class ZGammaLineshape:
         y = y * self._v_jac
         return y / (tf.reduce_sum(y) * self.npdt(self.dv))
 
+    # -- the FSR fold from a kernel table --------------------------------
+    def _table_rows(self, m):
+        """``(K, M1, p0)`` of the kernel table interpolated at masses ``m``.
+
+        ``M1 = K u_mean`` is interpolated rather than ``u_mean`` itself, so
+        that the interpolated cell carries the *mass-weighted* mean of the
+        nodes it came from and stays inside its own cell.  Both rules used
+        here reproduce a constant exactly, so ``sum_c K + p0 = 1`` survives the
+        interpolation at every ``m``; outside the node range the table is
+        continued as a constant (the Born grid runs above the last node only
+        where the density is negligible).
+        """
+        t = self.fsr
+        mn = t["m_nodes"]
+        m = np.clip(np.asarray(m, dtype=np.float64), mn[0], mn[-1])
+        M1 = t["K"] * t["u_mean"]
+        if self.fsr_minterp == "cubic" and mn.size >= 4:
+            from scipy.interpolate import CubicSpline
+
+            out = []
+            for y in (t["K"], M1, t["p0"]):
+                out.append(CubicSpline(mn, y, axis=0)(m))
+            K, M1i, p0 = out
+            # a cubic through a kink can undershoot; the cell masses are a
+            # probability, so clip and count rather than let a negative density
+            # reach the likelihood
+            self.fsr_table_neg = getattr(self, "fsr_table_neg", 0) + int(
+                np.sum(K < 0.0))
+            K = np.maximum(K, 0.0)
+            p0 = np.maximum(p0, 0.0)
+        else:
+            i = np.clip(np.searchsorted(mn, m) - 1, 0, mn.size - 2)
+            f = np.clip((m - mn[i]) / (mn[i + 1] - mn[i]), 0.0, 1.0)[:, None]
+            K = (1.0 - f) * t["K"][i] + f * t["K"][i + 1]
+            M1i = (1.0 - f) * M1[i] + f * M1[i + 1]
+            p0 = (1.0 - f[:, 0]) * t["p0"][i] + f[:, 0] * t["p0"][i + 1]
+        return K, M1i, p0
+
+    def fsr_matrix_from_table(self, chunk=256):
+        """The ``(nm, n_born)`` fold matrix built column by column from the table.
+
+        Column ``b`` holds what a unit of Born probability at ``m_b`` becomes
+        on the output grid, so it is built from the kernel *at that mass* --
+        the table's rows interpolated to ``m_b`` -- and every cell is
+        deposited by the rule that is exact for its own width:
+
+        * **narrower than the output spacing** (``m_b (e^{-u_lo} - e^{-u_hi}) <
+          dm``): a point mass at the cell's own first moment -- which is what
+          the atom form does, except that here the cell is *integrated*, not
+          merged, so the residual is the cell's second moment alone and no
+          ``sigma_cap`` enters.  The unradiated point mass ``p0`` is the same
+          deposit at ``u = 0``, i.e. on the diagonal.  ``fsr_deposit`` picks
+          how it is spread onto the two neighbouring nodes:
+
+          ``"interp"`` (default) uses a tent of half width ``r dm`` and height
+          ``1/r``, which makes the column the exact fold of the piecewise-
+          linear Born density -- identical to the atom form, matrix element by
+          matrix element -- and leaves only its O(dm^2) interpolation error.
+          ``"mass"`` uses the unit-width tent, i.e. splits the mass linearly:
+          the column then sums to the kernel's in-window probability exactly,
+          but sampling a unit-width tent on a grid of spacing ``r dm`` is not a
+          partition of unity and the O(1-r) ripple it leaves in the output
+          density does *not* shrink with ``dm``.  Measured against the exact
+          fold of a 40-atom kernel on the Born spectrum (test 8c): ``"interp"``
+          1.9e-4 / 4.7e-5 / 1.4e-5 at nm = 1024 / 2048 / 4096, ``"mass"``
+          2.3e-3 / 2.7e-3 / 3.4e-3 -- and the largest column excess the other
+          way round, +3e-3 ... +5e-3 against 4e-16.
+        * **wider** -- the tail, where the output grid resolves the kernel --
+          the cell's mass spread over its own width in ``m'``, projected onto
+          the hat basis exactly: ``int rho lambda_i``, which is the second
+          difference at the nodes of the twice-integrated density.  That keeps
+          both the mass and the position exact however the cell edges fall
+          between the nodes; reading the density off at the nodes instead
+          misplaces a cell only one grid spacing wide by up to ``dm/2``, which
+          is what makes a fit drift with the cell count (0.22 MeV of ``m_Z``
+          between 1000 and 4000 cells).
+
+        The two branches meet where a cell is exactly one grid spacing wide,
+        where they agree.  Mass that leaves the output window is dropped, as in
+        the atom form -- so a column sums to the kernel's in-window probability
+        and not to 1; :meth:`fsr_column_mass` checks it against the table.
+        """
+        u_edges = self.fsr["u_edges"]
+        eu = np.exp(-u_edges[::-1])  # cell edges / m_pre, ASCENDING in m'
+        # a cell's width in m', per unit of pre-FSR mass.  NOT monotone in c:
+        # the cells grow in u while e^{-u} shrinks, so the narrow/wide split is
+        # a mask and not a cut.
+        dwid = eu[::-1][:-1] - eu[::-1][1:]
+        ucen = 0.5 * (u_edges[:-1] + u_edges[1:])
+        ncell = u_edges.size - 1
+        dm, m0, nm = self.dm, self.window[0], self.nm
+        # the output nodes plus one guard on each side, for the second
+        # difference of the wide branch
+        xs = m0 + dm * np.arange(-1, nm + 1)
+        F = np.zeros((nm, self.n_born))
+        self.fsr_table_neg = 0
+        for c0 in range(0, self.n_born, chunk):
+            cols = slice(c0, min(c0 + chunk, self.n_born))
+            mb = self.m_born[cols]
+            K, M1, p0 = self._table_rows(mb)
+            # an EMPTY cell keeps its centre, and every mean is held inside its
+            # own cell: a cell must never deposit outside itself
+            U = np.where(K > 0.0, M1 / np.where(K > 0.0, K, 1.0), ucen)
+            U = np.clip(U, u_edges[:-1], u_edges[1:])
+            buf = np.zeros((mb.size, nm + 2))
+            for j in range(mb.size):
+                m = mb[j]
+                # an empty cell deposits nothing either way; leaving them out
+                # is what lets a table of point-like cells (an atom set) go
+                # entirely down the narrow branch
+                full = K[j] > 0.0
+                wide = full & (dwid >= dm / m)
+                nar = np.flatnonzero(full & ~wide)
+                # ---- narrow cells and the unradiated point mass ----------
+                x = np.empty(nar.size + 1)
+                v = np.empty(nar.size + 1)
+                x[:-1] = m * np.exp(-U[j, nar])
+                v[:-1] = K[j, nar]
+                x[-1] = m
+                v[-1] = p0[j]
+                s = (x - m0) / dm
+                i0 = np.floor(s).astype(np.int64)
+                f = s - i0
+                ok = (v > 0.0) & (i0 >= -1) & (i0 < nm)
+                i0, f, v, rr = i0[ok], f[ok], v[ok], (x[ok] / m)
+                idx = np.concatenate([i0, i0 + 1])
+                # F maps nodal DENSITIES to nodal densities: the dm of the Born
+                # cell's mass cancels the 1/dm that turns the deposited mass
+                # back into a density.
+                if self.fsr_deposit == "mass":
+                    val = np.concatenate([v * (1.0 - f), v * f])
+                else:
+                    # the same point mass spread by a tent of half width
+                    # `r dm` and height `1/r` instead of `dm` and 1: the fold
+                    # is then the EXACT fold of the piecewise-linear Born
+                    # density, which is what the atom form computes, and the
+                    # O(dm^2) interpolation error is all that is left.  The
+                    # unit-width tent conserves the mass exactly instead, but
+                    # sampling it on a grid of spacing `r dm` is not a
+                    # partition of unity, and the O(1-r) ripple that leaves in
+                    # the OUTPUT density does not go away with dm.
+                    val = np.concatenate([
+                        v / rr * np.maximum(1.0 - f / rr, 0.0),
+                        v / rr * np.maximum(1.0 - (1.0 - f) / rr, 0.0),
+                    ])
+                keep = (idx >= 0) & (idx < nm)
+                if keep.any():
+                    buf[j, :nm] += np.bincount(
+                        idx[keep], val[keep], minlength=nm
+                    )[:nm]
+                # ---- wide cells: the exact projection of their density --
+                # Each carries its mass spread over its own width; the deposit
+                # onto node i is the hat-basis projection int rho lambda_i,
+                # which twice-integrating by parts turns into the second
+                # difference of N = int int rho at the nodes.  Two cumulative
+                # sums and one searchsorted per column, no per-cell loop, and
+                # no assumption that the wide cells are contiguous: a narrow
+                # cell simply contributes no density (it is a point mass
+                # above) and M is flat across it.
+                if not wide.any():
+                    continue
+                A = np.where(wide, K[j], 0.0)[::-1]
+                E = m * eu
+                cumM = np.concatenate([[0.0], np.cumsum(A)])
+                wd = np.diff(E)
+                cumN = np.concatenate(
+                    [[0.0], np.cumsum(0.5 * (cumM[:-1] + cumM[1:]) * wd)])
+                k = np.clip(np.searchsorted(E, xs, "right") - 1, 0, ncell - 1)
+                dx = xs - E[k]
+                N = np.where(
+                    xs <= E[0],
+                    0.0,
+                    np.where(
+                        xs >= E[-1],
+                        cumN[-1] + (xs - E[-1]) * cumM[-1],
+                        cumN[k] + cumM[k] * dx
+                        + A[k] * dx * dx
+                        / (2.0 * np.where(wd[k] > 0.0, wd[k], 1.0)),
+                    ),
+                )
+                buf[j, :nm] += (N[2:] - 2.0 * N[1:-1] + N[:-2]) / dm
+            F[:, cols] = buf[:, :nm].T
+        return F
+
+    def fsr_column_mass(self):
+        """``(got, want)``: the probability each fold column puts in the window.
+
+        ``got`` is ``sum_i F[i, b] dm``, ``want`` the same number read off the
+        table itself (the kernel's mass between ``m_lo/m_b`` and ``1``, with
+        the part of a straddling cell taken by its own density).  Their
+        difference is the fold's discretisation error, and it is the
+        normalisation check of the table path: for a column whose whole
+        support is inside the window both are 1.
+        """
+        if self.fsr_kind != "table":
+            raise ValueError("fsr_column_mass is for the table kind")
+        F = self._fsr_mat.numpy()
+        got = F.sum(axis=0)
+        t = self.fsr
+        u_edges = t["u_edges"]
+        K, _, p0 = self._table_rows(self.m_born)
+        want = np.empty(self.n_born)
+        for b, m in enumerate(self.m_born):
+            # the cell fractions that fall inside [window[0], m_grid[-1]]
+            u_hi = np.log(m / max(self.window[0], 1e-12))
+            u_lo = np.log(m / self.m_grid[-1]) if m > self.m_grid[-1] else 0.0
+            frac = np.clip(
+                (np.minimum(u_edges[1:], u_hi) - np.maximum(u_edges[:-1], u_lo))
+                / np.diff(u_edges),
+                0.0,
+                1.0,
+            )
+            want[b] = K[b] @ frac + (p0[b] if u_lo <= 0.0 else 0.0)
+        return got, want
+
     def _acceptance_on(self, m):
         """The acceptance factor ``A(m)`` on masses ``m``, or ``None``.
 
@@ -799,9 +1153,13 @@ class ZGammaLineshape:
                     for k, v in self.acceptance.items()
                 }
             ),
+            "fsr_minterp": self.fsr_minterp,
+            "fsr_deposit": self.fsr_deposit,
             "fsr": (
                 None
                 if self.fsr is None
+                else self._table_config()
+                if self.fsr_kind == "table"
                 else {
                     "r": self.fsr["r"].tolist(),
                     "w": self.fsr["w"].tolist(),
@@ -814,12 +1172,39 @@ class ZGammaLineshape:
             ),
         }
 
+    def _table_config(self):
+        """The kernel table as JSON: by reference if it has a file, else inline.
+
+        A 4000-cell x 300-node table is 19 MB of float64 (``K`` and
+        ``u_mean``), which as JSON numbers would be ~150 MB of card, so the
+        inline form is zlib'd base64 -- 4.7 MB for that size, and the arrays
+        come back bit-identical.  When the table was loaded from an npz that is
+        still on disk the card carries the path instead and stays small.
+        """
+        import base64
+        import zlib
+
+        t = self.fsr
+        if t.get("path") and os.path.exists(t["path"]):
+            return {"kind": "table", "path": t["path"]}
+        b64 = {}
+        for k in TABLE_KEYS:
+            a = np.ascontiguousarray(t[k], dtype=np.float64)
+            b64[k] = {
+                "dtype": "float64",
+                "shape": list(a.shape),
+                "b64": base64.b64encode(zlib.compress(a.tobytes(), 6)).decode(),
+            }
+        return {"kind": "table", "b64": b64}
+
     @classmethod
     def from_config(cls, cfg, dtype=tf.float64):
         cfg = dict(cfg)
         cfg.pop("type", None)
         f = cfg.get("fsr")
-        if isinstance(f, dict) and "m_hi" in f:
+        if isinstance(f, dict) and f.get("kind") == "table":
+            cfg["fsr"] = f["path"] if "path" in f else dict(f)
+        elif isinstance(f, dict) and "m_hi" in f:
             f = dict(f)
             f["m_hi"] = [np.inf if v is None else float(v) for v in f["m_hi"]]
             cfg["fsr"] = f
