@@ -35,38 +35,24 @@ class ParamModel:
         # self.prior_means  = # np.ndarray, shape (nparams,). Optional; defaults
         #                     # to self.xparamdefault when not provided.
         #
-        # # optional: how this model's POIs should be BLINDED.
-        # # rabbit blinds a POI MULTIPLICATIVELY (poi * exp(N(0, 5))), which is
-        # # the right choice for the default `Mu`: a signal strength centred at
-        # # 1 that scales YIELDS, so any value it is handed is still evaluable
-        # # and positivity is preserved.
+        # # optional: declare that this model's POIs are NOT results and must
+        # # never be blinded -- auxiliary parameters that absorb something
+        # # rather than quantities anyone is keeping from the analyst.
+        # # SaturatedProjectModel's per-bin scales are the case this exists
+        # # for: they would be blinded only as a side effect of sharing a POI
+        # # block with the analysis model, and a blinded bin scale does not
+        # # open at the 1.0 the saturated test requires of it.
         # #
-        # # It is the wrong choice for a POI that is a PHYSICAL parameter fed
-        # # into a calculation with a restricted domain. Two things go wrong:
-        # # the calculation can be asked for a value it cannot evaluate, and --
-        # # because the reported coordinate is then poi_true / offset -- the
-        # # curvature scales as offset^2, so the reported SIGMA, the POI row of
-        # # the covariance and every impact on that POI are all divided by the
-        # # random factor. Only the RELATIVE uncertainty survives.
-        # #
-        # # Setting this to True switches the model's POIs to ADDITIVE
-        # # blinding, the same form rabbit already uses for nuisances of
-        # # interest. The offset is the same N(0, 5) draw, applied in the
-        # # parameter's OWN fit units. Because d(model)/d(internal) = 1 for a
-        # # translation, the covariance, the uncertainties and the impacts come
-        # # out EXACTLY unblinded while the central value is still hidden --
-        # # which is the point.
-        # #
-        # # Requires allowNegativeParam=True: with the squared storage an
-        # # additive offset could hand compute() a negative value, destroying
-        # # the only guarantee that branch provides (the Fitter raises).
-        # self.blind_additive = # bool, default False.
+        # # CompositeParamModel turns the declarations of its submodels into
+        # # `blind_exempt_params`, the NAMES of the exempt parameters, because
+        # # the Fitter resolves blinding by name and names survive the POI-block
+        # # permutation that indices would not.
+        # self.blind_exempt = # bool, default False.
         #
-        # # optional: the SCALE of that additive draw, in the POI's own units.
-        # # Unlike the multiplicative form, additive blinding is NOT scale
-        # # free: exp(N(0, 5)) spans e^+-10 whatever the POI means, but
-        # # + N(0, 5) is an absolute shift, so how well it hides depends on
-        # # the units. A POI whose uncertainty is O(1) in its fit units is
+        # # optional: the SCALE of the blinding draw, in the POI's own units.
+        # # The draw is an absolute shift, so unlike a multiplicative factor it
+        # # is NOT scale free: how well it hides depends on the parameter's
+        # # units. A POI whose uncertainty is O(1) in its fit units is
         # # offset by well under a sigma and is effectively unblinded.
         # #
         # # The model is the only thing that knows its own units, so it
@@ -252,58 +238,38 @@ class CompositeParamModel(ParamModel):
                 + [v[m.npoi :] for v, m in zip(means, param_models)]
             )
 
-        # Blinding form: a boolean, so unlike prior_sigmas there is no index
-        # permutation to track. Any submodel asking for additive blinding makes
-        # the composite additive -- the composite's POI block is the
-        # concatenation of the submodels' POIs, and mixing forms within one POI
-        # block is exactly what the Fitter refuses for a blinding group.
-        #
-        # "Any one makes all" is a policy the caller did not necessarily ask
-        # for, so SAY SO rather than infer it silently: a submodel that
-        # declared the multiplicative form gets the additive one, and the only
-        # other way to notice would be to read this line. Not a refusal (the
-        # way allowNegativeParam above is), because refusing would block the
-        # legitimate composition this exists for -- an additively blinded
-        # physical POI alongside a default signal strength, which is exactly a
-        # mix. The override is safe there: both forms hide the value, and the
-        # dangerous mix (an additive offset reaching a squared POI) is already
-        # refused by the Fitter.
-        # Only POI-carrying submodels vote: the form governs the POI block, so a
-        # submodel with no POIs flipping the whole composite (and then being
-        # named as the reason) would be misleading.
-        additive_models = [
-            type(m).__name__
+        # Parameters no submodel wants blinded. Names rather than indices: the
+        # Fitter resolves blinding by name, and names survive the POI-block
+        # permutation that indices would not.
+        exempt = [
+            m.params[: m.npoi]
             for m in param_models
-            if m.npoi > 0 and getattr(m, "blind_additive", False)
+            if m.npoi > 0 and getattr(m, "blind_exempt", False)
         ]
-        if additive_models:
-            self.blind_additive = True
-            overridden = [
-                type(m).__name__
-                for m in param_models
-                if m.npoi > 0 and not getattr(m, "blind_additive", False)
-            ]
-            if overridden:
-                logger.info(
-                    "CompositeParamModel: blinding form set to ADDITIVE for the whole "
-                    f"POI block because {additive_models} declared blind_additive=True; "
-                    f"this overrides the (default multiplicative) form of {overridden}."
-                )
+        if exempt:
+            self.blind_exempt_params = np.concatenate(exempt)
 
-            # The SCALE, unlike the form, is per-parameter units -- so it is
-            # carried as a per-POI VECTOR rather than reduced to one composite
-            # value. Each submodel contributes its own declaration over its own
-            # POI slice and there is no "any one wins" rule to get wrong, which
-            # is the same treatment prior_sigmas gets above. A composite of
-            # composites therefore works too: the vector is itself a legal
-            # declaration.
-            #
-            # Dropping this is NOT a benign default: the Fitter reads the scale
-            # off its effective model, so a submodel declaring scale=7 would
-            # blind at scale=1 the moment it is composited -- silently, and in
-            # the under-blinding direction. The weak-blinding warning cannot
-            # backstop it, because an additively blinded POI is typically free
-            # and so has no prefit sigma to compare against.
+        # The blinding SCALE is in each parameter's own fit units, so it is
+        # carried as a per-POI VECTOR rather than reduced to one composite
+        # value. Each submodel contributes its own declaration over its own POI
+        # slice, which is the same treatment prior_sigmas gets above, and a
+        # composite of composites works because the vector is itself a legal
+        # declaration.
+        #
+        # Dropping this is NOT a benign default: the Fitter reads the scale off
+        # its effective model, so a submodel declaring scale=7 would blind at
+        # scale=1 the moment it is composited -- silently, and in the
+        # under-blinding direction. The weak-blinding check would catch it after
+        # the fit, since it measures against the postfit sigma, but only after a
+        # run has already been spent -- propagating the declaration is what
+        # keeps the offset right the first time.
+        # Guarded on npoi: with every submodel POI-less the comprehension below
+        # is empty and np.concatenate raises. That composition is supported and
+        # reached from the CLI -- load_models builds a composite straight from
+        # --paramModel, and the whole ABCD family is POI-less -- and it has no
+        # POI block to scale in the first place. The Fitter falls back to 1.0
+        # through getattr when the attribute is absent.
+        if self.npoi:
             self.blind_additive_scale = np.concatenate(
                 [
                     np.broadcast_to(
@@ -596,6 +562,13 @@ class SaturatedProjectModel(ParamModel):
         # so compute() squares it here instead. See the class docstring: the
         # bin scales are positive in BOTH branches, only the owner of the
         # transform differs.
+        # The bin scales are the saturated test's own machinery, not a
+        # measurement: there is nothing in them to hide. Say so, because
+        # compositing them with a blinded analysis model would otherwise blind
+        # them too, and a blinded bin scale does not open at 1.0 -- which is
+        # exactly what the warm start in rabbit_fit.py requires of it.
+        self.blind_exempt = True
+
         self._square_internally = bool(allowNegativeParam)
 
         # x -> x**2 in either branch, so the model is never linear in its

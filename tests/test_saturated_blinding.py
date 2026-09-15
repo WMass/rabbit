@@ -4,25 +4,19 @@ Two properties of ``save_hists`` in ``bin/rabbit_fit.py``, both of which failed
 silently before the commits this file ships with.
 
 1. THE SATURATED FIT MUST NOT UNBLIND ITSELF. The composite re-init recreates
-   the offset Variables at the composite size, which creates them at the
-   IDENTITY. Nothing re-armed them, so the saturated fit ran in an unblinded
+   the offset Variables at the composite size, which creates them at zero.
+   Nothing re-armed them, so the saturated fit ran in an unblinded
    frame and wrote the ORIGINAL model's POI in the clear into
    ``results[...]["saturated_fit"]["parms"]`` -- an analysis asking for this
    test on data was unblinding itself in its own output file.
 
-2. THE WARM START MUST ACTUALLY LAND ON THE MAIN FIT'S LOSS. Arming is what
-   makes that non-trivial: ``init_blinding_values`` blinds EVERY POI of the
-   composite, and the saturated bin scales are POIs of the composite. They are
-   not among the three blocks the warm start copies, so they keep ``x0default``
-   -- and unless arming reframes ``x`` they come out of ``get_poi()`` as
-   ``1 * exp(N(0, 5))`` rather than 1. The composite then opens millions of
-   units above the main fit and ``q = 2*(NLL_main - NLL_sat)`` starts hugely
-   NEGATIVE, which is not a deviance.
-
-   The ``Mu`` case below is the one that matters: it is MULTIPLICATIVELY
-   blinded, which is the default and the form the reframing had to be extended
-   to cover. Measured on this toy before that extension: scales spanning
-   3.9e-04 to 1.1e+04, and q = -3.3e+07.
+2. THE WARM START MUST ACTUALLY LAND ON THE MAIN FIT'S LOSS. The saturated
+   bin scales are POIs of the composite and are not among the three blocks the
+   warm start copies, so they keep ``x0default``. They come out of
+   ``get_poi()`` as 1 only because ``SaturatedProjectModel`` declares them
+   ``blind_exempt`` -- they are the test's own machinery, not a result, so they
+   are never offset. Blind them and the composite opens far above the main fit
+   and ``q = 2*(NLL_main - NLL_sat)`` starts NEGATIVE, which is not a deviance.
 
 Every check is an INVARIANCE or a guard, and each one asserts that blinding is
 genuinely armed first, so none of them can pass vacuously through an
@@ -95,7 +89,7 @@ def path():
 
 
 def build_main(path, do_blinding=True):
-    """A plain ``Mu``: the default model, multiplicatively blinded."""
+    """A plain ``Mu``: the default model, with squared storage."""
     ind = inputdata.FitInputData(path)
     model = pm.Mu(ind)
     f = fitter.Fitter(ind, model, make_options(), do_blinding=do_blinding)
@@ -140,7 +134,7 @@ def build_saturated(f, blind, rearm=True):
 
 def _armed(f):
     """Is this fitter's frame actually offset? Guards every test below."""
-    return not np.allclose(f._blinding_offsets_poi.numpy(), 1.0, rtol=0, atol=1e-12)
+    return not np.allclose(f._blinding_offsets_poi_add.numpy(), 0.0, rtol=0, atol=1e-12)
 
 
 # --- 1. the leak --------------------------------------------------------------
@@ -191,15 +185,16 @@ def test_original_poi_is_written_blinded(path):
     assert not np.allclose(x_stored, poi_physical, rtol=0, atol=1e-12)
 
 
-# --- 2. the warm start, which arming is what makes non-trivial -----------------
+# --- 2. the warm start, which blinding is what makes non-trivial ---------------
 
 
 def test_bin_scales_are_one_after_the_warm_start(path):
-    """The saturated slots are blinded POIs the warm start never copies, so this
-    holds only because arming reframes ``x`` to keep the physical point."""
+    """The warm start never copies the saturated slots, so this holds only
+    because they are never offset -- SaturatedProjectModel declares them
+    blind_exempt, so they keep the 1.0 their default stores."""
     _, orig, f = build_main(path)
     _, _, composite, fs = build_saturated(f, blind=True)
-    assert _armed(fs), "vacuous: nothing is blinded, so nothing had to be reframed"
+    assert _armed(fs), "vacuous: nothing is blinded at all in this fitter"
 
     scales = fs.get_poi().numpy()[orig.npoi : composite.npoi]
     assert scales.shape == (NBINS,)

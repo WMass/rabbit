@@ -474,23 +474,15 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 fitter_saturated.xdefaultassign()
 
                 # RE-ARM BLINDING. init_fit_parms() above re-created the offset
-                # Variables at the composite size, which creates them at the
-                # IDENTITY -- offsets_poi = 1, offsets_poi_add = 0 -- and
-                # nothing armed them again. So the saturated fit ran in an
-                # UNBLINDED frame and wrote an unblinded POI into
+                # Variables at the composite size, which creates them at zero,
+                # and nothing armed them again. So the saturated fit would run
+                # in an UNBLINDED frame and write an unblinded POI into
                 # results[...]["saturated_fit"]["parms"], silently unblinding
                 # any analysis that asked for this test.
                 #
-                # Arm BEFORE touching x: set_blinding_offsets holds the
-                # PHYSICAL point fixed for both offset forms, so arming has to
-                # precede any assignment to x.
-                #
-                # The warm start below depends on that, and not via the
-                # analysis POI -- via the SATURATED bin scales, which are POIs
-                # of the composite and so are blinded along with everything
-                # else. Reframed, they stay at their physical default of 1;
-                # unreframed they land at 1 * exp(N(0, 5)) and the composite
-                # opens millions of units above the main fit. Pinned by
+                # The bin scales are unaffected either way: SaturatedProjectModel
+                # declares them blind_exempt, so they are never offset and open
+                # at the 1.0 the warm start below requires. Pinned by
                 # tests/test_saturated_blinding.py.
                 if fitter_saturated.do_blinding:
                     fitter_saturated.set_blinding_offsets(blind=blind)
@@ -516,8 +508,7 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 # entries copy verbatim without a frame conversion. That rests
                 # on the two fitters offsetting each shared parameter name
                 # IDENTICALLY: the draw is seeded by name, and
-                # CompositeParamModel propagates both the blinding form and its
-                # per-POI scale, so the composite reproduces the analysis
+                # CompositeParamModel propagates the per-POI blinding scale, so the composite reproduces the analysis
                 # model's offsets on the analysis model's slice. If a submodel
                 # declaration were ever dropped in that propagation the copied
                 # x would land at a different PHYSICAL point and the loss
@@ -709,6 +700,12 @@ def fit(args, fitter, ws, dofit=True):
         or args.externalPostfit is None
         or not getattr(fitter, "external_cov_loaded", False)
     ):
+        if args.noEDM and fitter.do_blinding:
+            logger.info(
+                "Not checking whether the blinding is wide enough to hide the "
+                "POIs: that needs the parameter uncertainties, and --noEDM "
+                "computes neither the covariance nor its POI rows."
+            )
         if not args.noEDM and not args.noHessian:
             # compute the covariance matrix and estimated distance to minimum
             _, grad, hess = fitter.loss_val_grad_hess()
@@ -787,6 +784,14 @@ def fit(args, fitter, ws, dofit=True):
             for k, i in enumerate(poi_noi_idx):
                 parms_variances_np[int(i)] = cov_rows[k, int(i)]
             parms_variances = tf.constant(parms_variances_np, dtype=fitter.indata.dtype)
+
+    # Whether the blinding actually hid anything can only be judged against the
+    # measured uncertainty. Both branches above leave it in parms_variances --
+    # the full diagonal with a Hessian, the POI and NOI entries alone under
+    # --noHessian, which is all this needs -- so the check costs nothing and
+    # works in either. Entries left NaN are skipped.
+    if fitter.do_blinding:
+        fitter.warn_if_blinding_is_weak(parms_variances)
 
     nllvalreduced = fitter.reduced_nll().numpy()
 

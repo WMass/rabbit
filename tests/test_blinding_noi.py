@@ -1,31 +1,31 @@
-"""A blinded NUISANCE OF INTEREST must also keep its declared start point.
+"""A blinded NUISANCE OF INTEREST is offset the same way a POI is.
 
-Third instance of the same start-point bug. ``self.x`` is initialised to
-``x0default``, i.e. in the UNBLINDED frame, so arming the offsets moves the
-PHYSICAL point unless ``x`` is compensated. The additive POI slots are
-compensated; the multiplicative POI slots were not (see
-tests/test_blinding_multiplicative.py) and neither was the THETA block, so a
-blinded fit opened every nuisance of interest at ``theta0default + N(0, 5)``
-instead of at its declared centre. For a ``--poiAsNoi`` analysis that parameter
-is the physics result itself.
+``self.x`` is initialised to ``x0default``, i.e. in the UNBLINDED frame, and
+arming is NOT compensated: it assigns the offsets and leaves ``x`` alone, so an
+armed fit opens every nuisance of interest at ``theta0default + offset`` rather
+than at its declared centre. That is deliberate -- compensating would set ``x``
+from ``x0default`` and the offsets, and ``x0default`` is public, so the offset
+would be one subtraction away from any prefit coordinate that is written or
+inspected. See ``set_blinding_offsets``.
 
-THE FORMULA, DERIVED FROM THE CODE. ``get_theta`` is
+For a ``--poiAsNoi`` analysis the offset nuisance IS the physics result, which
+is why the theta block gets the same treatment as the POI block and is tested
+as carefully.
+
+THE FORM, FROM THE CODE. ``get_theta`` is
 
     theta_physical = theta_stored + add
 
-with NO transform in front of it -- unlike ``get_poi``, whose squaring branch is
-what forces a square root there -- and no multiplicative offset exists for
-nuisances at all. So the frame-preserving update is the plain additive shift
-
-    theta -> theta + (add_old - add_new),
-
-the same form the additive POI slots already used. No square root, no ratio.
+with no transform in front of it, unlike ``get_poi``, whose squaring branch
+applies after the offset. Only nuisances OF INTEREST carry a non-zero offset --
+``init_blinding_values`` loops over ``indata.noiidxs`` -- so an ordinary
+constrained nuisance is untouched.
 
 THE CONSTRAINT TERM IS THE THING TO GET RIGHT. ``_compute_lc`` penalises
-``get_x() - self.x0``: both sides are in the MODEL frame, and ``x0`` must not be
-shifted. Holding ``theta_physical`` fixed therefore leaves the penalty's value
-AND its minimum exactly where they were -- which is checked here for a
-constrained NOI, not assumed.
+``get_x() - self.x0``: both sides are in the MODEL frame, and ``x0`` is not
+shifted. The armed run therefore opens with a non-zero prior penalty, measured
+here rather than hidden, and the MINIMUM is unmoved -- which is what matters
+and is checked, not assumed.
 
 Every check is an INVARIANCE or an idempotence, so no test prints, returns or
 asserts on an offset value.
@@ -73,7 +73,7 @@ class OnePoiModel(NoPoiModel):
     """A POI alongside the NOI, so the two blocks cannot be confused.
 
     The POI block sits at [0, npoi) and the theta block at [nparams, ...), with
-    the ParamModel's own nuisances in between; a reframe that got the offsets
+    the ParamModel's own nuisances in between; an offset vector that got the
     crossed would show up here and not in the npoi = 0 case.
     """
 
@@ -97,7 +97,7 @@ def make_tensor(path, constrained=True):
     """One NOI (constrained or not) plus one ordinary constrained nuisance.
 
     The ordinary one is the control: ``init_blinding_values`` only offsets
-    ``indata.noiidxs``, so it must come out of every reframe untouched.
+    ``indata.noiidxs``, so an ordinary nuisance must never be offset.
     """
     np.random.seed(1234)
     ax = hist.axis.Regular(20, -5, 5, name="x")
@@ -197,32 +197,41 @@ def _blinded(f):
 
 
 @pytest.mark.parametrize("model_cls", [NoPoiModel, OnePoiModel])
-def test_physical_start_invariant_under_arming(path, model_cls):
-    """The fit must open where the card said, not at theta0default + offset.
+def test_arming_does_not_move_the_coordinate(path, model_cls):
+    """Arming assigns offsets and leaves ``x`` alone.
 
-    Fails before the fix by the offset itself, drawn from N(0, 5) -- up to ~15
-    prior widths for a constrained NOI, and for --poiAsNoi that is the physics
-    parameter.
+    The physical NOI therefore DOES move, by the drawn offset. That is the
+    accepted cost: compensating it would write the offset into ``x``, where the
+    public theta0default recovers it by subtraction.
     """
     f = build(path, model_cls)
-    assert np.isclose(_theta(f), THETA_START, rtol=0, atol=1e-12)
+    x_before = f.x.numpy().copy()
+    theta_before = _theta(f)
 
     f.set_blinding_offsets(True)
     assert _blinded(f), "vacuous: this NOI was not blinded"
-    assert np.isclose(
-        _theta(f), THETA_START, rtol=1e-12, atol=0
-    ), f"arming moved the physical NOI from {THETA_START} to {_theta(f)}"
+
+    np.testing.assert_array_equal(f.x.numpy(), x_before)
+    assert not np.isclose(
+        _theta(f), theta_before, rtol=1e-9
+    ), "the physical NOI did not move, so nothing was actually armed"
 
 
 def test_npoi_zero_is_covered(path):
-    """The old xdefaultassign guard was `do_blinding and npoi`, so a model with
-    npoi = 0 -- the --poiAsNoi shape -- skipped the reframe entirely."""
+    """The --poiAsNoi shape, where the parameter of interest is a nuisance.
+
+    npoi = 0 means the POI block is empty and everything rides on the theta
+    offsets, so it is the configuration most easily missed by code that reaches
+    for the POI block first.
+    """
     f = build(path, NoPoiModel)
     assert f.param_model.npoi == 0
+    x_before = f.x.numpy().copy()
     f.set_blinding_offsets(True)
     f.xdefaultassign()
     assert _blinded(f)
-    assert np.isclose(_theta(f), THETA_START, rtol=1e-12, atol=0)
+    np.testing.assert_array_equal(f.x.numpy(), x_before)
+    assert not np.isclose(_xtheta(f), _theta(f), rtol=0, atol=1e-9)
 
 
 def test_theta_is_still_blinded(path):
@@ -234,7 +243,7 @@ def test_theta_is_still_blinded(path):
 
 
 def test_ordinary_nuisance_is_untouched(path):
-    """Only nuisances of interest are offset, so only they may be reframed."""
+    """Only nuisances of interest are offset; an ordinary one is untouched."""
     f = build(path, NoPoiModel)
     j = f.param_model.nparams + _iother(f)
     before = float(f.x[j].numpy())
@@ -245,7 +254,7 @@ def test_ordinary_nuisance_is_untouched(path):
 
 @pytest.mark.parametrize("model_cls", [NoPoiModel, OnePoiModel])
 def test_arming_is_idempotent(path, model_cls):
-    """A second arm must reframe by exactly 0, on x as well as on get_theta."""
+    """A second arm must change nothing, on x or on get_theta."""
     f = build(path, model_cls)
     f.set_blinding_offsets(True)
     x_once = f.x.numpy().copy()
@@ -269,25 +278,25 @@ def test_disarming_returns_to_the_starting_coordinate(path, model_cls):
 
 
 @pytest.mark.parametrize("model_cls", [NoPoiModel, OnePoiModel])
-def test_defaultassign_lands_on_the_default_while_armed(path, model_cls):
-    """xdefaultassign must reframe the theta block too.
+def test_defaultassign_lands_on_x0default_whether_armed_or_not(path, model_cls):
+    """The stored start must not depend on whether the offsets happen to be armed.
 
-    The driver calls defaultassign() once per (pseudo)data set and from the
-    second set onwards the offsets are still armed from the previous one; the
-    toy-throw path calls xdefaultassign() armed for the same reason.
+    The driver calls defaultassign() once per (pseudo)data set and the offsets
+    are still armed from the previous one, so a stored start that differed
+    between the two would expose the offset as a difference between sets.
     """
     f = build(path, model_cls)
+    f.defaultassign()
+    disarmed = f.x.numpy().copy()
+
     f.set_blinding_offsets(True)
     assert _blinded(f)
-
     f.defaultassign()
-    assert np.isclose(_theta(f), THETA_START, rtol=1e-12, atol=0)
-    f.set_blinding_offsets(True)
-    assert np.isclose(_theta(f), THETA_START, rtol=1e-12, atol=0)
+    np.testing.assert_array_equal(f.x.numpy(), disarmed)
 
     f.set_blinding_offsets(True)
     f.xdefaultassign()
-    assert np.isclose(_theta(f), THETA_START, rtol=1e-12, atol=0)
+    np.testing.assert_array_equal(f.x.numpy(), disarmed)
 
 
 # --- the constraint term -----------------------------------------------------
@@ -303,14 +312,19 @@ def test_x0_untouched_by_arming(path):
     np.testing.assert_array_equal(before, f.x0.numpy())
 
 
-def test_constraint_penalty_at_the_declared_start_is_zero(path):
-    """A constrained NOI opening at its own constraint centre costs nothing.
+def test_arming_costs_prefit_penalty_but_does_not_move_the_minimum(path):
+    """The price of the uncompensated start, stated rather than hidden.
 
-    Before the fix the armed fit opened at theta0default + offset and carried
-    0.5*offset**2 of prefit penalty -- on average 12.5 for offset ~ N(0, 5) --
-    which is pure noise added to the prefit NLL of every blinded analysis.
-    Compare armed against disarmed rather than asserting an absolute value, so
-    the check does not depend on the rest of the likelihood.
+    Armed, the run opens at theta0default while the CONSTRAINT still compares
+    the physical theta0default + offset against x0, so it carries
+    0.5*cw*offset**2 of prefit penalty -- on average 12.5 per blinded NOI for
+    offset ~ N(0, 5). That is real: the prefit NLL of a blinded run is not the
+    prefit NLL of an unblinded one, and with many blinded NOIs the minimiser
+    starts from a correspondingly worse point.
+
+    It is accepted because it does not move the answer -- see
+    test_constrained_minimum_is_not_moved, which is the assertion that matters.
+    Compensating it away would mean writing the offset into x.
     """
     f_ref = build(path, NoPoiModel)
     asimov = f_ref.expected_yield()
@@ -323,14 +337,15 @@ def test_constraint_penalty_at_the_declared_start_is_zero(path):
     f.set_nobs(asimov)
     lc_armed = float(f._compute_lc().numpy())
 
-    assert np.isclose(lc_armed, lc_disarmed, rtol=0, atol=1e-9)
+    off = float(f._blinding_offsets_theta[_inoi(f)].numpy())
+    assert np.isclose(lc_armed - lc_disarmed, 0.5 * off**2, rtol=1e-6, atol=1e-9)
 
 
 @pytest.mark.parametrize("constrained", [True, False])
 def test_constrained_minimum_is_not_moved(path, path_unconstrained, constrained):
     """The fit must land on the same PHYSICAL NOI armed or disarmed.
 
-    This is the real question about the constraint term: the reframing may move
+    This is the real question about the constraint term: arming moves
     the coordinate but must not move where the likelihood-plus-prior is
     minimised. Run it for a constrained NOI and for a free one, since only the
     former has a prior to move.
@@ -352,44 +367,8 @@ def test_constrained_minimum_is_not_moved(path, path_unconstrained, constrained)
     assert np.isclose(_theta(f), theta_disarmed, rtol=0, atol=1e-6)
 
 
-def test_loss_is_the_same_armed_and_disarmed(path):
-    """Blinding is a reparametrisation: at the same PHYSICAL point the loss, and
-    hence every fit result, must be identical."""
-    f_ref = build(path, NoPoiModel)
-    asimov = f_ref.expected_yield()
-    f_ref.set_nobs(asimov)
-    loss_disarmed = float(f_ref.reduced_nll().numpy())
-
-    f = build(path, NoPoiModel)
-    f.set_blinding_offsets(True)
-    assert _blinded(f)
-    f.set_nobs(asimov)
-    loss_armed = float(f.reduced_nll().numpy())
-
-    assert np.isclose(loss_armed, loss_disarmed, rtol=0, atol=1e-9)
-
-
-def test_shift_is_additive_not_scaled(path):
-    """Pin the algebra, not just its consequence.
-
-    get_theta has no transform in front of it, so the frame-preserving update is
-    a plain shift. Read the update off the coordinate and check it is a
-    difference and not a ratio -- the mistake that a squared POI does require.
-    """
-    f = build(path, NoPoiModel)
-    x_before = _xtheta(f)
-    f.set_blinding_offsets(True)
-    assert _blinded(f)
-    x_after = _xtheta(f)
-    off = float(f._blinding_offsets_theta[_inoi(f)].numpy())
-
-    assert np.isclose(x_after, x_before - off, rtol=0, atol=1e-14)
-    # the physical value is the stored one plus the offset, unchanged definition
-    assert np.isclose(_theta(f), x_after + off, rtol=0, atol=1e-14)
-
-
 def test_unblind_leaves_both_frames_equal(path):
-    """--unblind on the NOI makes the reframing the identity."""
+    """--unblind on the NOI leaves its offset at zero."""
     f = build(path, NoPoiModel, unblind=["massShift"])
     x0 = f.x.numpy().copy()
     f.set_blinding_offsets(True)
