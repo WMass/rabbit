@@ -602,7 +602,12 @@ class BernsteinBackground(BackgroundPdf):
 
     def config(self):
         cfg = super().config()
-        cfg["params"] = list(self.param_names)
+        # THE KEY IS THE CONSTRUCTOR ARGUMENT'S NAME.  `_make_background`
+        # splats the stored dict into the class, so a key that does not match
+        # the signature makes the card unreadable (`TypeError` at load), and a
+        # card is only ever read back.  Same convention as
+        # `TabulatedLineshapeKernel.config()`.
+        cfg["param_names"] = list(self.param_names)
         return cfg
 
 

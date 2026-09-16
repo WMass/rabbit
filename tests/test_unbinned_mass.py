@@ -27,6 +27,9 @@ Checks, in order:
    same parameters: the NLLs must add up and the fits must agree.
 8. **Gaussian priors** -- a prior declared with the term acts as
    ``0.5 ((p - mu) / sigma)^2`` and constrains the postfit uncertainty.
+9. **background round trip** -- every background kind written to a datacard
+   and read back through ``read_unbinned_terms_from_h5`` gives the same
+   parameters, the same density and the same NLL.
 
 Quick mode builds a small datacard from the step-1 caches (default 20k
 candidates, a 20k-sample kernel CF on 2048 points) and runs in a few minutes.
@@ -826,6 +829,113 @@ def test_priors(args):
 
 
 # ---------------------------------------------------------------------------
+# 9. background datacard round trip
+# ---------------------------------------------------------------------------
+def _toy_term(name, background, bkg_frac_param=None, seed=11, **kw):
+    """A small term plus the datasets its datacard carries."""
+    rng = np.random.default_rng(seed)
+    n, nt = 96, 32
+    sigma = rng.uniform(0.02, 0.04, n)
+    mobs = rng.normal(0.0, 0.03, n)
+    tgrid = np.linspace(0.0, 14.0, nt)
+    vgf = np.ones(n)
+    term = unbinned.MassCFTerm(
+        name,
+        sigma=sigma,
+        mobs=mobs,
+        tgrid=tgrid,
+        families=[{"name": "res", "param": "k", "kind": "gauss"}],
+        vgf=vgf,
+        m_ref=3.0969,
+        scale_param="alpha",
+        background=background,
+        bkg_frac_param=bkg_frac_param,
+        bkg_frac=0.0 if bkg_frac_param else 0.05,
+        chunk=32,
+        **kw,
+    )
+    datasets = {"sigma": sigma, "mobs": mobs, "tgrid": tgrid, "vgf": vgf}
+    return term, datasets
+
+
+def _write_read(term, datasets, tmpdir):
+    """Through the datacard: ``write_unbinned_terms_group`` then the reader."""
+    import h5py
+
+    raw = [
+        dict(
+            name=term.name,
+            config=term.config(),
+            params=list(term.param_names),
+            param_defaults=term.param_defaults,
+            param_prior_sigmas=term.param_prior_sigmas,
+            param_prior_means=term.param_prior_means,
+            param_is_poi=term.param_is_poi,
+            datasets=datasets,
+        )
+    ]
+    fn = os.path.join(tmpdir, f"card_{term.name}.hdf5")
+    with h5py.File(fn, "w") as f:
+        unbinned.write_unbinned_terms_group(f, raw)
+    with h5py.File(fn, "r") as f:
+        back = unbinned.read_unbinned_terms_from_h5(f["unbinned_terms"])
+    assert len(back) == 1, len(back)
+    return back[0]
+
+
+def test_background_roundtrip():
+    """Every background kind must survive the datacard.
+
+    ``config()`` is only ever consumed by ``_make_background``, which splats
+    the stored dict into the class, so a key that is not the constructor's
+    argument name makes the card unreadable -- and the class-level tests
+    (section 5) never see it because they build the background by hand.
+    """
+    print("\n=== 9. background datacard round trip ===")
+    window = (2.75, 3.45)
+    cases = {
+        "uniform": unbinned.UniformBackground(window),
+        "bernstein": unbinned.BernsteinBackground(
+            window, [f"bkg_c{i}" for i in range(3)]
+        ),
+    }
+    rng = np.random.default_rng(13)
+    m = tf.constant(np.linspace(window[0], window[1], 4001), tf.float64)
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        for kind, bkg in cases.items():
+            term, datasets = _toy_term(kind, bkg, bkg_frac_param="f_bkg")
+            back = _write_read(term, datasets, d)
+            same_params = list(back.param_names) == list(term.param_names)
+            ok &= same_params and back.background.kind == kind
+            # the density itself, at a random point of the background's own
+            # parameters -- the config carries the names, and a wrong one
+            # would give a different (or unbuildable) pdf
+            values = {
+                p: tf.constant(v, tf.float64)
+                for p, v in zip(
+                    bkg.param_names, rng.normal(0.0, 1.0, len(bkg.param_names))
+                )
+            }
+            y0 = term.background.pdf(values, m).numpy()
+            y1 = back.background.pdf(values, m).numpy()
+            dmax = float(np.max(np.abs(np.broadcast_to(y1, y0.shape) - y0)))
+            ok &= dmax < 1e-12
+            # and the term's NLL, which is what the fit sees
+            x = tf.constant([1.0] * len(term.param_names), tf.float64)
+            v0 = float(term.nll(x).numpy())
+            v1 = float(back.nll(x).numpy())
+            ok &= v0 == v1
+            print(
+                f"  {kind:9s}: params {list(back.param_names)} "
+                f"(match: {same_params}), max |dpdf| = {dmax:.2e}, "
+                f"NLL {v0:.9f} vs {v1:.9f}"
+            )
+    print("  PASS" if ok else "  FAIL")
+    return ok
+
+
+# ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -851,7 +961,7 @@ def parse_args():
     p.add_argument("--minimizer", default="trust-exact")
     p.add_argument("--threads", type=int, default=32)
     p.add_argument(
-        "--only", default=None, help="comma separated subset of tests to run (1..6)"
+        "--only", default=None, help="comma separated subset of tests to run (1..9)"
     )
     return p.parse_args()
 
@@ -875,7 +985,7 @@ def main():
     which = (
         set(args.only.split(","))
         if args.only
-        else {"1", "2", "3", "4", "5", "6", "7", "8"}
+        else {"1", "2", "3", "4", "5", "6", "7", "8", "9"}
     )
     results = {}
 
@@ -907,6 +1017,8 @@ def main():
         results["5 bernstein"] = test_bernstein()
     if "6" in which:
         results["6 sparse D rows"] = test_jacobian_rows()
+    if "9" in which:
+        results["9 background round trip"] = test_background_roundtrip()
 
     print("\n=== summary ===")
     for k, v in results.items():
