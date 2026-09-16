@@ -803,7 +803,20 @@ def fit(args, fitter, ws, dofit=True):
     ndfsat = int(tf.size(fitter.nobs).numpy()) - fitter.nfreeparms
     nfree_params, nfree_systs = fitter.nfreeparms_breakdown
 
-    chi2_val = 2.0 * nllvalreduced
+    # 2 * nllvalreduced is a saturated chi2 only for the *binned* likelihood,
+    # whose reduced form carries the offset that makes it vanish at the
+    # saturated model. An unbinned term has no such offset (it is a plain
+    # -sum log density), so it is removed from the test statistic here; its
+    # parameters are still counted in ndfsat, so with unbinned terms the
+    # number quoted is the binned goodness of fit at a reduced ndof.
+    nll_unbinned = 0.0
+    if getattr(fitter, "unbinned_terms", []):
+        nll_unbinned = float(fitter._compute_unbinned_nll().numpy())
+        logger.info(
+            f"Unbinned likelihood terms contribute {nll_unbinned:.6f} to the "
+            "NLL; the saturated chi2 below is for the binned likelihood only"
+        )
+    chi2_val = 2.0 * (nllvalreduced - nll_unbinned)
     p_val = chi2.sf(chi2_val, ndfsat)
 
     logger.info("Saturated chi2:")
@@ -1039,6 +1052,36 @@ def main():
     from rabbit.sharding import drain_selection_log
 
     drain_selection_log()
+
+    # SAY WHICH DEVICES THE FIT WILL RUN ON, and say it loudly when there are
+    # none. When the CUDA libraries cannot be dlopened (a missing
+    # LD_LIBRARY_PATH entry is enough) TF logs "Cannot dlopen some GPU
+    # libraries ... Skipping registering GPU devices" at a level that the
+    # TF_CPP_MIN_LOG_LEVEL every batch script sets suppresses, reports no GPU,
+    # and runs the whole fit on the CPU. Nothing fails, nothing is logged, and
+    # the only symptom is a fit ~100x slower than the same fit yesterday --
+    # which reads as a hard model, not as a broken environment (measured: two
+    # 4 h H200 allocations that never executed a single op on the GPU,
+    # 2026-09-13). One line at startup is the difference between diagnosing
+    # that in a minute and in a day.
+    _visible_gpus = tf.config.get_visible_devices("GPU")
+    if _visible_gpus:
+        logger.info(
+            f"TensorFlow sees {len(_visible_gpus)} GPU(s): "
+            + ", ".join(d.name for d in _visible_gpus)
+        )
+    elif _os.environ.get("CUDA_VISIBLE_DEVICES") == "":
+        logger.info("GPUs are hidden by CUDA_VISIBLE_DEVICES=''; running on the CPU.")
+    elif tf.test.is_built_with_cuda():
+        logger.warning(
+            "No GPU is visible to TensorFlow although it was built with CUDA: "
+            "the fit will run on the CPU. If that is not intended, check "
+            "CUDA_VISIBLE_DEVICES and that LD_LIBRARY_PATH carries the CUDA "
+            "runtime (TF reports a failed dlopen only at a log level that "
+            "TF_CPP_MIN_LOG_LEVEL usually hides)."
+        )
+    else:
+        logger.info("TensorFlow has no GPU support in this build; running on the CPU.")
 
     # make list of fits with -1: asimov; 0: fit to data; >=1: toy
     fits = np.concatenate(

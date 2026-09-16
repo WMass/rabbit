@@ -717,6 +717,11 @@ _SHARDED_SAFE = {
     "set_blinding_offsets",
     "prefit_covariance",
     "edmval_cov",
+    # a sum over CANDIDATES at get_x(), with no bin axis to shard: the sharded
+    # loss evaluates the same terms in its global (unsharded) part, so the
+    # value the driver subtracts from nllvalreduced for the saturated chi2 is
+    # the same number the fit minimised, however many devices it ran on
+    "_compute_unbinned_nll",
 }
 
 

@@ -294,6 +294,40 @@ def common_parser():
         "least-occupied selection). The number given should match --nDevices.",
     )
     parser.add_argument(
+        "--unbinnedDeltaKernelForm",
+        default="auto",
+        choices=["auto", "residual", "fluctuation", "off"],
+        help="Which form the two resolution corrections of an unbinned mass "
+        "term are applied in. 'auto' (default) puts DELTA-kernel terms in the "
+        "residual form, where the corrections are exact and the density is "
+        "positive by construction, and leaves wide-kernel terms in the "
+        "fluctuation form, which is the treatment there. 'residual' / "
+        "'fluctuation' force one form on every term; 'off' leaves whatever the "
+        "card declared. A term in the v formulation is never moved (the v form "
+        "exists only in the fluctuation form).",
+    )
+    parser.add_argument(
+        "--unbinnedCorrAMax",
+        default=None,
+        type=float,
+        help="Override the fluctuation form's FIRST-order coefficient bound "
+        "|a_i| on every unbinned term, at load time. The map is truncated at "
+        "first order in a_i and in c_i/sigma_i and only the second had a "
+        "declared domain; outside its domain the modelled density can go "
+        "negative and log of it is a NaN. 0 disables the bound (the default "
+        "the cards carry). This CHANGES THE MODEL -- a_i carries the "
+        "(1 - a_i x) Jacobian that removes a bias of order a_i sigma_i -- so "
+        "it exists to be scanned and costed, not to be set casually.",
+    )
+    parser.add_argument(
+        "--unbinnedCorrCoeffMax",
+        default=None,
+        type=float,
+        help="Override the fluctuation form's QUADRATIC coefficient bound "
+        "|c_i/sigma_i| on every unbinned term, at load time (the cards carry "
+        "0.08). Same warning as --unbinnedCorrAMax.",
+    )
+    parser.add_argument(
         "--precondition",
         action="store_true",
         help="Reparameterise a block of parameters so the reference Hessian is the "
@@ -431,6 +465,28 @@ def common_parser():
         "26 batched ones. The batch is halved automatically if the device "
         "cannot hold it, so this is an upper bound rather than a value that "
         "has to be right. Set 1 for the sequential loop.",
+    )
+    parser.add_argument(
+        "--unbinnedChunk",
+        default=0,
+        type=int,
+        help="Candidate chunk size for unbinned likelihood terms, overriding "
+        "the one stored in the datacard (0: keep it). The chunk is a pure "
+        "memory / dispatch knob -- the objective is a sum over candidates and "
+        "does not depend on how it is partitioned -- so it can be retuned per "
+        "machine. A term carrying a per-candidate sparse D refuses to be "
+        "re-chunked, because its blocks were sliced at write time.",
+    )
+    parser.add_argument(
+        "--unbinnedChunkMode",
+        default="graph",
+        choices=["graph", "eager"],
+        help="How an unbinned term loops its candidate chunks. 'graph' is a "
+        "tf.while_loop with the gradient accumulated in the body and the "
+        "Hessian-vector product taken forward-over-reverse, so exactly one "
+        "chunk is ever live; 'eager' is the python loop, which builds the "
+        "whole sample's tape and exists as the reference the graph path is "
+        "checked against.",
     )
     parser.add_argument(
         "--hvpMethod",

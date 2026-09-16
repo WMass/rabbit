@@ -81,6 +81,11 @@ class TensorWriter:
         # add_auxiliary and rabbit.auxiliary.
         self.auxiliary = []
 
+        # Unbinned likelihood terms (per-candidate contributions to the NLL).
+        # Each entry is the raw dict produced by add_unbinned_term; see
+        # rabbit.unbinned for the on-disk schema and the term classes.
+        self.unbinned_terms = []
+
         # If >0, log-normal systematic variations are clipped so that each bin's
         # up/down factor k=exp(logk) stays within [1/x, x] with x=clip_syst_variations
         # (e.g. 10 => [0.1x, 10x]). Tames spurious huge variations in near-empty
@@ -1548,6 +1553,117 @@ class TensorWriter:
             }
         )
 
+    def add_unbinned_term(
+        self,
+        name,
+        config,
+        params,
+        datasets,
+        param_defaults=None,
+        param_prior_sigmas=None,
+        param_prior_means=None,
+        param_is_poi=None,
+    ):
+        """Add an unbinned (per-candidate) likelihood term to the datacard.
+
+        The term contributes ``- sum_i log L_i(x)`` to the NLL, where the sum
+        runs over candidates rather than bins and ``x`` is the slice of the fit
+        parameter vector named by ``params``. See :mod:`rabbit.unbinned` for
+        the term classes, the physics, and the full on-disk schema.
+
+        The usual way to build the arguments is to construct the term object
+        first and let it describe itself::
+
+            term = unbinned.MassCFTerm(name, sigma=..., mobs=..., ...)
+            writer.add_unbinned_term(
+                name, term.config(), term.param_names, datasets, ...)
+
+        Parameters
+        ----------
+        name : str
+            Term identifier (the HDF5 subgroup name). Must be unique.
+        config : dict
+            JSON-serialisable structural description, as returned by the
+            term's ``config()``: ``kind``, ``channel`` label, family list,
+            kernel / background configuration, units, floor, chunk size.
+        params : list[str]
+            Parameter names the term consumes, in the term's own order.
+        datasets : dict
+            ``{key: ndarray}`` of the term's numeric inputs (per-candidate
+            arrays, tabulated exponents, kernel CF tabulation, ...). Names are
+            fixed by the term kind; see :mod:`rabbit.unbinned`.
+        param_defaults : array-like, optional
+            Starting value of each parameter (default 0).
+        param_prior_sigmas : array-like, optional
+            Gaussian prior width per parameter; NaN (the default) leaves the
+            parameter free. Applied by the Fitter through the ParamModel prior
+            mechanism, i.e. as ``0.5 ((p - mean) / sigma)^2``.
+        param_prior_means : array-like, optional
+            Prior centers (default: the starting values).
+        param_is_poi : array-like of bool/int, optional
+            Which parameters are reported as POIs (default: none).
+        """
+        if any(t["name"] == name for t in self.unbinned_terms):
+            raise RuntimeError(f"unbinned term '{name}' already added")
+
+        params = [str(p) for p in params]
+        npar = len(params)
+
+        def _arr(v, default, dtype=np.float64):
+            if v is None:
+                return np.full(npar, default, dtype=dtype)
+            a = np.asarray(v, dtype=dtype).ravel()
+            if a.shape != (npar,):
+                raise ValueError(
+                    f"unbinned term '{name}': expected {npar} entries per "
+                    f"parameter, got {a.shape}"
+                )
+            return a
+
+        defaults = _arr(param_defaults, 0.0)
+        self.unbinned_terms.append(
+            {
+                "name": name,
+                "config": dict(config),
+                "params": params,
+                "param_defaults": defaults,
+                "param_prior_sigmas": _arr(param_prior_sigmas, np.nan),
+                "param_prior_means": (
+                    defaults.copy()
+                    if param_prior_means is None
+                    else _arr(param_prior_means, 0.0)
+                ),
+                "param_is_poi": _arr(param_is_poi, 0, dtype=np.int8),
+                "datasets": {k: np.asarray(v) for k, v in datasets.items()},
+            }
+        )
+
+    def add_dummy_channel(self, name="unbinned", process="unbinned"):
+        """Add a 1-bin channel with unit yield, zero variance and Asimov data.
+
+        A fit that consists *only* of unbinned terms still has to satisfy
+        ``FitInputData``, which requires ``data_obs`` / ``norm`` / ``logk``.
+        This is the least invasive way to provide them: one bin, one process
+        with a fixed yield of 1 and no systematics, and data equal to the
+        prediction. Its Poisson term is then a parameter-independent constant
+        (it shifts the reported absolute NLL by 0 and contributes nothing to
+        the gradient or Hessian), and its zero variance keeps the
+        bin-by-bin-statistics machinery from introducing a nuisance for it
+        (``betamask`` masks entries with ``sumw2 == 0``).
+        """
+        import hist
+
+        ax = hist.axis.Integer(0, 1, name="bin", underflow=False, overflow=False)
+        h_data = hist.Hist(ax, storage=hist.storage.Double())
+        h_data.values()[...] = [1.0]
+        h_proc = hist.Hist(ax, storage=hist.storage.Weight())
+        h_proc.values()[...] = [1.0]
+        h_proc.variances()[...] = [0.0]
+
+        self.add_channel([ax], name)
+        self.add_data(h_data, name)
+        self.add_process(h_proc, process, name, signal=False)
+
     def add_auxiliary(self, name, datasets):
         """Store a named bundle of arbitrary arrays in the output.
 
@@ -2422,6 +2538,15 @@ class TensorWriter:
                         "hess_sparse",
                         maxChunkBytes=self.chunkSize,
                     )
+
+        # Write unbinned likelihood terms. See rabbit.unbinned. Imported
+        # lazily: rabbit.unbinned pulls in tensorflow (it owns the term
+        # classes), which the write path does not otherwise need.
+        from rabbit import unbinned
+
+        nbytes += unbinned.write_unbinned_terms_group(
+            f, self.unbinned_terms, maxChunkBytes=self.chunkSize
+        )
 
         # Write generic auxiliary array bundles (not used by the fit). See rabbit.auxiliary.
         nbytes += auxiliary.write_auxiliary_group(

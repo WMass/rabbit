@@ -46,6 +46,7 @@ import tensorflow as tf
 from wums import logging
 
 from rabbit import external_likelihood
+from rabbit import unbinned as unbinned_terms_mod
 from rabbit.bbstat.bbstat import BinByBinStat
 from rabbit.fitter import Fitter
 
@@ -363,6 +364,22 @@ class MultiDeviceFitter(Fitter):
             raise NotImplementedError(
                 "Multi-device fits (--nDevices > 1) are not supported in "
                 "sparse mode."
+            )
+        if getattr(self, "unbinned_terms", None):
+            # An unbinned term is a sum over CANDIDATES; the shard views here
+            # slice the bins axis and carry no candidate axis at all, so there
+            # is nothing for `shard_edges` to cut. They are evaluated in the
+            # global (unsharded) term instead, which is correct but puts their
+            # per-candidate tensors -- the largest arrays in such a fit -- on
+            # one device. Sharding them needs a `ShardUnbinnedView`: a
+            # contiguous candidate range with the term's per-candidate tensors
+            # `tf.identity`-copied onto the shard's device, one tape per shard
+            # on a device-local x, and the partials added like everything else.
+            logger.warning(
+                f"{len(self.unbinned_terms)} unbinned term(s) are evaluated on "
+                f"{self.shards[0].device if self.shards else 'the first device'} "
+                "rather than sharded: the shard views partition bins, and an "
+                "unbinned term has candidates instead."
             )
         if (
             self.bbstat.enabled
@@ -810,6 +827,19 @@ class MultiDeviceFitter(Fitter):
             )
             if lext is not None:
                 total = total + lext
+            # Unbinned terms are NOT sharded: they are a sum over candidates,
+            # not over bins, and nothing in ShardIndataView carries a candidate
+            # axis. Evaluating them here keeps the sharded likelihood CORRECT
+            # (leaving them out silently drops them, which is what this path
+            # did before), at the price of their per-candidate tensors living
+            # on one device and their compute not being split. Sharding them
+            # properly means a candidate-range shard view -- see the note in
+            # `_build_shards`.
+            lunb = unbinned_terms_mod.compute_unbinned_nll(
+                self.unbinned_terms, gview.get_x(), self.indata.dtype, full_nll=False
+            )
+            if lunb is not None:
+                total = total + lunb
             # Regularizer penalties belong here rather than in a shard: they
             # are global (a shard would double count them) and, for the ones
             # allowed on this path, depend only on the parameter vector, which

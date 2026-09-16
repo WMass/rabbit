@@ -85,6 +85,56 @@ Built-in models:
 - `ExtendedABCD`: 6-region ABCD using two sideband bins in the x direction (Ax, Bx further from signal, A/B in the middle). Fake rate is log-linearly extrapolated: `D = C·Ax·B² / (Bx·A²)`. `npoi=0`, `npou=5·n_bins`. CLI: `--paramModel ExtendedABCD <process> <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] <ch_A> [ax:val ...] <ch_B> [ax:val ...] <ch_C> [ax:val ...] <ch_D> [ax:val ...]`.
 - `SmoothExtendedABCD`: like `ExtendedABCD` but all five free-parameter regions (A, B, C, Ax, Bx) are parameterised with an exponential Chebyshev polynomial along one smoothing axis (same basis as `SmoothABCD`). `npoi=0`, `npou=5·n_outer·(order+1)`. CLI: `--paramModel SmoothExtendedABCD <axis> [params:<src> | order:N] <process> <ch_Ax> [ax:val ...] <ch_Bx> [ax:val ...] <ch_A> [ax:val ...] <ch_B> [ax:val ...] <ch_C> [ax:val ...] <ch_D> [ax:val ...]`. `params:aux:<name>` reads initial coefficients and order from an auxiliary bundle of the input file, `params:<file.hdf5>` from a standalone file. `SmoothExtendedABCDIsoMT` falls back to the bundle `initial_params_SmoothExtendedABCDIsoMT_<process>_<channel>` when neither token is given.
 
+### Unbinned terms: `rabbit/unbinned.py`
+Additive `-sum_i log L_i(x)` contributions over *candidates* rather than bins,
+evaluated inside the same `tf.function` as the binned likelihood (so gradient,
+Hessian and HVP come from the existing tapes). `UnbinnedTerm` is the base class
+(`param_names` + `nll(params)`); `MassCFTerm` is the CVH mass likelihood built
+from characteristic functions, with pluggable `PhysicsKernel`
+(`DeltaKernel` / `BreitWignerKernel` / `TabulatedLineshapeKernel`) and
+`BackgroundPdf` (`UniformBackground` / `BernsteinBackground`) components, a
+data-driven list of resolution *families*, and an optional sparse
+`m_i(theta) = m_i^0 + D_i theta` hook. Written with
+`TensorWriter.add_unbinned_term`, read as `FitInputData.unbinned_terms`,
+declared to the fit by the `UnbinnedParams` param model. `Fitter` builds them
+next to the external terms, adds them in `_compute_nll`, and forces
+`is_linear = False` / `jit_compile = False` when they are present. See the
+module docstring for the schema and `tests/test_unbinned_mass.py` for the
+validation against the standalone reference implementation.
+
+### External (quadratic) terms: `rabbit/external_likelihood.py`
+Additive `g^T x_sub + 0.5 x_sub^T H x_sub` contributions over a *named slice*
+of the fit parameter vector, written with
+`TensorWriter.add_external_likelihood_term(grad=, hess=, mean=)` (dense
+`hist.Hist` or sparse `wums.SparseHist` Hessian), read as
+`FitInputData.external_terms`. Like an unbinned term it consumes parameters by
+name but declares nothing, so something has to put those names in the fit
+vector: `--paramModel ExternalParams` (`rabbit/param_models/external_params.py`)
+reads the declarations — name, starting value, Gaussian prior, POI flag — from
+an `auxiliary` bundle (default `external_params`, override with
+`bundle:<name>`), mirroring what `UnbinnedParams` does for unbinned terms. Use
+both together (`--paramModel UnbinnedParams --paramModel ExternalParams
+bundle:...`) when a card has both kinds of term; their parameter names must be
+disjoint. `tests/test_global_term.py` is the joint test: a quadratic term and a
+Gaussian-equivalent unbinned mass term sharing parameters through the sparse
+`m_i(theta) = m_i^0 + D_i theta` rows, checked against the closed-form
+solution (minimum, covariance, priors, freezing, injection recovery).
+
+Note that a card whose only free parameters come from these terms has `npoi=0`
+and often `nsyst=0`; XLA has no gradient kernel for the resulting length-0
+slice/select in `get_x()`, so the Fitter disables `jit_compile` in that case.
+
+Two practical points for a card that is *only* a quadratic term. **Use
+`--minimizerMethod trust-exact`**: the problem is a small dense quadratic, the
+exact trust-region solve converges in a couple of steps (7 s on a 50-parameter
+CVH field card, values reproducing the closed-form `-H^-1 g` to 6e-10 of the
+error), whereas trust-krylov's CG needs ~`sqrt(cond(H))` iterations (56 s, and
+the minimum only to 1e-3 of the error). And **scale the parameters to a common
+unit before writing `H`**: an external Hessian whose parameters differ by orders
+of magnitude in what they physically do is correspondingly ill-conditioned, and
+trust-krylov did not converge at all on the unscaled version of that same card
+(cond 6.6e9 unscaled vs 1.9e7 scaled).
+
 ### Auxiliary data: `rabbit/auxiliary.py`
 `TensorWriter.add_auxiliary(name, datasets)` stores a named bundle of arbitrary arrays (numeric ndarrays and/or 1-D string lists) under a top-level `auxiliary` HDF5 group, exposed on the read side as `FitInputData.auxiliary[name]`. It is not used by the fit itself; it is a side channel for param models to carry pre-computed inputs that must stay consistent with the datacard.
 

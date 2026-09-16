@@ -13,6 +13,7 @@ from wums import logging
 from rabbit import external_likelihood, io_tools
 from rabbit import preconditioner as precond
 from rabbit import tfhelpers as tfh
+from rabbit import unbinned as unbinned_terms_mod
 from rabbit.bbstat.bbstat import BinByBinStat
 from rabbit.callbacks import RESTART_MIN_IMPROVEMENT, FitterCallback, merge_callbacks
 from rabbit.impacts import (
@@ -106,6 +107,10 @@ class Fitter:
             "loss_val_grad_hessp",
             "loss_val_grad_hessp_fwdrev",
             "loss_val_grad_hessp_revrev",
+            # only set when the card carries unbinned terms, and a bound
+            # method either way -- strip it with the rest so __deepcopy__
+            # rebuilds it against the copy rather than the original
+            "loss_val_grad_hess",
         }
     )
     valid_systematic_types = ["log_normal", "normal"]
@@ -135,6 +140,9 @@ class Fitter:
         # scipy's OptimizeResult from the last fit(), so the convergence
         # outcome can be written to the output. None if the minimizer raised.
         self.minimizer_result = None
+        # kept so init_fit_parms can read the unbinned chunk options, which
+        # only become relevant once the terms exist
+        self._fit_options = options
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
         hvp_batch = getattr(options, "hvpBatch", 256)
         # `or 256` would turn an explicit 0 into the default; test None
@@ -173,6 +181,17 @@ class Fitter:
             raise ValueError(
                 f"jitCompile must be one of 'auto', 'on', 'off'; got {_jit_opt!r}"
             )
+        _has_unbinned = bool(getattr(self.indata, "unbinned_terms", []))
+        # An empty block in the parameter vector [poi | model_nui | syst] --
+        # a ParamModel with npoi = 0 (e.g. ExternalParams / UnbinnedParams
+        # declaring only nuisances) or a datacard with no systematics -- makes
+        # get_x() slice a length-0 piece out of x and tf.where over it. XLA has
+        # no gradient kernel for either ("Scatter dimension 0 is of size zero"
+        # / "StridedSliceGrad" on an empty tensor) and the whole jit-compiled
+        # loss+gradient call fails. Graph mode handles it fine, so drop jit.
+        _empty_block = (
+            param_model.npoi == 0 or param_model.npou == 0 or self.indata.nsyst == 0
+        )
         if _jit_opt == "off":
             self.jit_compile = False
         elif _jit_opt == "on":
@@ -183,10 +202,29 @@ class Fitter:
                     "sparse mode, so jit_compile will be disabled."
                 )
                 self.jit_compile = False
+            elif _has_unbinned:
+                logger.warning(
+                    "--jitCompile=on requested but the input has unbinned "
+                    "likelihood terms; their per-candidate (n x nt) blocks "
+                    "are large constants that XLA clones per fusion, so "
+                    "jit_compile will be disabled."
+                )
+                self.jit_compile = False
+            elif _empty_block:
+                logger.warning(
+                    "--jitCompile=on requested but the parameter vector has an "
+                    f"empty block (npoi={param_model.npoi}, "
+                    f"npou={param_model.npou}, nsyst={self.indata.nsyst}); XLA "
+                    "has no gradient kernel for the length-0 slice/select in "
+                    "get_x(), so jit_compile will be disabled."
+                )
+                self.jit_compile = False
             else:
                 self.jit_compile = True
         else:  # "auto"
-            self.jit_compile = not self.indata.sparse
+            self.jit_compile = (
+                not self.indata.sparse and not _has_unbinned and not _empty_block
+            )
         # When --noHessian is requested the postfit Hessian is never
         # computed, so the dense [npar, npar] covariance matrix should
         # not be allocated. self.cov is set to None in that case and
@@ -476,6 +514,86 @@ class Fitter:
             self.indata.dtype,
         )
 
+        # Unbinned likelihood terms (per-candidate -sum log L contributions).
+        # The term objects are built by FitInputData (they own large constant
+        # tensors); here only their parameter names are resolved against the
+        # fit parameter vector. See rabbit.unbinned.
+        # chunk size and loop mode, from the CLI, before the terms are wired:
+        # both are pure evaluation knobs (the objective is a sum over
+        # candidates and does not depend on how it is partitioned), so they
+        # belong to the fit, not to the card.
+        raw_unbinned = getattr(self.indata, "unbinned_terms", []) or []
+        want_chunk = int(getattr(self._fit_options, "unbinnedChunk", 0) or 0)
+        want_mode = getattr(self._fit_options, "unbinnedChunkMode", "graph")
+        # The coefficient DOMAINS of the fluctuation form, also from the CLI.
+        # Unlike the chunking these DO change the model, so they are not
+        # defaults: they exist so the bound can be scanned -- the way
+        # `corr_coeff_max = 0.08` was scanned -- without rebuilding a card that
+        # is tens of GB. `None` leaves whatever the card declared.
+        want_a_max = getattr(self._fit_options, "unbinnedCorrAMax", None)
+        want_coeff_max = getattr(self._fit_options, "unbinnedCorrCoeffMax", None)
+        # WHICH FORM the two corrections are applied in. At a DELTA kernel the
+        # residual form is exact and positive by construction, and the
+        # fluctuation form is a first-order Fourier-space truncation of the
+        # same thing -- a computational device valid only where the correction
+        # is small. Where it is not, the modelled density can go negative and
+        # `log` of it takes the whole NLL, gradient and Hessian non-finite; that
+        # is what killed the phase-2 full-card fit at its own start point. So
+        # "auto" puts every delta-kernel term in the residual form and leaves
+        # wide-kernel terms (the Z, where `delta` is NOT the fluctuation) in the
+        # fluctuation form, which is the treatment there.
+        want_form = getattr(self._fit_options, "unbinnedDeltaKernelForm", "auto")
+        for term in raw_unbinned:
+            if want_form != "off" and hasattr(term, "set_corr_form"):
+                kern = getattr(term, "kernel", None)
+                is_delta = getattr(kern, "kind", None) == "delta"
+                target = (
+                    ("residual" if is_delta else None)
+                    if want_form == "auto"
+                    else want_form
+                )
+                if (
+                    target is not None
+                    and target != term.corr_form
+                    and getattr(term, "vpow", None) is None
+                ):
+                    before = term.corr_form
+                    term.set_corr_form(target)
+                    logger.info(
+                        f"unbinned term '{term.name}': kernel is "
+                        f"'{getattr(kern, 'kind', '?')}', so the corrections "
+                        f"move from the {before} form to the {target} form -- "
+                        "exact there, and not a first-order truncation that "
+                        "can go negative"
+                    )
+            if (want_a_max is not None or want_coeff_max is not None) and hasattr(
+                term, "set_corr_bounds"
+            ):
+                term.set_corr_bounds(a_max=want_a_max, coeff_max=want_coeff_max)
+                logger.info(
+                    f"unbinned term '{term.name}': coefficient domains set "
+                    f"from the CLI to corr_a_max={term.corr_a_max:g}, "
+                    f"corr_coeff_max={term.corr_coeff_max:g}"
+                )
+            if want_chunk:
+                term.rechunk(want_chunk)
+            if want_mode == "eager":
+                term.chunk_mode = "eager"
+            elif not term.graph_chunkable:
+                logger.warning(
+                    f"unbinned term '{term.name}' cannot use the graph chunk "
+                    "loop (its per-chunk slicing needs a python chunk index); "
+                    "it will build the whole sample's tape."
+                )
+            logger.info(
+                f"unbinned term '{term.name}': {term.n} candidates in "
+                f"{term.nchunk} chunk(s) of {term.chunk}, {term.chunk_mode} loop"
+            )
+        self.unbinned_terms = unbinned_terms_mod.build_tf_unbinned_terms(
+            raw_unbinned,
+            self.parms,
+        )
+
         # for freezing parameters
         self.frozen_params = []
         self.frozen_params_mask = tf.Variable(
@@ -490,13 +608,23 @@ class Fitter:
         # quadratic-solver path; the user is responsible for ensuring the
         # resulting Gaussian step is meaningful (e.g. via an outer iteration
         # that re-anchors the linearization point).
+        # An unbinned term is never quadratic in the parameters, so the
+        # single-Cholesky-step shortcut below would return a Gaussian step
+        # from the starting point rather than the minimum.
         self.is_linear = self.force_linear or (
             (self.chisqFit or self.covarianceFit)
             and self.param_model.is_linear
             and self.indata.symmetric_tensor
             and self.indata.systematic_type == "normal"
             and self.bbstat.is_linear
+            and not self.unbinned_terms
         )
+        if self.force_linear and self.unbinned_terms:
+            logger.warning(
+                "--forceLinear with unbinned likelihood terms: the unbinned "
+                "NLL is not quadratic, so the single Gaussian step is only a "
+                "linearization of it around the current point."
+            )
         if self.force_linear:
             logger.info(
                 "--forceLinear set: solving by a single Gaussian (Cholesky / "
@@ -1327,6 +1455,130 @@ class Fitter:
             return edmval, cov
         else:
             return edmval_cov(grad, hess)
+
+    def _floating_block(self, grad, hess):
+        """``(grad, hess)`` restricted to the parameters that are floating.
+
+        A frozen parameter contributes an exactly zero row and column to the
+        Hessian (``get_x`` stop-gradients it), so the full matrix is singular
+        as soon as anything is frozen. :meth:`edmval_cov` has always masked
+        them; the ``--diagnostics`` line did not, and solved the singular
+        system instead -- "Input matrix is not invertible", which the fitter
+        reports as "Minimizer raised" and turns into a failed fit.
+        """
+        if not len(self.frozen_params):
+            return grad, hess
+        sub = tf.gather(grad, self.floating_indices, axis=0)
+        subh = tf.gather(hess, self.floating_indices, axis=0)
+        subh = tf.gather(subh, self.floating_indices, axis=1)
+        return sub, subh
+
+    def hess_for_minimizer(self, hess):
+        """The Hessian with the FROZEN directions made non-singular.
+
+        `get_x` stop-gradients a frozen parameter, so its row and column of the
+        Hessian are exactly zero -- and handing a singular matrix to a
+        trust-region subproblem is handing it the "hard case" on every single
+        iteration. `trust-exact` then never returns an interior Newton step,
+        so `hits_boundary` is False, so the trust radius never doubles, and the
+        fit converges LINEARLY: measured on `z_n300k` with four parameters
+        frozen, the EDM fell 16495 -> 210 in five iterations and then moved
+        about 1 % per iteration for the next twenty-five. `--precondition` does
+        not help, because a singular block cannot be whitened.
+
+        Putting 1 on the frozen diagonal is EXACT, not a regularisation: the
+        frozen gradient components are zero, so the subproblem's solution has
+        `p_frozen = -0/1 = 0` for any positive value there, exactly as it did
+        with the zero row. All it changes is that the matrix is invertible, so
+        the solver sees an ordinary problem of the floating dimension.
+        """
+        self.warn_unconstrained(hess)
+        if not len(self.frozen_params):
+            return hess
+        # ONLY the frozen entries. A parameter that is floating but that no
+        # term constrains has a zero row for a PHYSICS reason, and it must
+        # stay singular so the fit fails loudly rather than quietly returning
+        # a number for a direction the data does not determine.
+        mask = tf.cast(self.frozen_params_mask, hess.dtype)
+        return hess + tf.linalg.diag(mask)
+
+    def warn_unconstrained(self, hess, rtol=1e-12):
+        """Name the FLOATING parameters no term constrains, once.
+
+        A zero Hessian row on a floating parameter means nothing in the
+        likelihood depends on it -- a material group no candidate touches, a
+        mode outside the acceptance. The subproblem is then singular for a
+        physics reason, and the honest outcome is to say which parameter it is
+        and let the fit fail, not to regularise it into a number. (This is
+        why :meth:`hess_for_minimizer` adds its unit diagonal on the FROZEN
+        entries only.)
+
+        THE TEST IS ON THE WHOLE ROW, NOT THE DIAGONAL. "Nothing in the
+        likelihood depends on it" means the parameter's entire Hessian row
+        vanishes, and that is scale-free. Testing the DIAGONAL against the
+        global maximum is not: on a card that mixes an external quadratic term
+        with unbinned mass terms the curvatures differ by twelve orders of
+        magnitude -- measured, a hit-chi2 block at 7.12e13 against `m_Z` at
+        0.0608 -- so every mass parameter falls below `rtol * max(diag)` and is
+        reported as unconstrained while its error is a perfectly sensible
+        5.78 MeV. A parameter that IS unconstrained has a zero row as well as a
+        zero diagonal, so the row test keeps every true positive (a material
+        group no candidate touches is blind to every term at once) and drops
+        the worst of the block-scale false positives: on the joint card `m_Z`
+        goes from a diagonal of 0.0608 (below the 71.2 threshold) to a row
+        maximum of ~2e4 (five orders above it), because the mass term couples
+        it to the field modes.
+
+        NOT a complete fix. A whole BLOCK whose curvature sits below
+        `rtol * max|H|` is still flagged -- the `K(m)` shapes are the candidate
+        on this card -- because the threshold is still global. The complete
+        answer is a per-block scale: group the parameters by which term
+        declares them (`Fitter` knows, from the unbinned and external terms'
+        `param_names`) and compare each row against the largest entry in its
+        OWN group. That is left for the rabbit branch; the row test is the part
+        that removes the false positive actually observed.
+        """
+        if getattr(self, "_warned_unconstrained", False):
+            return
+        self._warned_unconstrained = True
+        try:
+            h = np.abs(np.asarray(hess))
+            d = np.abs(np.asarray(tf.linalg.diag_part(hess)))
+        except Exception:  # pragma: no cover - diagnostics only
+            return
+        scale = h.max()
+        if not np.isfinite(scale) or scale <= 0:
+            return
+        free = np.ones(d.shape, dtype=bool)
+        if len(self.frozen_params):
+            free = ~np.asarray(self.frozen_params_mask)
+        # the whole row, not the diagonal: see the note above
+        rowmax = h.max(axis=1)
+        bad = np.where(free & (rowmax < rtol * scale))[0]
+        if not bad.size:
+            return
+        names = np.asarray(self.parms).astype(str)
+        logger.warning(
+            f"{bad.size} floating parameter(s) have an essentially zero "
+            f"Hessian ROW (largest entry {rowmax[bad].max():.3g}, diagonal "
+            f"{d[bad].max():.3g}, against a scale of "
+            f"{scale:.3g}): {list(names[bad][:12])}"
+            + (" ..." if bad.size > 12 else "")
+            + ". Nothing in the likelihood constrains them, so the "
+            "trust-region subproblem is singular. Freeze them or give them a "
+            "prior; this is NOT the frozen-parameter case and is deliberately "
+            "not regularised away."
+        )
+
+    def log_diagnostics(self, grad, hess):
+        """Condition number and EDM of the CURRENT point, for --diagnostics."""
+        subgrad, subhess = self._floating_block(grad, hess)
+        try:
+            logger.info(f"  - Condition number: {tfh.cond_number(subhess)}")
+            logger.info(f"  - edmval: {tfh.edmval(subgrad, subhess)}")
+        except Exception as ex:  # pragma: no cover - diagnostics only
+            # a diagnostic must never be able to fail a fit
+            logger.warning(f"  - diagnostics unavailable at this point: {ex}")
 
     def edmval_cov_rows_hessfree(self, grad, row_indices, rtol=1e-10, maxiter=None):
         """Hessian-free edmval + selected rows of the covariance matrix.
@@ -2547,9 +2799,32 @@ class Fitter:
         log-normalization is gated on ``full_nll``. External terms are stored
         expanded, so the centering constant has to be added back explicitly.
         See :mod:`rabbit.external_likelihood`.
+
+        Evaluated at the *effective* parameter vector ``get_x()`` (not the raw
+        ``self.x``), like :meth:`_compute_lc` and :meth:`_compute_unbinned_nll`:
+        the ``stop_gradient`` that ``get_x`` applies to frozen entries is what
+        makes a frozen parameter actually frozen in a likelihood or contour
+        scan. With ``self.x`` an external term kept pulling on a scanned
+        parameter, which matters as soon as a parameter is shared between an
+        external term and something else (e.g. a global calibration parameter
+        appearing both in a quadratic hit-chi2 term and in an unbinned mass
+        term).
         """
         return external_likelihood.compute_external_nll(
-            self.external_terms, self.x, self.indata.dtype, full_nll=full_nll
+            self.external_terms, self.get_x(), self.indata.dtype, full_nll=full_nll
+        )
+
+    def _compute_unbinned_nll(self, full_nll=False):
+        """Sum of the unbinned likelihood terms' contributions.
+
+        Each term contributes ``- sum_i log L_i`` over its own candidates,
+        evaluated at the *effective* parameter vector ``get_x()`` (not the raw
+        ``self.x``) so that frozen parameters really are frozen -- likelihood
+        scans and contour scans rely on the ``stop_gradient`` that ``get_x``
+        applies. See :mod:`rabbit.unbinned`.
+        """
+        return unbinned_terms_mod.compute_unbinned_nll(
+            self.unbinned_terms, self.get_x(), self.indata.dtype, full_nll=full_nll
         )
 
     def _compute_nll(self, profile=True, full_nll=False):
@@ -2567,6 +2842,10 @@ class Fitter:
         lext = self._compute_external_nll(full_nll=full_nll)
         if lext is not None:
             l = l + lext
+
+        lunb = self._compute_unbinned_nll(full_nll=full_nll)
+        if lunb is not None:
+            l = l + lunb
         return l
 
     def _compute_loss(self, profile=True):
@@ -2633,6 +2912,19 @@ class Fitter:
         # propagation through SparseMatrixMatMul (no JVP rule for the
         # CSR variant), so the fwdrev HVP cannot be used in sparse mode.
         # Fall back to revrev with a warning.
+        # An unbinned term hides its candidate loop behind a
+        # `tf.custom_gradient` (see rabbit.unbinned): the value is a
+        # tf.while_loop, its VJP is the gradient loop and the gradient's VJP is
+        # the HVP loop. That is exactly the revrev contract. Forward mode is a
+        # different mechanism -- ForwardAccumulator does not go through a
+        # registered VJP -- so fwdrev would come back wrong or zero here.
+        if getattr(self, "unbinned_terms", None) and self.hvp_method == "fwdrev":
+            logger.warning(
+                "fwdrev HVP is not supported with unbinned likelihood terms "
+                "(their candidate loop is hidden behind a tf.custom_gradient, "
+                "which forward mode does not traverse); falling back to revrev."
+            )
+            self.hvp_method = "revrev"
         if self.hvp_method == "fwdrev" and self.indata.sparse:
             logger.warning(
                 "fwdrev HVP is not supported in sparse mode "
@@ -2644,6 +2936,54 @@ class Fitter:
             self.loss_val_grad_hessp = self.loss_val_grad_hessp_fwdrev
         else:
             self.loss_val_grad_hessp = self.loss_val_grad_hessp_revrev
+
+        # THE HESSIAN ROUTE FOR AN UNBINNED CARD.  `loss_val_grad_hess` builds
+        # the matrix with `t2.jacobian`, which vectorises over every parameter
+        # at once and so holds `nparams` copies of the forward tape.  For an
+        # unbinned term that tape is the whole candidate sample: 116 GB at
+        # 300 000 candidates and 5 parameters, which is what drove the
+        # full-scale fits out of the Fitter in the first place.  The matrix
+        # itself is only [npar, npar].
+        #
+        # `hessian_from_hvps` (PR #154) builds it column by column from the
+        # very HVP the PR #153 minimizers already call every iteration, each
+        # costing one chunk of memory rather than the sample.  At the 7-100
+        # parameters of these fits that is seconds, and flat in memory.  It is
+        # selected automatically -- an unbinned card must never take the pfor
+        # route, and the user should not have to know that.
+        if getattr(self, "unbinned_terms", None):
+            self.loss_val_grad_hess = self._loss_val_grad_hess_from_hvps
+            # `_hessp_batch` is a pfor of width k over the same loss; a
+            # tf.while_loop with a custom gradient inside one is not something
+            # to rely on, and the batching buys nothing at this parameter
+            # count. One HVP at a time.
+            self.hvp_batch = 1
+            logger.info(
+                f"{len(self.unbinned_terms)} unbinned term(s): the Hessian is "
+                "assembled from Hessian-vector products rather than from the "
+                "vectorised jacobian, and the HVP is revrev."
+            )
+
+    def _loss_val_grad_hess_from_hvps(self, profile=True):
+        """``loss_val_grad_hess`` for a card carrying unbinned terms.
+
+        Same signature and same return types as the traced version it replaces,
+        so every caller -- the preconditioner's reference matrix, the postfit
+        covariance, the impacts, `tf-trust-exact` -- is unchanged.
+        """
+        if not profile:
+            # nothing in the unbinned path profiles, so the flag only reaches
+            # the binned part of the loss; refuse rather than quietly ignoring
+            # it if there is a binned part that would care
+            if self.bbstat.enabled:
+                raise NotImplementedError(
+                    "profile=False Hessian with unbinned terms and bin-by-bin "
+                    "statistics is not implemented"
+                )
+        val, grad = self.loss_val_grad()
+        hess = self.hessian_from_hvps(batch=1)
+        hess = 0.5 * (hess + hess.T)
+        return val, grad, tf.constant(hess, dtype=self.indata.dtype)
 
     @tf.function
     def loss_val_grad_hess(self, profile=True):
@@ -2932,11 +3272,8 @@ class Fitter:
             self.x.assign(pc.to_physical(yval))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
-            return pc.hess_to_internal(hess.__array__())
+                self.log_diagnostics(grad, hess)
+            return pc.hess_to_internal(self.hess_for_minimizer(hess).__array__())
 
         # Native (TF) minimizer counterparts of the callbacks above. Same
         # contract and the same internal coordinates, but the gradient and
@@ -2952,10 +3289,8 @@ class Fitter:
             self.x.assign(pc.to_physical(yval))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
+                self.log_diagnostics(grad, hess)
+            hess = self.hess_for_minimizer(hess)
             if pc.enabled:
                 grad = tf.constant(pc.grad_to_internal(grad.__array__()))
                 hess = tf.constant(pc.hess_to_internal(hess.__array__()))
@@ -2997,6 +3332,151 @@ class Fitter:
         # scipy works in internal coordinates throughout; y = 0 at the point the
         # transform was built.
         xval = pc_cell[0].from_physical(self.x.numpy())
+
+        # THE FROZEN SUBSPACE IS REMOVED FROM THE MINIMISATION, not only from
+        # the derivatives.
+        #
+        # `--freezeParameters` is implemented with `tf.stop_gradient` (see
+        # `get_poi` / `get_model_nui` / `get_theta`): it zeroes the parameter's
+        # gradient and its Hessian row and column, but the likelihood is still
+        # EVALUATED at whatever the vector holds. Hand the minimiser the full
+        # vector and each frozen parameter is a direction on which the model is
+        # exactly flat -- and a trust-region method does not leave a flat
+        # direction alone. `hess_for_minimizer` puts 1 on the frozen diagonal
+        # against ~1e8 elsewhere, so the frozen block is the SMALLEST-curvature
+        # eigenspace of the matrix scipy factorises, and `trust-exact`'s hard
+        # case deliberately walks to the trust-region boundary along that
+        # eigenvector; `trust-krylov`/`trust-ncg` see zero curvature there and
+        # do the same. Measured over the stored results of the Z-mass campaign:
+        # 8 of 36 fits came back with the four frozen resolution knobs
+        # displaced from the value they were frozen at, by up to 0.126, always
+        # along (1,1,1,1) or (1,-1,1,-1) -- an arbitrary vector of a degenerate
+        # block, which is the signature. The likelihood was evaluated there, so
+        # those fits did not have what they froze held fixed.
+        #
+        # Minimising over the floating coordinates only is EXACT, not a
+        # regularisation: the frozen gradient components are identically zero,
+        # so no descent direction is discarded, and the reduced Hessian is the
+        # one `edmval_cov` already uses for the EDM and the covariance.
+        ifree = np.asarray(self.floating_indices, dtype=np.int64)
+        ifrozen = np.asarray(
+            np.where(np.asarray(self.frozen_params_mask))[0], dtype=np.int64
+        )
+        nfull = int(xval.size)
+        reduce_frozen = ifrozen.size > 0
+        if reduce_frozen and pc_cell[0].enabled:
+            # A block-diagonal preconditioner passes non-block indices through,
+            # so holding an internal coordinate fixed holds the physical one
+            # fixed -- but only if no frozen index sits inside a block. If one
+            # does, the two operations do not commute and the reduction would
+            # silently move a frozen parameter.
+            inblock = set()
+            for b in pc_cell[0].blocks:
+                inblock.update(int(i) for i in np.asarray(b.idx).ravel())
+            clash = sorted(inblock.intersection(int(i) for i in ifrozen))
+            if clash:
+                raise ValueError(
+                    "preconditioning a FROZEN parameter is not supported: "
+                    f"{[str(np.asarray(self.parms)[i]) for i in clash[:8]]} "
+                    "are frozen and inside a preconditioner block, so the "
+                    "transform mixes them with floating directions. Drop "
+                    "--precondition or unfreeze them."
+                )
+        # captured by reference so a restart, which rebuilds both the transform
+        # and `xval`, refreshes what the frozen coordinates are held at
+        frozen_ref = [xval[ifrozen].copy() if reduce_frozen else None]
+
+        def expand(u):
+            """Reduced -> full internal vector, frozen entries restored."""
+            u = np.asarray(u, dtype=np.float64)
+            if not reduce_frozen:
+                return u
+            v = np.empty(nfull, dtype=np.float64)
+            v[ifree] = u
+            v[ifrozen] = frozen_ref[0]
+            return v
+
+        def restrict(v):
+            v = np.asarray(v, dtype=np.float64)
+            return v[ifree] if reduce_frozen else v
+
+        ifree_tf = tf.constant(ifree[:, None], tf.int32)
+
+        def expand_dir_tf(v):
+            """Reduced DIRECTION -> full, zeros on the frozen entries."""
+            if not reduce_frozen:
+                return v
+            return tf.scatter_nd(ifree_tf, v, [nfull])
+
+        def gather_tf(v):
+            return v if not reduce_frozen else tf.gather(v, ifree, axis=0)
+
+        def gather2_tf(m):
+            """Both axes of a square matrix, i.e. the floating BLOCK."""
+            if not reduce_frozen:
+                return m
+            return tf.gather(tf.gather(m, ifree, axis=0), ifree, axis=1)
+
+        if reduce_frozen:
+            _full = (scipy_loss, scipy_hess, scipy_hessp)
+
+            def scipy_loss(u, _f=_full[0]):
+                val, grad = _f(expand(u))
+                return val, np.asarray(grad)[ifree]
+
+            def scipy_hess(u, _f=_full[1]):
+                return np.asarray(_f(expand(u)))[np.ix_(ifree, ifree)]
+
+            def scipy_hessp(u, p, _f=_full[2]):
+                pfull = np.zeros(nfull, dtype=np.float64)
+                pfull[ifree] = np.asarray(p, dtype=np.float64)
+                return np.asarray(_f(expand(u), pfull))[ifree]
+
+            _nat = (
+                native_loss,
+                native_closure,
+                native_grad_closure,
+                native_set_point,
+                native_hessp,
+            )
+
+            def native_loss(u, _f=_nat[0]):
+                return _f(expand(u))
+
+            def native_closure(u, _f=_nat[1]):
+                val, grad, hess = _f(expand(u))
+                return val, gather_tf(grad), gather2_tf(hess)
+
+            def native_grad_closure(u, _f=_nat[2]):
+                val, grad = _f(expand(u))
+                return val, gather_tf(grad)
+
+            def native_set_point(u, _f=_nat[3]):
+                return _f(expand(u))
+
+            def native_hessp(_f=_nat[4]):
+                hp = _f()
+
+                def hessp(v):
+                    return gather_tf(hp(expand_dir_tf(v)))
+
+                return hessp
+
+            # Name the values too. Freezing holds a parameter where `self.x`
+            # currently has it, which under --externalPostfit is the SNAPSHOT
+            # value, not the card default -- and a snapshot written before this
+            # fix can carry a frozen parameter that the old minimiser had
+            # already displaced. Printing it is how a warm start that is not
+            # frozen where it thinks it is becomes visible.
+            _pn = np.asarray(self.parms).astype(str)
+            _held = pc_cell[0].to_physical(xval)
+            logger.info(
+                f"[minimize] minimising over {ifree.size} floating parameter(s); "
+                f"{ifrozen.size} frozen one(s) are removed from the vector the "
+                "minimiser sees, not merely stop-gradiented, and are held at: "
+                + ", ".join(f"{_pn[i]}={_held[i]:.10g}" for i in ifrozen[:12])
+                + (" ..." if ifrozen.size > 12 else "")
+            )
 
         if self.minimizer_method in [
             "trust-krylov",
@@ -3076,6 +3556,7 @@ class Fitter:
                     xval,
                     self.earlyStopping,
                     snapshotter=snapshotter,
+                    expand=expand if reduce_frozen else None,
                     stall_rel_tol=self.stallRelTol,
                 )
                 try:
@@ -3083,7 +3564,7 @@ class Fitter:
                         res = minimize_trust_exact(
                             native_loss,
                             native_closure,
-                            xval,
+                            restrict(xval),
                             gtol=sci_opts.get("gtol", 0.0),
                             maxiter=sci_opts.get("maxiter"),
                             callback=cb,
@@ -3094,7 +3575,7 @@ class Fitter:
                             native_grad_closure,
                             native_hessp(),
                             native_set_point,
-                            xval,
+                            restrict(xval),
                             gtol=sci_opts.get("gtol", 0.0),
                             maxiter=sci_opts.get("maxiter"),
                             callback=cb,
@@ -3105,7 +3586,7 @@ class Fitter:
                             native_grad_closure,
                             native_hessp(),
                             native_set_point,
-                            xval,
+                            restrict(xval),
                             gtol=sci_opts.get("gtol", 0.0),
                             maxiter=sci_opts.get("maxiter"),
                             callback=cb,
@@ -3113,7 +3594,7 @@ class Fitter:
                     else:
                         res = scipy.optimize.minimize(
                             scipy_loss,
-                            xval,
+                            restrict(xval),
                             method=self.minimizer_method,
                             jac=True,
                             tol=0.0,
@@ -3137,7 +3618,7 @@ class Fitter:
                         )
                     logger.debug(ex)
                 else:
-                    xval = res["x"]
+                    xval = expand(res["x"])
                     self.minimizer_result = res
                     logger.debug(res)
 
@@ -3183,6 +3664,10 @@ class Fitter:
                 self.x.assign(pc_cell[0].to_physical(xval))
                 pc_cell[0] = self._build_preconditioner()
                 xval = pc_cell[0].from_physical(self.x.numpy())
+                # a new transform means new internal coordinates, so what the
+                # frozen entries are held at has to be re-read in them
+                if reduce_frozen:
+                    frozen_ref[0] = xval[ifrozen].copy()
 
         # xval (and callback.xval) are internal coordinates; everything outside
         # fit() expects physical parameters.

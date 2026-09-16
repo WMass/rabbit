@@ -54,3 +54,6 @@ rabbit_text2hdf5 = "bin.rabbit_text2hdf5:main"
 [tool.setuptools.packages.find]
 where = ["."]
 
+[tool.setuptools.package-data]
+"rabbit.lineshapes" = ["data/*.npz"]
+
