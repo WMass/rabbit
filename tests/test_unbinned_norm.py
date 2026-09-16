@@ -32,8 +32,19 @@ from rabbit import unbinned
 DTYPE = tf.float64
 
 
-def gauss_term(name, mobs, sigma, nt=512, tmax=8.0, m_ref=0.0, window=None,
-               nclass=1, gamma_param=None, chunk=100000, tpoints=8192):
+def gauss_term(
+    name,
+    mobs,
+    sigma,
+    nt=512,
+    tmax=8.0,
+    m_ref=0.0,
+    window=None,
+    nclass=1,
+    gamma_param=None,
+    chunk=100000,
+    tpoints=8192,
+):
     """Gaussian (+ optional Breit-Wigner) term, optionally window-normalised."""
     tgrid = np.linspace(0.0, tmax, nt)
     vgf = np.ones(len(sigma))
@@ -48,15 +59,26 @@ def gauss_term(name, mobs, sigma, nt=512, tmax=8.0, m_ref=0.0, window=None,
         edges = np.quantile(sigma, np.linspace(0, 1, nclass + 1))
         cls = np.clip(np.searchsorted(edges[1:-1], sigma, "right"), 0, nclass - 1)
         sig_c = np.array(
-            [np.median(sigma[cls == c]) if np.any(cls == c) else sigma.mean()
-             for c in range(nclass)]
+            [
+                np.median(sigma[cls == c]) if np.any(cls == c) else sigma.mean()
+                for c in range(nclass)
+            ]
         )
-        norm = {"sigma": sig_c, "vgf": np.ones(nclass), "class": cls,
-                "families": []}
+        norm = {"sigma": sig_c, "vgf": np.ones(nclass), "class": cls, "families": []}
     return unbinned.MassCFTerm(
-        name, sigma=sigma, mobs=mobs, tgrid=tgrid, families=families, vgf=vgf,
-        kernel=kernel, m_ref=m_ref, norm_window=window, norm_tpoints=tpoints,
-        norm=norm, chunk=chunk, dtype=DTYPE,
+        name,
+        sigma=sigma,
+        mobs=mobs,
+        tgrid=tgrid,
+        families=families,
+        vgf=vgf,
+        kernel=kernel,
+        m_ref=m_ref,
+        norm_window=window,
+        norm_tpoints=tpoints,
+        norm=norm,
+        chunk=chunk,
+        dtype=DTYPE,
     )
 
 
@@ -76,27 +98,30 @@ def test1():
     lo, hi = m_ref - 2.0, m_ref + 2.0
     ok = True
     for nodes in (1024, 4096, 16384):
-        t = gauss_term("g", mobs, sigma, window=(lo, hi), nclass=8,
-                       tpoints=nodes, m_ref=m_ref)
+        t = gauss_term(
+            "g", mobs, sigma, window=(lo, hi), nclass=8, tpoints=nodes, m_ref=m_ref
+        )
         z = t._norm_z({"k_res": tf.constant(1.0, DTYPE)}).numpy()
         sc = np.asarray(t._norm["sigma"])
         exact = phi((hi - m_ref) / sc) - phi((lo - m_ref) / sc)
         dev = np.max(np.abs(z - exact))
-        print(f"    t points={nodes:6d}  max |Z - erf|  = {dev:.3e}   "
-              f"(Z in [{z.min():.6f}, {z.max():.6f}])")
+        print(
+            f"    t points={nodes:6d}  max |Z - erf|  = {dev:.3e}   "
+            f"(Z in [{z.min():.6f}, {z.max():.6f}])"
+        )
         if nodes == 16384:
             ok &= dev < 1e-6
     # a scaled resolution must still be exact
-    t = gauss_term("g", mobs, sigma, window=(lo, hi), nclass=8, tpoints=16384,
-                   m_ref=m_ref)
+    t = gauss_term(
+        "g", mobs, sigma, window=(lo, hi), nclass=8, tpoints=16384, m_ref=m_ref
+    )
     for k in (0.5, 2.0):
         z = t._norm_z({"k_res": tf.constant(k, DTYPE)}).numpy()
         sc = np.asarray(t._norm["sigma"]) * np.sqrt(k)
         dev = np.max(np.abs(z - (phi((hi - m_ref) / sc) - phi((lo - m_ref) / sc))))
         print(f"    k_res={k:4.1f}   max |Z - erf|  = {dev:.3e}")
         ok &= dev < 1e-6
-    print("    (the residual is the midpoint-rule error of the Fourier "
-          "quadrature)")
+    print("    (the residual is the midpoint-rule error of the Fourier " "quadrature)")
     print(f"  -> {'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -110,19 +135,37 @@ def test2():
     ref = None
     ok = True
     for nodes in (256, 512, 1024, 2048, 8192, 32768):
-        t = gauss_term("v", mobs, sigma, window=(60.0, 120.0), nclass=4,
-                       tpoints=nodes, m_ref=91.1876, gamma_param="gam")
-        z = t._norm_z({"k_res": tf.constant(1.0, DTYPE),
-                       "gam": tf.constant(2493.2, DTYPE)}).numpy()
+        t = gauss_term(
+            "v",
+            mobs,
+            sigma,
+            window=(60.0, 120.0),
+            nclass=4,
+            tpoints=nodes,
+            m_ref=91.1876,
+            gamma_param="gam",
+        )
+        z = t._norm_z(
+            {"k_res": tf.constant(1.0, DTYPE), "gam": tf.constant(2493.2, DTYPE)}
+        ).numpy()
         if ref is None:
             first = z
         ref = z
         print(f"    t points={nodes:6d}  Z = " + " ".join(f"{v:.9f}" for v in z))
     # the 32768-point answer is the reference; check 8192 is already there
-    t = gauss_term("v", mobs, sigma, window=(60.0, 120.0), nclass=4, tpoints=8192,
-                   m_ref=91.1876, gamma_param="gam")
-    z257 = t._norm_z({"k_res": tf.constant(1.0, DTYPE),
-                      "gam": tf.constant(2493.2, DTYPE)}).numpy()
+    t = gauss_term(
+        "v",
+        mobs,
+        sigma,
+        window=(60.0, 120.0),
+        nclass=4,
+        tpoints=8192,
+        m_ref=91.1876,
+        gamma_param="gam",
+    )
+    z257 = t._norm_z(
+        {"k_res": tf.constant(1.0, DTYPE), "gam": tf.constant(2493.2, DTYPE)}
+    ).numpy()
     dev = np.max(np.abs(z257 - ref) / ref)
     print(f"    8192 vs 32768 t points: max rel dev = {dev:.3e}")
     ok &= dev < 1e-5
@@ -132,26 +175,39 @@ def test2():
 
 def test3():
     print("\n[3] cost of the resolution-class approximation")
-    print("    K classes replace the exact per-candidate Z. What matters is "
-          "how fast Z\n    varies with sigma, i.e. how close the window edge "
-          "is in units of sigma.")
+    print(
+        "    K classes replace the exact per-candidate Z. What matters is "
+        "how fast Z\n    varies with sigma, i.e. how close the window edge "
+        "is in units of sigma."
+    )
     rng = np.random.default_rng(9)
     n = 5000
     sigma = rng.uniform(0.5, 3.0, n)
     mobs = rng.normal(0.0, 1.5, n)
     m_ref = 91.1876
     ok = True
-    for half, tag in ((2.0, "narrow, edge at 1-4 sigma (worst case)"),
-                      (8.0, "edge at 3-16 sigma"),
-                      (30.0, "the real Z window, edge at 10-60 sigma")):
+    for half, tag in (
+        (2.0, "narrow, edge at 1-4 sigma (worst case)"),
+        (8.0, "edge at 3-16 sigma"),
+        (30.0, "the real Z window, edge at 10-60 sigma"),
+    ):
         lo, hi = m_ref - half, m_ref + half
         exact = phi((hi - m_ref) / sigma) - phi((lo - m_ref) / sigma)
-        print(f"    window +-{half:4.1f} GeV ({tag}): Z in "
-              f"[{exact.min():.6f}, {exact.max():.6f}]")
+        print(
+            f"    window +-{half:4.1f} GeV ({tag}): Z in "
+            f"[{exact.min():.6f}, {exact.max():.6f}]"
+        )
         devs = {}
         for nclass in (1, 4, 16, 32):
-            t = gauss_term("g", mobs, sigma, window=(lo, hi), nclass=nclass,
-                           tpoints=8192, m_ref=m_ref)
+            t = gauss_term(
+                "g",
+                mobs,
+                sigma,
+                window=(lo, hi),
+                nclass=nclass,
+                tpoints=8192,
+                m_ref=m_ref,
+            )
             z = t._norm_z({"k_res": tf.constant(1.0, DTYPE)}).numpy()
             per = np.asarray(tf.gather(z, t._norm_class))
             devs[nclass] = np.max(np.abs(per - exact) / exact)
@@ -182,12 +238,28 @@ def test4():
     # working grid (64 in-maker points, 512 here) does not resolve. That is the
     # whole reason _norm_z does the integral in Fourier space instead.
     NT = 8192
-    term = gauss_term("a", mobs, sigma, window=(lo, hi), nclass=1, tpoints=16384,
-                      m_ref=m_ref, gamma_param="gam", nt=NT)
+    term = gauss_term(
+        "a",
+        mobs,
+        sigma,
+        window=(lo, hi),
+        nclass=1,
+        tpoints=16384,
+        m_ref=m_ref,
+        gamma_param="gam",
+        nt=NT,
+    )
     plain = gauss_term("b", mobs, sigma, m_ref=m_ref, gamma_param="gam", nt=NT)
     grid = np.linspace(lo, hi, 16385)
-    gterm = gauss_term("c", grid - m_ref, np.full(len(grid), sig0), m_ref=m_ref,
-                       gamma_param="gam", chunk=len(grid), nt=NT)
+    gterm = gauss_term(
+        "c",
+        grid - m_ref,
+        np.full(len(grid), sig0),
+        m_ref=m_ref,
+        gamma_param="gam",
+        chunk=len(grid),
+        nt=NT,
+    )
     dg = tf.constant(np.diff(grid), DTYPE)
     names = ["k_res", "gam"]
 
@@ -215,10 +287,12 @@ def test4():
         dgr = np.max(np.abs(ga - gb) / (np.abs(gb) + 1e-30))
         print(f"    x={x}: NLL rel dev {dn:.3e}, grad rel dev {dgr:.3e}")
         ok &= dn < 1e-5 and dgr < 1e-4
-    print("    (both routes are quadrature-limited at ~1e-6 relative here -- "
-          "refining the\n     mass grid from 2049 to 16385 nodes does not move "
-          "the number, and test 2 shows\n     the Fourier Z converging at the "
-          "same 1e-6. The point is that they agree.)")
+    print(
+        "    (both routes are quadrature-limited at ~1e-6 relative here -- "
+        "refining the\n     mass grid from 2049 to 16385 nodes does not move "
+        "the number, and test 2 shows\n     the Fourier Z converging at the "
+        "same 1e-6. The point is that they agree.)"
+    )
     print(f"  -> {'PASS' if ok else 'FAIL'}")
     return ok
 
@@ -258,20 +332,33 @@ def test5():
     keep = (mobs_all + m_ref > lo) & (mobs_all + m_ref < hi)
     mobs = mobs_all[keep]
     sigma = np.full(len(mobs), sig0)
-    print(f"    {len(mobs)} of {n} inside [{lo}, {hi}] "
-          f"({100*(1-keep.mean()):.2f} % cut away)")
+    print(
+        f"    {len(mobs)} of {n} inside [{lo}, {hi}] "
+        f"({100*(1-keep.mean()):.2f} % cut away)"
+    )
 
     ok = True
     for label, window in (("with norm_window", (lo, hi)), ("without", None)):
-        t = gauss_term("f", mobs, sigma, window=window, nclass=1, tpoints=16384,
-                       m_ref=m_ref, gamma_param="gam", chunk=200000)
+        t = gauss_term(
+            "f",
+            mobs,
+            sigma,
+            window=window,
+            nclass=1,
+            tpoints=16384,
+            m_ref=m_ref,
+            gamma_param="gam",
+            chunk=200000,
+        )
         t0 = time.time()
         res, H = _fit(lambda x: t.nll(x), [1.0, 2400.0], 2)
         err = np.sqrt(np.diag(np.linalg.inv(H)))
         pull = (res.x[1] - gamma_true) / err[1]
-        print(f"    {label:18s}: k_res = {res.x[0]:.5f} +- {err[0]:.5f}, "
-              f"Gamma = {res.x[1]:8.2f} +- {err[1]:5.2f} MeV "
-              f"(truth {gamma_true}, pull {pull:+.1f}) [{time.time()-t0:.0f} s]")
+        print(
+            f"    {label:18s}: k_res = {res.x[0]:.5f} +- {err[0]:.5f}, "
+            f"Gamma = {res.x[1]:8.2f} +- {err[1]:5.2f} MeV "
+            f"(truth {gamma_true}, pull {pull:+.1f}) [{time.time()-t0:.0f} s]"
+        )
         if window is not None:
             ok &= abs(pull) < 3.0
         else:
@@ -302,35 +389,51 @@ def test6():
 
     def build(tg, sr, si, ups):
         return unbinned.MassCFTerm(
-            "u", sigma=sigma, mobs=mobs, tgrid=tg, vgf=vgf,
-            families=[{"name": "hit", "param": "k_hit", "kind": "gauss"},
-                      {"name": "ms", "param": "k_ms", "kind": "tab",
-                       "re": sr, "im": si}],
+            "u",
+            sigma=sigma,
+            mobs=mobs,
+            tgrid=tg,
+            vgf=vgf,
+            families=[
+                {"name": "hit", "param": "k_hit", "kind": "gauss"},
+                {"name": "ms", "param": "k_ms", "kind": "tab", "re": sr, "im": si},
+            ],
             phik=(ttab, phik.real.copy(), phik.imag.copy()),
-            m_ref=m_ref, upsample=ups, chunk=n, dtype=DTYPE)
+            m_ref=m_ref,
+            upsample=ups,
+            chunk=n,
+            dtype=DTYPE,
+        )
 
     vals = tf.constant([1.0, 1.0], DTYPE)
     ok = True
     for f in (4, 16):
         t1 = np.linspace(0.0, tmax, (nt - 1) * f + 1)
-        pre = build(t1, CubicSpline(t0, sre, axis=1)(t1),
-                    CubicSpline(t0, sim, axis=1)(t1), 1)
+        pre = build(
+            t1, CubicSpline(t0, sre, axis=1)(t1), CubicSpline(t0, sim, axis=1)(t1), 1
+        )
         ing = build(t0, sre, sim, f)
         a = pre.raw_density(vals).numpy()
         b = ing.raw_density(vals).numpy()
         dev = np.max(np.abs(a - b) / np.abs(a))
-        print(f"    upsample {f:3d}: in-graph vs pre-splined density, "
-              f"max rel dev = {dev:.3e}   (NLL {pre.nll(vals).numpy():.9f} vs "
-              f"{ing.nll(vals).numpy():.9f})")
+        print(
+            f"    upsample {f:3d}: in-graph vs pre-splined density, "
+            f"max rel dev = {dev:.3e}   (NLL {pre.nll(vals).numpy():.9f} vs "
+            f"{ing.nll(vals).numpy():.9f})"
+        )
         ok &= dev < 1e-8
     base = build(t0, sre, sim, 1)
     prev = base.raw_density(vals).numpy()
-    print("    convergence of the density with the integration grid "
-          "(median |rel change|):")
+    print(
+        "    convergence of the density with the integration grid "
+        "(median |rel change|):"
+    )
     for f in (2, 4, 8, 16, 32):
         cur = build(t0, sre, sim, f).raw_density(vals).numpy()
-        print(f"      {f:3d}x ({(nt-1)*f+1:5d} points): "
-              f"{np.median(np.abs(cur - prev) / np.abs(cur)):.3e}")
+        print(
+            f"      {f:3d}x ({(nt-1)*f+1:5d} points): "
+            f"{np.median(np.abs(cur - prev) / np.abs(cur)):.3e}"
+        )
         prev = cur
     print(f"  -> {'PASS' if ok else 'FAIL'}")
     return ok
@@ -339,7 +442,7 @@ def test6():
 if __name__ == "__main__":
     skip = set()
     if "--skip" in sys.argv:
-        skip = {int(a) for a in sys.argv[sys.argv.index("--skip") + 1:]}
+        skip = {int(a) for a in sys.argv[sys.argv.index("--skip") + 1 :]}
     results = {}
     for i, f in enumerate((test1, test2, test3, test4, test5, test6), 1):
         if i in skip:

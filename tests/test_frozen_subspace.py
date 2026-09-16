@@ -133,8 +133,7 @@ def test_freezing_a_parameter_at_its_own_optimum_changes_nothing_else(method):
         frozen = names[-2:]
         idx = [names.index(n) for n in frozen]
 
-        g = _setup(filename, minimizerMethod=method,
-                   freezeParameters=frozen)
+        g = _setup(filename, minimizerMethod=method, freezeParameters=frozen)
         x0 = g.x.numpy().copy()
         x0[idx] = xfree[idx]
         g.x.assign(x0)

@@ -32,8 +32,7 @@ def make_provider(cfg, dtype=None):
     typ = cfg.get("type")
     if typ not in _PROVIDERS:
         raise ValueError(
-            f"unknown lineshape provider type '{typ}'; "
-            f"known: {sorted(_PROVIDERS)}"
+            f"unknown lineshape provider type '{typ}'; " f"known: {sorted(_PROVIDERS)}"
         )
     kw = {} if dtype is None else {"dtype": dtype}
     return _PROVIDERS[typ].from_config(cfg, **kw)

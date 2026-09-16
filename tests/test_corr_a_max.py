@@ -29,7 +29,6 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from rabbit import unbinned  # noqa: E402
 
 from .test_fluctuation import build, dens  # noqa: E402
 
@@ -43,8 +42,14 @@ def _term(a_res, **kw):
     rng = np.random.default_rng(7)
     sigma = np.full(n, 0.9)
     mobs = rng.normal(0.0, 1.0, n)
-    return build(sigma, mobs, a_res=np.asarray(a_res, float),
-                 jensen_s2=np.full(n, 1e-4), corr_form="fluctuation", **kw)
+    return build(
+        sigma,
+        mobs,
+        a_res=np.asarray(a_res, float),
+        jensen_s2=np.full(n, 1e-4),
+        corr_form="fluctuation",
+        **kw,
+    )
 
 
 def test_default_is_off_and_bit_identical():
@@ -91,15 +96,26 @@ def test_a_wide_candidate_that_the_quadratic_bound_cannot_reach():
     rng = np.random.default_rng(7)
     # sigma/m ~ 9.9 %, i.e. the wide population, and a_res tuned so the
     # cancellation leaves |g| ~ 0.02 as measured
-    t = build(np.array([9.0]), rng.normal(0.0, 1.0, 1),
-              a_res=np.array([0.12]), jensen_s2=np.array([1e-4]),
-              corr_form="fluctuation", corr_coeff_max=0.08)
+    t = build(
+        np.array([9.0]),
+        rng.normal(0.0, 1.0, 1),
+        a_res=np.array([0.12]),
+        jensen_s2=np.array([1e-4]),
+        corr_form="fluctuation",
+        corr_coeff_max=0.08,
+    )
     a, g = _a_g(t)
     assert abs(a[0]) > 0.08 > abs(g[0]), (a[0], g[0])
     assert abs(g[0]) < 0.03, g[0]
-    tb = build(np.array([9.0]), rng.normal(0.0, 1.0, 1),
-               a_res=np.array([0.12]), jensen_s2=np.array([1e-4]),
-               corr_form="fluctuation", corr_coeff_max=0.08, corr_a_max=0.05)
+    tb = build(
+        np.array([9.0]),
+        rng.normal(0.0, 1.0, 1),
+        a_res=np.array([0.12]),
+        jensen_s2=np.array([1e-4]),
+        corr_form="fluctuation",
+        corr_coeff_max=0.08,
+        corr_a_max=0.05,
+    )
     ab, _ = _a_g(tb)
     assert abs(ab[0]) == 0.05
 
@@ -143,8 +159,9 @@ def test_set_corr_form_round_trips_to_the_constructed_term():
     sigma = np.full(3, 0.9)
     mobs = rng.normal(0.0, 1.0, 3)
     built = build(sigma, mobs, a_res=a_res, jensen_s2=js, corr_form="residual")
-    flipped = build(sigma, mobs, a_res=a_res, jensen_s2=js,
-                    corr_form="fluctuation").set_corr_form("residual")
+    flipped = build(
+        sigma, mobs, a_res=a_res, jensen_s2=js, corr_form="fluctuation"
+    ).set_corr_form("residual")
     assert flipped.corr_form == "residual" and not flipped._fluct
     # the fluctuation block must be switched OFF, not left stale
     assert flipped._fl_a is None and flipped._fl_g is None
@@ -158,8 +175,13 @@ def test_set_corr_form_is_reversible():
     a_res = np.array([0.01, 0.05, 0.20])
     js = np.full(3, 1e-4)
     rng = np.random.default_rng(7)
-    t = build(np.full(3, 0.9), rng.normal(0.0, 1.0, 3), a_res=a_res,
-              jensen_s2=js, corr_form="fluctuation")
+    t = build(
+        np.full(3, 0.9),
+        rng.normal(0.0, 1.0, 3),
+        a_res=a_res,
+        jensen_s2=js,
+        corr_form="fluctuation",
+    )
     d0 = dens(t)
     a0 = np.asarray(t._fl_a).copy()
     t.set_corr_form("residual")
@@ -177,11 +199,17 @@ def test_the_residual_form_cannot_produce_a_negative_density():
     kernel evaluated at a shifted residual with a positive Jacobian.
     """
     sigma = np.array([9.0])
-    mobs = np.array([36.0])          # 4 sigma out, where the density is tiny
+    mobs = np.array([36.0])  # 4 sigma out, where the density is tiny
     a_res = np.array([0.35])
     js = np.array([1e-4])
-    fl = build(sigma, mobs, a_res=a_res, jensen_s2=js,
-               corr_form="fluctuation", corr_coeff_max=0.0)
+    fl = build(
+        sigma,
+        mobs,
+        a_res=a_res,
+        jensen_s2=js,
+        corr_form="fluctuation",
+        corr_coeff_max=0.0,
+    )
     res = build(sigma, mobs, a_res=a_res, jensen_s2=js, corr_form="residual")
     assert dens(fl)[0] <= 0.0 < dens(res)[0], (dens(fl)[0], dens(res)[0])
     # and the load-time flip fixes it in place

@@ -242,17 +242,21 @@ class JacChunkTable:
         self.njac = int(njac)
         self._whole = None
         self._whole_d = None
-        nnz = sum(int(b.values.shape[0]) for b in blocks
-                  if isinstance(b, tf.sparse.SparseTensor))
+        nnz = sum(
+            int(b.values.shape[0])
+            for b in blocks
+            if isinstance(b, tf.sparse.SparseTensor)
+        )
         ntot = max(1, int(chunks.n) * self.njac)
         self.density = nnz / ntot
         if dense is None:
             dense = self.density >= self.DENSE_THRESHOLD
         self.is_dense = bool(dense)
         if self.is_dense:
-            blocks = [tf.sparse.to_dense(b)
-                      if isinstance(b, tf.sparse.SparseTensor) else b
-                      for b in blocks]
+            blocks = [
+                tf.sparse.to_dense(b) if isinstance(b, tf.sparse.SparseTensor) else b
+                for b in blocks
+            ]
         self.blocks = blocks
 
     def __len__(self):
@@ -263,9 +267,7 @@ class JacChunkTable:
 
     def _whole_sparse(self):
         if self.is_dense:
-            raise RuntimeError(
-                "JacChunkTable holds dense D blocks; use _whole_dense()"
-            )
+            raise RuntimeError("JacChunkTable holds dense D blocks; use _whole_dense()")
         # `tf.init_scope()` because the first *traced* access is what builds
         # this: without it the constants land inside the tf.while_loop's own
         # FuncGraph and cannot be read from anywhere else ("cannot be accessed
@@ -316,9 +318,7 @@ class JacChunkTable:
         return tf.sparse.slice(
             self._whole_sparse(),
             tf.stack([tf.cast(lo, tf.int64), tf.constant(0, tf.int64)]),
-            tf.stack(
-                [tf.cast(hi - lo, tf.int64), tf.constant(self.njac, tf.int64)]
-            ),
+            tf.stack([tf.cast(hi - lo, tf.int64), tf.constant(self.njac, tf.int64)]),
         )
 
     def matvec(self, ci, theta):
@@ -326,9 +326,8 @@ class JacChunkTable:
         blk = self[ci]
         if self.is_dense:
             return tf.linalg.matvec(blk, theta)
-        return tf.squeeze(
-            tf.sparse.sparse_dense_matmul(blk, theta[:, None]), axis=-1
-        )
+        return tf.squeeze(tf.sparse.sparse_dense_matmul(blk, theta[:, None]), axis=-1)
+
 
 # Default preconditioning units, see module docstring.
 ALPHA_UNIT = 1e-3
@@ -818,7 +817,6 @@ class UnbinnedTerm:
 
         return _nll(params)
 
-
     @property
     def chunk_mode(self):
         """``"graph"`` (tf.while_loop) or ``"eager"`` (python loop).
@@ -1090,8 +1088,7 @@ class MassCFTerm(UnbinnedTerm):
         if self.upsample > 1:
             from scipy.interpolate import CubicSpline
 
-            tfine = np.linspace(tgrid[0], tgrid[-1],
-                                (self.nt - 1) * self.upsample + 1)
+            tfine = np.linspace(tgrid[0], tgrid[-1], (self.nt - 1) * self.upsample + 1)
             self._upmat = tf.constant(
                 CubicSpline(tgrid, np.eye(self.nt), axis=0)(tfine), dtype
             )
@@ -1117,9 +1114,7 @@ class MassCFTerm(UnbinnedTerm):
         if a_res is not None:
             arr = np.asarray(a_res, dtype=np.float64).ravel()
             if arr.shape != (self.n,):
-                raise ValueError(
-                    f"a_res has shape {arr.shape}, expected {(self.n,)}"
-                )
+                raise ValueError(f"a_res has shape {arr.shape}, expected {(self.n,)}")
             self.a_res = tf.constant(arr, dtype)
             self._a_res_np = arr
         self._dyn_sigma = (
@@ -1248,11 +1243,13 @@ class MassCFTerm(UnbinnedTerm):
         # corrections would be evaluated at the wrong mass.  Passing the real
         # per-candidate mass here keeps them right without the caller having to
         # patch private attributes.
-        cm = (mobs + float(m_ref)) if corr_mass is None else \
-            np.asarray(corr_mass, dtype=np.float64).ravel()
+        cm = (
+            (mobs + float(m_ref))
+            if corr_mass is None
+            else np.asarray(corr_mass, dtype=np.float64).ravel()
+        )
         if cm.shape != (self.n,):
-            raise ValueError(
-                f"corr_mass has shape {cm.shape}, expected {(self.n,)}")
+            raise ValueError(f"corr_mass has shape {cm.shape}, expected {(self.n,)}")
         self.corr_mass = None if corr_mass is None else cm
         self._jensen_m = tf.constant(cm, dtype)
         self._build_fluct(sigma, cm - float(m_ref), jensen_mode, tgrid)
@@ -1344,8 +1341,11 @@ class MassCFTerm(UnbinnedTerm):
             self.phik_im = None
 
         # ---- truncation normalisation -------------------------------------
-        self.norm_window = None if norm_window is None else (
-            float(norm_window[0]), float(norm_window[1]))
+        self.norm_window = (
+            None
+            if norm_window is None
+            else (float(norm_window[0]), float(norm_window[1]))
+        )
         # IS THE WINDOW IN MASS UNITS OR IN SIGMA?  A Z channel is selected in
         # a MASS window (60-120 GeV), the same for every candidate.  A
         # CONSTRAINT RESIDUAL is selected on its PULL (`|z_v| < 5`), which is
@@ -1397,11 +1397,14 @@ class MassCFTerm(UnbinnedTerm):
             logger.info(
                 f"unbinned term '{name}': D is {self._jac_chunks.density:.1%} "
                 f"dense over {self._chunks.n} x {len(self.jac_params)}, stored "
-                + ("DENSE (sparse_dense_matmul has no deterministic GPU kernel, "
-                   "and below ~1/3 density COO is the larger representation "
-                   "anyway)" if self._jac_chunks.is_dense else
-                   "SPARSE -- note this cannot run on a GPU under "
-                   "tf.config.experimental.enable_op_determinism()")
+                + (
+                    "DENSE (sparse_dense_matmul has no deterministic GPU kernel, "
+                    "and below ~1/3 density COO is the larger representation "
+                    "anyway)"
+                    if self._jac_chunks.is_dense
+                    else "SPARSE -- note this cannot run on a GPU under "
+                    "tf.config.experimental.enable_op_determinism()"
+                )
             )
         elif jac is not None:
             raise ValueError("jac given without jac_params")
@@ -1501,8 +1504,11 @@ class MassCFTerm(UnbinnedTerm):
         if not self._jensen or self.jensen_mode != "shift":
             return None
         lo, hi = self._chunks[ci]
-        return (self.npdt(1.5 * self.jensen_scale)
-                * self.jensen_s2[lo:hi] * self._jensen_m[lo:hi])
+        return (
+            self.npdt(1.5 * self.jensen_scale)
+            * self.jensen_s2[lo:hi]
+            * self._jensen_m[lo:hi]
+        )
 
     def _chunk_sigma(self, values, ci, delta):
         """Per-candidate ``(nchunk,)`` resolution, which DEPENDS on the
@@ -1562,8 +1568,10 @@ class MassCFTerm(UnbinnedTerm):
             return None
         lo, hi = self._chunks[ci]
         sig = self.sigma[lo:hi]
-        return tf.maximum(sig - self.a_res[lo:hi] * self._corr_delta(delta, ci),
-                          self.npdt(self.sigma_floor) * sig)
+        return tf.maximum(
+            sig - self.a_res[lo:hi] * self._corr_delta(delta, ci),
+            self.npdt(self.sigma_floor) * sig,
+        )
 
     def _chunk_residual(self, values, ci):
         """Residual ``delta_i`` fed to the inverse-Fourier integral.
@@ -1714,12 +1722,10 @@ class MassCFTerm(UnbinnedTerm):
             #    0.01 MeV where the fixed-width form is wrong by 7-31 MeV.
             #  * the JENSEN `u^2` term, `+sigma_i/m_i`, unchanged in units of
             #    `k_i` (it is `sigma^2/m` in `m`, divided by `m^p`).
-            sig_phys = sig * mden ** self.vpow
+            sig_phys = sig * mden**self.vpow
             r = sig_phys / mden
             a = a - self.vpow * r
-            gextra = (
-                (1.0 - 0.5 * self.vpow) * r if jen else -0.5 * self.vpow * r
-            )
+            gextra = (1.0 - 0.5 * self.vpow) * r if jen else -0.5 * self.vpow * r
         # THE FIRST-ORDER COEFFICIENT HAS A DOMAIN TOO.  `corr_coeff_max` below
         # bounds the QUADRATIC coefficient because that is the one the Z leg
         # exercised; the map is truncated at first order in `a_i` as well, and
@@ -1805,7 +1811,7 @@ class MassCFTerm(UnbinnedTerm):
         from scipy.interpolate import CubicSpline
 
         tsrc = np.asarray(self.tgrid_stored, dtype=np.float64)
-        tfine = np.asarray(tgrid, dtype=np.float64)   # the INTEGRATION grid
+        tfine = np.asarray(tgrid, dtype=np.float64)  # the INTEGRATION grid
         sp = CubicSpline(tsrc, np.eye(len(tsrc)), axis=0)
         for k in (1, 2):
             self._dmat[k] = tf.constant(sp(tfine, k), self.dtype)
@@ -1870,10 +1876,14 @@ class MassCFTerm(UnbinnedTerm):
         # unconditionally: `_build_fluct` resets the block to inactive when the
         # term is in the RESIDUAL form, which is what has to happen when the
         # form is flipped by :meth:`set_corr_form`
-        cm = (self.corr_mass if self.corr_mass is not None
-              else self.mobs.numpy() + self.m_ref)
-        self._build_fluct(self.sigma.numpy(), cm - self.m_ref,
-                          self.jensen_mode, self.tgrid.numpy())
+        cm = (
+            self.corr_mass
+            if self.corr_mass is not None
+            else self.mobs.numpy() + self.m_ref
+        )
+        self._build_fluct(
+            self.sigma.numpy(), cm - self.m_ref, self.jensen_mode, self.tgrid.numpy()
+        )
         return self
 
     def set_corr_form(self, corr_form):
@@ -1910,8 +1920,7 @@ class MassCFTerm(UnbinnedTerm):
         """
         if corr_form not in ("residual", "fluctuation"):
             raise ValueError(
-                f"corr_form must be 'residual' or 'fluctuation', got "
-                f"'{corr_form}'"
+                f"corr_form must be 'residual' or 'fluctuation', got " f"'{corr_form}'"
             )
         if corr_form == self.corr_form:
             return self
@@ -1959,9 +1968,10 @@ class MassCFTerm(UnbinnedTerm):
         start, stop = int(start), int(stop)
         if not 0 <= start < stop <= self.n:
             raise ValueError(f"candidate range [{start}, {stop}) outside [0, {self.n})")
-        if getattr(self, "g_ptr", None) is not None or getattr(
-            self, "h_ptr", None
-        ) is not None:
+        if (
+            getattr(self, "g_ptr", None) is not None
+            or getattr(self, "h_ptr", None) is not None
+        ):
             # the CSR group / hit blocks are indexed by a POINTER array of
             # length n+1 into a flat nnz axis; slicing candidates means
             # re-cutting both, which the leading-dimension detection below
@@ -2016,8 +2026,10 @@ class MassCFTerm(UnbinnedTerm):
             else:
                 whole = self._jac_chunks._whole_sparse()
                 sub = tf.sparse.slice(whole, [start, 0], [n, njac])
-                blocks = [tf.sparse.slice(sub, [lo, 0], [hi - lo, njac])
-                          for lo, hi in out._chunks]
+                blocks = [
+                    tf.sparse.slice(sub, [lo, 0], [hi - lo, njac])
+                    for lo, hi in out._chunks
+                ]
             out._jac_chunks = JacChunkTable(
                 blocks, out._chunks, njac, dense=self._jac_chunks.is_dense
             )
@@ -2074,8 +2086,8 @@ class MassCFTerm(UnbinnedTerm):
         key = self._memo_key(ci)
         self._jensen_u[key] = u
         self._jensen_clipped[key] = (
-            None if self.corr_clip <= 0.0
-            else tf.abs(delta - dc) > self.npdt(0.0))
+            None if self.corr_clip <= 0.0 else tf.abs(delta - dc) > self.npdt(0.0)
+        )
         # inside the clip this IS `u m`; outside, the map is continued with
         # unit slope from the boundary, so the correction saturates at the
         # value it had there and the transform stays monotone
@@ -2251,10 +2263,12 @@ class MassCFTerm(UnbinnedTerm):
             z = tf.zeros(
                 [self._chunks[ci][1] - self._chunks[ci][0], self.nt_int], self.dtype
             )
-        return (d1re if d1re is not None else z,
-                d1im if d1im is not None else z,
-                d2re if d2re is not None else z,
-                d2im if d2im is not None else z)
+        return (
+            d1re if d1re is not None else z,
+            d1im if d1im is not None else z,
+            d2re if d2re is not None else z,
+            d2im if d2im is not None else z,
+        )
 
     def _density(
         self,
@@ -2515,9 +2529,7 @@ class MassCFTerm(UnbinnedTerm):
         g = edge(d_lo) - edge(d_hi)
         if s_re is not None:
             g = tf.exp(s_re) * g
-        return tf.reduce_sum(g / t[None, :], axis=1) * self.npdt(
-            self._norm_dt / np.pi
-        )
+        return tf.reduce_sum(g / t[None, :], axis=1) * self.npdt(self._norm_dt / np.pi)
 
     def _norm_extra(self, values, s_re, s_im, t):
         """Subclass parts of the CLASS-level resolution exponent.
@@ -2594,8 +2606,7 @@ class MassCFTerm(UnbinnedTerm):
         # are declared structurally in `norm_fixed` so the card round-trips.
         self.norm_fixed = []
         for f in norm.get("fixed", []):
-            entry = {"name": f["name"], "param": None,
-                     "kind": f.get("kind", "tab")}
+            entry = {"name": f["name"], "param": None, "kind": f.get("kind", "tab")}
             if entry["kind"] != "gauss":
                 for comp in ("re", "im"):
                     arr = f.get(comp)
@@ -2960,9 +2971,7 @@ class MaterialCFTerm(MassCFTerm):
                                 f"'fix_{comp}' has shape {fx.shape}, expected "
                                 f"{(self.n, self.nt)}"
                             )
-                        entry["fix_" + comp] = tf.constant(
-                            fx, tf.as_dtype(fx.dtype)
-                        )
+                        entry["fix_" + comp] = tf.constant(fx, tf.as_dtype(fx.dtype))
                 if len(entry) == 1:
                     raise ValueError(
                         f"group family '{f['name']}' has no re/im/fix component"
@@ -3031,23 +3040,32 @@ class MaterialCFTerm(MassCFTerm):
         dtype = self.dtype
         nt = self.norm_tpoints
         tsrc = np.asarray(self.tgrid_stored, dtype=np.float64)
-        tmid = np.asarray(self._norm_tgrid.numpy() if hasattr(self._norm_tgrid,
-                          "numpy") else self._norm_tgrid, dtype=np.float64)
+        tmid = np.asarray(
+            (
+                self._norm_tgrid.numpy()
+                if hasattr(self._norm_tgrid, "numpy")
+                else self._norm_tgrid
+            ),
+            dtype=np.float64,
+        )
 
         def _resample(arr, want_rows):
             """Put a `(..., nt_stored or nt_norm)` array on the norm grid."""
             from scipy.interpolate import CubicSpline
+
             arr = np.asarray(arr, dtype=np.float64)
             if arr.shape[0] != want_rows:
                 raise ValueError(
                     f"norm group array has {arr.shape[0]} rows, expected "
-                    f"{want_rows}")
+                    f"{want_rows}"
+                )
             if arr.shape[-1] == nt:
                 return arr
             if arr.shape[-1] != self.nt:
                 raise ValueError(
                     f"norm group array has {arr.shape[-1]} t points, expected "
-                    f"{self.nt} or {nt}")
+                    f"{self.nt} or {nt}"
+                )
             return CubicSpline(tsrc, arr, axis=-1)(tmid)
 
         self._norm_gfam = []
@@ -3061,19 +3079,23 @@ class MaterialCFTerm(MassCFTerm):
                         raise ValueError(
                             f"norm group family '{f['name']}' has "
                             f"{a.shape[1]} groups, expected "
-                            f"{len(self.group_params)}")
+                            f"{len(self.group_params)}"
+                        )
                     entry[comp] = tf.constant(a, dtype)
                 fx = f.get("fix_" + comp)
                 if fx is not None:
                     entry["fix_" + comp] = tf.constant(
-                        _resample(fx, self._nclass), dtype)
+                        _resample(fx, self._nclass), dtype
+                    )
             if len(entry) > 1:
                 self._norm_gfam.append(entry)
 
         vgo = norm.get("vg_other")
-        self._norm_vgother = (None if vgo is None else
-                              tf.constant(np.asarray(vgo, np.float64).ravel(),
-                                          dtype))
+        self._norm_vgother = (
+            None
+            if vgo is None
+            else tf.constant(np.asarray(vgo, np.float64).ravel(), dtype)
+        )
         hv = norm.get("hit_v")
         if hv is None:
             self._norm_hitv = None
@@ -3082,17 +3104,19 @@ class MaterialCFTerm(MassCFTerm):
             if hv.shape != (self._nclass, len(self.hit_params)):
                 raise ValueError(
                     f"norm hit_v has shape {hv.shape}, expected "
-                    f"{(self._nclass, len(self.hit_params))}")
+                    f"{(self._nclass, len(self.hit_params))}"
+                )
             self._norm_hitv = tf.constant(hv, dtype)
         if self._norm_gfam and self._norm_vgother is None and self.h_ptr is not None:
             raise ValueError(
                 "a MaterialCF truncation normalisation needs norm['vg_other'] "
-                "whenever the term carries a Gaussian hit share")
+                "whenever the term carries a Gaussian hit share"
+            )
 
     def _norm_extra(self, values, s_re, s_im, t):
         dtype = self.dtype
         if getattr(self, "_norm_gfam", None):
-            w = self._amount(values)                      # (G,)
+            w = self._amount(values)  # (G,)
             for f in self._norm_gfam:
                 for comp, tgt in (("re", 0), ("im", 1)):
                     arr = f.get(comp)
@@ -3124,8 +3148,9 @@ class MaterialCFTerm(MassCFTerm):
     def _amount(self, values):
         k = tf.stack([values[p] for p in self.group_params]) * self._gunits
         if self.amount_clip > 0.0:
-            k = tf.clip_by_value(k, self.npdt(-self.amount_clip),
-                                 self.npdt(self.amount_clip))
+            k = tf.clip_by_value(
+                k, self.npdt(-self.amount_clip), self.npdt(self.amount_clip)
+            )
         if self.amount_mode == "exp":
             return tf.exp(k)
         return tf.maximum(tf.constant(1.0, self.dtype) + k, self.npdt(0.0))
@@ -3133,8 +3158,7 @@ class MaterialCFTerm(MassCFTerm):
     def _hitscale(self, values):
         e = tf.stack([values[p] for p in self.hit_params]) * self._hunits
         if self.hit_clip > 0.0:
-            e = tf.clip_by_value(e, self.npdt(-self.hit_clip),
-                                 self.npdt(self.hit_clip))
+            e = tf.clip_by_value(e, self.npdt(-self.hit_clip), self.npdt(self.hit_clip))
         if self.hit_mode == "exp":
             return tf.exp(e)
         return tf.maximum(tf.constant(1.0, self.dtype) + e, self.npdt(0.0))
@@ -3164,9 +3188,7 @@ class MaterialCFTerm(MassCFTerm):
             a, b = self._csr_bounds(self.g_ptr, self._g_ptr_t, lo, hi)
             w = self._amount(values)
             wrow = tf.gather(w, self._g_id[a:b])[:, None]
-            seg = self._g_seg[a:b] - (
-                lo if tf.is_tensor(lo) else np.int32(lo)
-            )
+            seg = self._g_seg[a:b] - (lo if tf.is_tensor(lo) else np.int32(lo))
             nseg = hi - lo
             for f in self.group_families:
                 for comp, tgt in (("re", 0), ("im", 1)):
@@ -3385,8 +3407,10 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
             for fam in cfg.get("group_families", []):
                 entry = {"name": fam["name"]}
                 for comp in ("re", "im"):
-                    for pref, key in (("", f"Sg_{comp}_{fam['name']}"),
-                                      ("fix_", f"Sgfix_{comp}_{fam['name']}")):
+                    for pref, key in (
+                        ("", f"Sg_{comp}_{fam['name']}"),
+                        ("fix_", f"Sgfix_{comp}_{fam['name']}"),
+                    ):
                         if key in data:
                             entry[pref + comp] = data.pop(key)
                 gfam.append(entry)
@@ -3413,8 +3437,9 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
                     entry = {"name": fam["name"]}
                     for comp in ("re", "im"):
                         for pref, key in (
-                                ("", f"Sg_{comp}_{fam['name']}_norm"),
-                                ("fix_", f"Sgfix_{comp}_{fam['name']}_norm")):
+                            ("", f"Sg_{comp}_{fam['name']}_norm"),
+                            ("fix_", f"Sgfix_{comp}_{fam['name']}_norm"),
+                        ):
                             if key in data:
                                 entry[pref + comp] = data.pop(key)
                     if len(entry) > 1:

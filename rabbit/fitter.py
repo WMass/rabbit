@@ -190,9 +190,7 @@ class Fitter:
         # / "StridedSliceGrad" on an empty tensor) and the whole jit-compiled
         # loss+gradient call fails. Graph mode handles it fine, so drop jit.
         _empty_block = (
-            param_model.npoi == 0
-            or param_model.npou == 0
-            or self.indata.nsyst == 0
+            param_model.npoi == 0 or param_model.npou == 0 or self.indata.nsyst == 0
         )
         if _jit_opt == "off":
             self.jit_compile = False
@@ -3434,8 +3432,13 @@ class Fitter:
                 pfull[ifree] = np.asarray(p, dtype=np.float64)
                 return np.asarray(_f(expand(u), pfull))[ifree]
 
-            _nat = (native_loss, native_closure, native_grad_closure,
-                    native_set_point, native_hessp)
+            _nat = (
+                native_loss,
+                native_closure,
+                native_grad_closure,
+                native_set_point,
+                native_hessp,
+            )
 
             def native_loss(u, _f=_nat[0]):
                 return _f(expand(u))
@@ -3471,9 +3474,7 @@ class Fitter:
                 f"[minimize] minimising over {ifree.size} floating parameter(s); "
                 f"{ifrozen.size} frozen one(s) are removed from the vector the "
                 "minimiser sees, not merely stop-gradiented, and are held at: "
-                + ", ".join(
-                    f"{_pn[i]}={_held[i]:.10g}" for i in ifrozen[:12]
-                )
+                + ", ".join(f"{_pn[i]}={_held[i]:.10g}" for i in ifrozen[:12])
                 + (" ..." if ifrozen.size > 12 else "")
             )
 

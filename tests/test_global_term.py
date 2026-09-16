@@ -108,9 +108,7 @@ class Toy:
         self.priors = dict(priors or {})
 
         # design matrix of the linear part: u = [alpha, theta]
-        self.A = np.concatenate(
-            [np.full((n, 1), ALPHA_UNIT * M_REF), self.D], axis=1
-        )
+        self.A = np.concatenate([np.full((n, 1), ALPHA_UNIT * M_REF), self.D], axis=1)
         self.W = 1.0 / self.sigma**2
 
     # -- reference ---------------------------------------------------------
@@ -180,7 +178,9 @@ class Toy:
                 fr = free[free > 0]
                 rhs = -G[fr] - Q[np.ix_(fr, free[free == 0])].sum(axis=1) * 0.0
                 rhs = rhs - Q[np.ix_(fr, np.arange(nu))] @ ufix
-                u[fr] = np.linalg.solve(Q[np.ix_(fr, fr)], rhs + Q[np.ix_(fr, fr)] @ ufix[fr])
+                u[fr] = np.linalg.solve(
+                    Q[np.ix_(fr, fr)], rhs + Q[np.ix_(fr, fr)] @ ufix[fr]
+                )
                 return u
             M = AWA / k + Q
             rhs = AWm / k - G - M @ ufix + M[:, free] @ ufix[free]
@@ -403,7 +403,9 @@ def test_quadratic_only(tmpdir):
     assert models == [["ExternalParams", "bundle:global_params"]], models
     ref_x, ref_cov, ref_nll = toy.solve(with_ext=True, with_mass=False)
     ref = {nm: ref_x[2 + j] for j, nm in enumerate(toy.names)}
-    ref_err = {nm: float(np.sqrt(ref_cov[2 + j, 2 + j])) for j, nm in enumerate(toy.names)}
+    ref_err = {
+        nm: float(np.sqrt(ref_cov[2 + j, 2 + j])) for j, nm in enumerate(toy.names)
+    }
     # the closed form of the pure quadratic
     direct = -np.linalg.solve(toy.H, toy.g)
     assert np.allclose(direct, ref_x[2:], atol=1e-12), "internal reference inconsistent"
@@ -453,7 +455,9 @@ def test_mass_only(tmpdir):
     )
     rel = abs(got - ref_val) / abs(ref_val)
     ok = rel < 1e-9
-    print(f"    NLL at a random point: {got:.9f} vs analytic {ref_val:.9f} (rel {rel:.2e})")
+    print(
+        f"    NLL at a random point: {got:.9f} vs analytic {ref_val:.9f} (rel {rel:.2e})"
+    )
     print("  PASS" if ok else "  FAIL")
     return ok
 

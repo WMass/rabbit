@@ -63,7 +63,7 @@ import tensorflow as tf
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rabbit import unbinned  # noqa: E402
-from rabbit.lineshapes import ZGammaLineshape, make_provider  # noqa: E402
+from rabbit.lineshapes import ZGammaLineshape  # noqa: E402
 from tests.test_unbinned_mass import _trust_exact  # noqa: E402
 
 REF_LINESHAPE_DIR = "/work/submit/david_w/ZMass/calibration_studies/lineshape"
@@ -514,7 +514,6 @@ def test_datacard(args):
 
     try:
         from rabbit.tensorwriter import TensorWriter
-
         from tests.test_unbinned_mass import loss_at, make_fitter
     except ImportError as exc:
         # TensorWriter pulls in wums.sparse_hist / hist, which the bare
@@ -728,10 +727,11 @@ def test_modifiers(args):
     fine = np.linspace(W[0], W[1], 4001)
     zb2 = ZGammaLineshape(acceptance=acc, **kw)
     zg2 = ZGammaLineshape(
-        acceptance={"kind": "grid", "m": fine,
-                    "a": zb2._acceptance_on(fine)}, **kw)
+        acceptance={"kind": "grid", "m": fine, "a": zb2._acceptance_on(fine)}, **kw
+    )
     d = np.max(np.abs(zg2.pdf(V).numpy() - zb2.pdf(V).numpy())) / np.max(
-        zb2.pdf(V).numpy())
+        zb2.pdf(V).numpy()
+    )
     print(f"  7g. grid rendering of a Bernstein A(m): max rel dev {d:.2e}")
     ok &= d < 1e-6
 
@@ -758,11 +758,17 @@ def _toy_table(nodes, u_edges, lam0=50.0, u_max=7.0):
     K = (ea - eb) / norm
     M1 = ((a + 1.0 / lam) * ea - (b + 1.0 / lam) * eb) / norm
     with np.errstate(invalid="ignore", divide="ignore"):
-        U = np.where(K > 0.0, M1 / np.where(K > 0.0, K, 1.0),
-                     0.5 * (a + b) * np.ones_like(K))
+        U = np.where(
+            K > 0.0, M1 / np.where(K > 0.0, K, 1.0), 0.5 * (a + b) * np.ones_like(K)
+        )
     U = np.clip(U, a, b)
-    return {"m_nodes": nodes, "u_edges": u_edges, "K": K, "u_mean": U,
-            "p0": np.zeros(len(nodes))}
+    return {
+        "m_nodes": nodes,
+        "u_edges": u_edges,
+        "K": K,
+        "u_mean": U,
+        "p0": np.zeros(len(nodes)),
+    }
 
 
 def _ugrid(n, u_min=1e-9, u_max=7.0):
@@ -787,10 +793,13 @@ def _point_table(u, w, m_lo=50.0, m_hi=200.0, eps=1e-9):
     j = np.searchsorted(e, u, "right") - 1
     K[j] = w
     U[j] = u
-    return {"m_nodes": np.array([m_lo, m_hi]), "u_edges": e,
-            "K": np.broadcast_to(K, (2, len(K))).copy(),
-            "u_mean": np.broadcast_to(U, (2, len(U))).copy(),
-            "p0": np.zeros(2)}
+    return {
+        "m_nodes": np.array([m_lo, m_hi]),
+        "u_edges": e,
+        "K": np.broadcast_to(K, (2, len(K))).copy(),
+        "u_mean": np.broadcast_to(U, (2, len(U))).copy(),
+        "p0": np.zeros(2),
+    }
 
 
 def test_fsr_table(args):
@@ -828,9 +837,12 @@ def test_fsr_table(args):
     Fa, Ft = za._fsr_mat.numpy(), zt._fsr_mat.numpy()
     d = np.max(np.abs(Ft - Fa)) / np.max(np.abs(Fa))
     dp = np.max(np.abs(zt.pdf(V).numpy() - za.pdf(V).numpy())) / np.max(
-        za.pdf(V).numpy())
-    print(f"  8a. table of the same atoms: fold matrix max rel dev {d:.2e}, "
-          f"pdf {dp:.2e}")
+        za.pdf(V).numpy()
+    )
+    print(
+        f"  8a. table of the same atoms: fold matrix max rel dev {d:.2e}, "
+        f"pdf {dp:.2e}"
+    )
     # the two build the same matrix element from `m_i/r` and from `r m_b`; the
     # tent weight can cancel to 1e-6 of itself, which is what limits the
     # element-wise agreement.  The pdf, where nothing cancels, is at round-off.
@@ -840,12 +852,12 @@ def test_fsr_table(args):
     # 5e-4 GeV against a 34 MeV grid) against a naive transcription
     ue = np.linspace(0.0, 0.01, 2001)
     for rule in ("interp", "mass"):
-        z = ZGammaLineshape(fsr=_toy_table([50.0, 91.0, 200.0], ue),
-                            fsr_deposit=rule, **kw)
+        z = ZGammaLineshape(
+            fsr=_toy_table([50.0, 91.0, 200.0], ue), fsr_deposit=rule, **kw
+        )
         F = z._fsr_mat.numpy()
         K, M1, p0 = z._table_rows(z.m_born)
-        U = np.clip(np.where(K > 0, M1 / np.where(K > 0, K, 1), 0.0),
-                    ue[:-1], ue[1:])
+        U = np.clip(np.where(K > 0, M1 / np.where(K > 0, K, 1), 0.0), ue[:-1], ue[1:])
         dm, m0 = z.dm, W[0]
         ref = np.zeros_like(F)
         for b, m in enumerate(z.m_born):
@@ -857,17 +869,21 @@ def test_fsr_table(args):
                 if rule == "mass":
                     wts = ((i, 1.0 - f), (i + 1, f))
                 else:
-                    wts = ((i, max(1.0 - f / r, 0.0) / r),
-                           (i + 1, max(1.0 - (1.0 - f) / r, 0.0) / r))
+                    wts = (
+                        (i, max(1.0 - f / r, 0.0) / r),
+                        (i + 1, max(1.0 - (1.0 - f) / r, 0.0) / r),
+                    )
                 for jj, wt in wts:
                     if 0 <= jj < NM:
                         ref[jj, b] += K[b, c] * wt
         d = np.max(np.abs(F - ref)) / np.max(np.abs(F))
         cs = F.sum(axis=0)
         inside = (z.m_born * np.exp(-0.01) > W[0]) & (z.m_born <= W[1])
-        print(f"  8b. all-narrow, deposit '{rule}': vs a naive deposit "
-              f"{d:.2e}; column sums (support inside the window) "
-              f"{cs[inside].min():.10f} .. {cs[inside].max():.10f}")
+        print(
+            f"  8b. all-narrow, deposit '{rule}': vs a naive deposit "
+            f"{d:.2e}; column sums (support inside the window) "
+            f"{cs[inside].min():.10f} .. {cs[inside].max():.10f}"
+        )
         ok &= d < 1e-14
         if rule == "mass":
             ok &= np.max(np.abs(cs[inside] - 1.0)) < 1e-13
@@ -889,14 +905,20 @@ def test_fsr_table(args):
         e = m * np.exp(-ue2)
         for c in range(len(ue2) - 1):
             w = e[c] - e[c + 1]
-            ref2[:, b] += K2[b, c] / w * z2.dm * (
-                _tent_cdf((e[c] - mi) / z2.dm) - _tent_cdf((e[c + 1] - mi) / z2.dm))
+            ref2[:, b] += (
+                K2[b, c]
+                / w
+                * z2.dm
+                * (_tent_cdf((e[c] - mi) / z2.dm) - _tent_cdf((e[c + 1] - mi) / z2.dm))
+            )
     d = np.max(np.abs(F2 - ref2)) / np.max(np.abs(F2))
     cs2 = F2.sum(axis=0)
     in2 = (z2.m_born * np.exp(-0.5) > W[0]) & (z2.m_born <= W[1])
-    print(f"  8c. all-wide vs a naive per-cell hat projection: max rel dev "
-          f"{d:.2e}; its column sums {cs2[in2].min():.12f} .. "
-          f"{cs2[in2].max():.12f}")
+    print(
+        f"  8c. all-wide vs a naive per-cell hat projection: max rel dev "
+        f"{d:.2e}; its column sums {cs2[in2].min():.12f} .. "
+        f"{cs2[in2].max():.12f}"
+    )
     # the projection is a second difference of a twice-integrated density, so
     # it loses the ratio of the cumulative to the deposit -- ~1e-10 here
     ok &= d < 1e-8 and np.max(np.abs(cs2[in2] - 1.0)) < 1e-12
@@ -918,42 +940,66 @@ def test_fsr_table(args):
         out = []
         for rule in ("interp", "mass"):
             zr = ZGammaLineshape(fsr=tat, fsr_deposit=rule, **k2)
-            out.append((np.max(np.abs(zr.pdf(V).numpy() - ex)) / np.max(ex),
-                        zr._fsr_mat.numpy().sum(axis=0).max() - 1.0))
-        print(f"  8d. nm = {nm:5d}: vs the exact fold, interp {out[0][0]:.2e} "
-              f"mass {out[1][0]:.2e}; largest column excess interp "
-              f"{out[0][1]:+.1e} mass {out[1][1]:+.1e}")
+            out.append(
+                (
+                    np.max(np.abs(zr.pdf(V).numpy() - ex)) / np.max(ex),
+                    zr._fsr_mat.numpy().sum(axis=0).max() - 1.0,
+                )
+            )
+        print(
+            f"  8d. nm = {nm:5d}: vs the exact fold, interp {out[0][0]:.2e} "
+            f"mass {out[1][0]:.2e}; largest column excess interp "
+            f"{out[0][1]:+.1e} mass {out[1][1]:+.1e}"
+        )
         ok &= out[0][0] < out[1][0] and abs(out[1][1]) < 1e-13
 
     # (e) the truncated kernel: the column mass against the table itself
-    z3 = ZGammaLineshape(fsr=_toy_table([50.0, 91.0, 200.0], _ugrid(2000)),
-                         fsr_deposit="mass", **kw)
+    z3 = ZGammaLineshape(
+        fsr=_toy_table([50.0, 91.0, 200.0], _ugrid(2000)), fsr_deposit="mass", **kw
+    )
     got, want = z3.fsr_column_mass()
     e = np.abs(got - want)
-    print(f"  8e. a kernel the window truncates: column mass vs the table, "
-          f"max {e.max():.2e}, mean {e.mean():.2e}")
+    print(
+        f"  8e. a kernel the window truncates: column mass vs the table, "
+        f"max {e.max():.2e}, mean {e.mean():.2e}"
+    )
     # the max is at the columns the window cuts through, where the reference
     # itself only splits a straddling cell by its width
     ok &= e.mean() < 1e-3
 
     # (f) the mass interpolation: halving the node spacing
     ue3 = _ugrid(2000)
-    ref = ZGammaLineshape(
-        fsr=_toy_table(np.arange(50.0, 200.1, 0.125), ue3), **kw).pdf(V).numpy()
+    ref = (
+        ZGammaLineshape(fsr=_toy_table(np.arange(50.0, 200.1, 0.125), ue3), **kw)
+        .pdf(V)
+        .numpy()
+    )
     prev = None
     for dmn in (4.0, 2.0, 1.0, 0.5):
-        p = ZGammaLineshape(
-            fsr=_toy_table(np.arange(50.0, 200.1, dmn), ue3), **kw).pdf(V).numpy()
+        p = (
+            ZGammaLineshape(fsr=_toy_table(np.arange(50.0, 200.1, dmn), ue3), **kw)
+            .pdf(V)
+            .numpy()
+        )
         d = np.max(np.abs(p - ref)) / np.max(ref)
-        print(f"  8f. m nodes {dmn:4.2f} GeV apart: max rel dev {d:.3e}"
-              + (f"  (x{prev / d:.2f} finer)" if prev else ""))
+        print(
+            f"  8f. m nodes {dmn:4.2f} GeV apart: max rel dev {d:.3e}"
+            + (f"  (x{prev / d:.2f} finer)" if prev else "")
+        )
         if prev is not None:
             ok &= prev / d > 2.5
         prev = d
-    pc = ZGammaLineshape(fsr=_toy_table(np.arange(50.0, 200.1, 4.0), ue3),
-                         fsr_minterp="cubic", **kw).pdf(V).numpy()
-    print(f"  8f. the same 4 GeV nodes, cubic: max rel dev "
-          f"{np.max(np.abs(pc - ref)) / np.max(ref):.3e}")
+    pc = (
+        ZGammaLineshape(
+            fsr=_toy_table(np.arange(50.0, 200.1, 4.0), ue3), fsr_minterp="cubic", **kw
+        )
+        .pdf(V)
+        .numpy()
+    )
+    print(
+        f"  8f. the same 4 GeV nodes, cubic: max rel dev "
+        f"{np.max(np.abs(pc - ref)) / np.max(ref):.3e}"
+    )
 
     # (g) the cells: halving them
     # (not monotone: the narrow/wide boundary moves through the cells as they
@@ -964,8 +1010,10 @@ def test_fsr_table(args):
     for nc in (500, 1000, 2000, 4000):
         p = ZGammaLineshape(fsr=_toy_table(nodes, _ugrid(nc)), **kw).pdf(V).numpy()
         d = np.max(np.abs(p - ref)) / np.max(ref)
-        print(f"  8g. {nc:5d} cells: max rel dev {d:.3e}"
-              + (f"  (x{prev / d:.2f} finer)" if prev else ""))
+        print(
+            f"  8g. {nc:5d} cells: max rel dev {d:.3e}"
+            + (f"  (x{prev / d:.2f} finer)" if prev else "")
+        )
         first = d if first is None else first
         prev = d
     ok &= prev < 1e-3 and first / prev > 4.0
@@ -977,8 +1025,10 @@ def test_fsr_table(args):
     zc = ZGammaLineshape.from_config(cfg)
     d = np.max(np.abs(zc.pdf(V).numpy() - zr.pdf(V).numpy()))
     n = len(json.dumps(cfg))
-    print(f"  8h. inline config -> JSON -> from_config: max abs dev {d:.2e} "
-          f"({n / 1e6:.2f} MB of JSON for {tab['K'].size} cells)")
+    print(
+        f"  8h. inline config -> JSON -> from_config: max abs dev {d:.2e} "
+        f"({n / 1e6:.2f} MB of JSON for {tab['K'].size} cells)"
+    )
     # the arrays come back bit-identical; the pdf differs by the last bits
     # because the rows are renormalised once more on the way back in
     ok &= d < 1e-12
@@ -988,10 +1038,13 @@ def test_fsr_table(args):
         zp = ZGammaLineshape(fsr=path, **kw)
         cfg = json.loads(json.dumps(zp.config()))
         ok &= cfg["fsr"] == {"kind": "table", "path": path}
-        d = np.max(np.abs(ZGammaLineshape.from_config(cfg).pdf(V).numpy()
-                          - zp.pdf(V).numpy()))
-        print(f"  8h. by reference: config is {len(json.dumps(cfg))} bytes, "
-              f"max abs dev {d:.2e}")
+        d = np.max(
+            np.abs(ZGammaLineshape.from_config(cfg).pdf(V).numpy() - zp.pdf(V).numpy())
+        )
+        print(
+            f"  8h. by reference: config is {len(json.dumps(cfg))} bytes, "
+            f"max abs dev {d:.2e}"
+        )
         ok &= d == 0.0
 
     print("  PASS" if ok else "  FAIL")

@@ -52,30 +52,52 @@ REF_LINESHAPE_DIR = "/work/submit/david_w/ZMass/calibration_studies/lineshape"
 
 # PDG id, electric charge, weak isospin -- the five active flavours of the
 # reference calculation (top is left out, as there).
-QUARKS = ((1, -1 / 3, -1 / 2), (2, 2 / 3, 1 / 2), (3, -1 / 3, -1 / 2),
-          (4, 2 / 3, 1 / 2), (5, -1 / 3, -1 / 2))
+QUARKS = (
+    (1, -1 / 3, -1 / 2),
+    (2, 2 / 3, 1 / 2),
+    (3, -1 / 3, -1 / 2),
+    (4, 2 / 3, 1 / 2),
+    (5, -1 / 3, -1 / 2),
+)
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--pdfset", default="NNPDF31_nnlo_as_0118")
     p.add_argument("--pdf-member", type=int, default=0)
     p.add_argument("--sqrt-s", type=float, default=13000.0, help="GeV")
     p.add_argument("--m-lo", type=float, default=40.0, help="lowest anchor mass [GeV]")
-    p.add_argument("--m-hi", type=float, default=200.0, help="highest anchor mass [GeV]")
-    p.add_argument("--n-anchor", type=int, default=300,
-                   help="log-spaced anchors; the provider cubic-splines log L "
-                        "in log m between them")
-    p.add_argument("--y-cut", type=float, default=None,
-                   help="restrict the boson rapidity to |Y| < y_cut (an "
-                        "acceptance model). Default: inclusive.")
-    p.add_argument("--tag", default=None,
-                   help="output basename, written to data/zlumi_<tag>.npz")
-    p.add_argument("--outdir", default=os.path.join(os.path.dirname(
-        os.path.abspath(__file__)), "data"))
-    p.add_argument("--lineshape-dir", default=REF_LINESHAPE_DIR,
-                   help="directory holding drell_yan_xsec.py / constants.py")
+    p.add_argument(
+        "--m-hi", type=float, default=200.0, help="highest anchor mass [GeV]"
+    )
+    p.add_argument(
+        "--n-anchor",
+        type=int,
+        default=300,
+        help="log-spaced anchors; the provider cubic-splines log L "
+        "in log m between them",
+    )
+    p.add_argument(
+        "--y-cut",
+        type=float,
+        default=None,
+        help="restrict the boson rapidity to |Y| < y_cut (an "
+        "acceptance model). Default: inclusive.",
+    )
+    p.add_argument(
+        "--tag", default=None, help="output basename, written to data/zlumi_<tag>.npz"
+    )
+    p.add_argument(
+        "--outdir",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+    )
+    p.add_argument(
+        "--lineshape-dir",
+        default=REF_LINESHAPE_DIR,
+        help="directory holding drell_yan_xsec.py / constants.py",
+    )
     return p.parse_args()
 
 
@@ -90,28 +112,29 @@ def main():
         )
     sys.path.insert(0, args.lineshape_dir)
     import drell_yan_xsec as dy  # noqa: E402
-
     import lhapdf  # noqa: E402
 
     pdf = lhapdf.mkPDF(args.pdfset, args.pdf_member)
-    s = args.sqrt_s ** 2
+    s = args.sqrt_s**2
 
-    m_anchor = np.exp(np.linspace(np.log(args.m_lo), np.log(args.m_hi),
-                                  args.n_anchor))
+    m_anchor = np.exp(np.linspace(np.log(args.m_lo), np.log(args.m_hi), args.n_anchor))
     log_lumi = np.empty((len(QUARKS), args.n_anchor))
     for i, (flavor, _, _) in enumerate(QUARKS):
         if args.y_cut is None:
-            vals = dy.integrate_sigma_hat_prime_sm(s, flavor, m_anchor ** 2, pdf)
+            vals = dy.integrate_sigma_hat_prime_sm(s, flavor, m_anchor**2, pdf)
         else:
             vals = dy.integrate_sigma_hat_prime_sm_Ycut(
-                s, flavor, m_anchor ** 2, pdf, args.y_cut)
+                s, flavor, m_anchor**2, pdf, args.y_cut
+            )
         vals = np.asarray(vals, dtype=float)
         if not np.all(vals > 0):
             raise RuntimeError(f"non-positive luminosity for flavour {flavor}")
         log_lumi[i] = np.log(vals)
-        print(f"  flavour {flavor}: L({args.m_lo:.0f}) = {vals[0]:.6e}, "
-              f"L(91.2) = {np.exp(np.interp(np.log(91.1876), np.log(m_anchor), log_lumi[i])):.6e}, "
-              f"L({args.m_hi:.0f}) = {vals[-1]:.6e}")
+        print(
+            f"  flavour {flavor}: L({args.m_lo:.0f}) = {vals[0]:.6e}, "
+            f"L(91.2) = {np.exp(np.interp(np.log(91.1876), np.log(m_anchor), log_lumi[i])):.6e}, "
+            f"L({args.m_hi:.0f}) = {vals[-1]:.6e}"
+        )
 
     src = os.path.join(args.lineshape_dir, "drell_yan_xsec.py")
     provenance = dict(
@@ -122,16 +145,23 @@ def main():
         factorisation_scale="mu_F = Q (the dilepton mass)",
         order="LO parton luminosity (the hard ME it multiplies is LO too)",
         y_cut=args.y_cut,
-        acceptance="none (fully inclusive in rapidity and lepton angles)"
-        if args.y_cut is None else f"|Y| < {args.y_cut}, no lepton cuts",
+        acceptance=(
+            "none (fully inclusive in rapidity and lepton angles)"
+            if args.y_cut is None
+            else f"|Y| < {args.y_cut}, no lepton cuts"
+        ),
         m_lo=args.m_lo,
         m_hi=args.m_hi,
         n_anchor=args.n_anchor,
         source=src,
-        source_mtime=datetime.datetime.fromtimestamp(
-            os.path.getmtime(src)).isoformat(timespec="seconds"),
-        source_function="drell_yan_xsec.integrate_sigma_hat_prime_sm"
-        if args.y_cut is None else "drell_yan_xsec.integrate_sigma_hat_prime_sm_Ycut",
+        source_mtime=datetime.datetime.fromtimestamp(os.path.getmtime(src)).isoformat(
+            timespec="seconds"
+        ),
+        source_function=(
+            "drell_yan_xsec.integrate_sigma_hat_prime_sm"
+            if args.y_cut is None
+            else "drell_yan_xsec.integrate_sigma_hat_prime_sm_Ycut"
+        ),
         generator=os.path.abspath(__file__),
         created=datetime.date.today().isoformat(),
         lhapdf_version=lhapdf.version(),

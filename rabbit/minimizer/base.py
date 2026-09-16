@@ -232,7 +232,12 @@ def _minimize_trust_region(
 
 
 def minimize_trust_exact(
-    fun, closure, x0, gtol=0.0, maxiter=None, callback=None,
+    fun,
+    closure,
+    x0,
+    gtol=0.0,
+    maxiter=None,
+    callback=None,
     initial_trust_radius=1.0,
 ):
     """Native nearly-exact trust-region minimization (cf. scipy trust-exact).

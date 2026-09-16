@@ -1071,9 +1071,7 @@ def main():
             + ", ".join(d.name for d in _visible_gpus)
         )
     elif _os.environ.get("CUDA_VISIBLE_DEVICES") == "":
-        logger.info(
-            "GPUs are hidden by CUDA_VISIBLE_DEVICES=''; running on the CPU."
-        )
+        logger.info("GPUs are hidden by CUDA_VISIBLE_DEVICES=''; running on the CPU.")
     elif tf.test.is_built_with_cuda():
         logger.warning(
             "No GPU is visible to TensorFlow although it was built with CUDA: "

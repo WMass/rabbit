@@ -72,14 +72,16 @@ def make_inputs(n=400, nt=48, ngroup=5, ncls=3, tmax=8.0, seed=1):
     # amplitude per (candidate, group) row, group-dependent so the groups are
     # distinguishable; MS dominates, ionization ~10x smaller, rad ~100x
     amp = 0.02 * (1.0 + 0.5 * gid.astype(float)) * (0.5 + rng.random(nnz))
-    t2 = tgrid ** 2
+    t2 = tgrid**2
     Sms = (-amp[:, None] * t2[None, :]).astype(np.float32)
-    Sio_re = (-0.1 * amp[:, None] * t2[None, :]
-              * np.exp(-0.05 * t2)[None, :]).astype(np.float32)
-    Sio_im = (0.05 * amp[:, None] * (tgrid ** 3)[None, :]
-              * np.exp(-0.05 * t2)[None, :]).astype(np.float32)
+    Sio_re = (-0.1 * amp[:, None] * t2[None, :] * np.exp(-0.05 * t2)[None, :]).astype(
+        np.float32
+    )
+    Sio_im = (
+        0.05 * amp[:, None] * (tgrid**3)[None, :] * np.exp(-0.05 * t2)[None, :]
+    ).astype(np.float32)
     Srad_re = (-0.01 * amp[:, None] * t2[None, :]).astype(np.float32)
-    Srad_im = (0.004 * amp[:, None] * (tgrid ** 3)[None, :]).astype(np.float32)
+    Srad_im = (0.004 * amp[:, None] * (tgrid**3)[None, :]).astype(np.float32)
 
     # hit classes
     hptr = [0]
@@ -98,16 +100,25 @@ def make_inputs(n=400, nt=48, ngroup=5, ncls=3, tmax=8.0, seed=1):
     vgf = vg_other + np.add.reduceat(hv, hptr[:-1]) * (np.diff(hptr) > 0)
 
     # observed masses: a Gaussian draw of the right total width
-    tot = vgf + 2.0 * np.add.reduceat(
-        amp * 0.0 + amp, ptr[:-1]) * (np.diff(ptr) > 0)
+    tot = vgf + 2.0 * np.add.reduceat(amp * 0.0 + amp, ptr[:-1]) * (np.diff(ptr) > 0)
     mobs = rng.normal(0.0, sigma * np.sqrt(np.maximum(tot, 0.2)))
-    return dict(tgrid=tgrid, sigma=sigma, mobs=mobs, n=n, nt=nt,
-                ngroup=ngroup, ncls=ncls,
-                grp_ptr=ptr, grp_id=gid,
-                fam={"ms": (Sms, None), "ioni": (Sio_re, Sio_im),
-                     "rad": (Srad_re, Srad_im)},
-                hit_ptr=hptr, hit_cls=hcls, hit_v=hv, vg_other=vg_other,
-                vgf=vgf)
+    return dict(
+        tgrid=tgrid,
+        sigma=sigma,
+        mobs=mobs,
+        n=n,
+        nt=nt,
+        ngroup=ngroup,
+        ncls=ncls,
+        grp_ptr=ptr,
+        grp_id=gid,
+        fam={"ms": (Sms, None), "ioni": (Sio_re, Sio_im), "rad": (Srad_re, Srad_im)},
+        hit_ptr=hptr,
+        hit_cls=hcls,
+        hit_v=hv,
+        vg_other=vg_other,
+        vgf=vgf,
+    )
 
 
 def group_names(ng):
@@ -153,14 +164,30 @@ def build_mass(inp, flat, **kw):
         fams.append(e)
     npar = 1 + len(inp["fam"])
     return unbinned.MassCFTerm(
-        "mass", sigma=inp["sigma"], mobs=inp["mobs"], tgrid=inp["tgrid"],
-        families=fams, vgf=flat["vgf"], floor="none",
-        param_defaults=np.ones(npar), **kw)
+        "mass",
+        sigma=inp["sigma"],
+        mobs=inp["mobs"],
+        tgrid=inp["tgrid"],
+        families=fams,
+        vgf=flat["vgf"],
+        floor="none",
+        param_defaults=np.ones(npar),
+        **kw,
+    )
 
 
-def build_material(inp, amount_mode="exp", hit_mode="linear", with_hits=True,
-                   group_units=None, hit_units=None, data_scale=None,
-                   prune=(), _fix_dtype=np.float64, **kw):
+def build_material(
+    inp,
+    amount_mode="exp",
+    hit_mode="linear",
+    with_hits=True,
+    group_units=None,
+    hit_units=None,
+    data_scale=None,
+    prune=(),
+    _fix_dtype=np.float64,
+    **kw,
+):
     """``data_scale`` multiplies the DATA-side exponents of the listed groups
     (the injection); ``prune`` folds the listed groups into the fixed
     baseline."""
@@ -191,25 +218,39 @@ def build_material(inp, amount_mode="exp", hit_mode="linear", with_hits=True,
     if len(prune):
         cnt = np.zeros(inp["n"], np.int64)
         for i in range(inp["n"]):
-            cnt[i] = int(keep[ptr[i]:ptr[i + 1]].sum())
+            cnt[i] = int(keep[ptr[i] : ptr[i + 1]].sum())
         ptr = np.concatenate([[0], np.cumsum(cnt)])
         gid = gid[keep]
     gp = group_names(inp["ngroup"])
     hp = hit_names(inp["ncls"]) if with_hits else []
-    share = ((inp["hit_ptr"], inp["hit_cls"], inp["hit_v"], inp["vg_other"])
-             if with_hits else None)
+    share = (
+        (inp["hit_ptr"], inp["hit_cls"], inp["hit_v"], inp["vg_other"])
+        if with_hits
+        else None
+    )
     if not with_hits:
         kw.setdefault("vgf", inp["vgf"])
     npar = len(gp) + len(hp)
     return unbinned.MaterialCFTerm(
-        "mat", sigma=inp["sigma"], mobs=inp["mobs"], tgrid=inp["tgrid"],
+        "mat",
+        sigma=inp["sigma"],
+        mobs=inp["mobs"],
+        tgrid=inp["tgrid"],
         families=kw.pop("families", []),
-        group_params=gp, group_families=gfam, grp_ptr=ptr, grp_id=gid,
+        group_params=gp,
+        group_families=gfam,
+        grp_ptr=ptr,
+        grp_id=gid,
         group_units=group_units,
-        hit_params=hp, hit_share=share, hit_units=hit_units,
-        amount_mode=amount_mode, hit_mode=hit_mode, floor="none",
-        param_defaults=np.zeros(npar), **kw)
-
+        hit_params=hp,
+        hit_share=share,
+        hit_units=hit_units,
+        amount_mode=amount_mode,
+        hit_mode=hit_mode,
+        floor="none",
+        param_defaults=np.zeros(npar),
+        **kw,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +259,9 @@ def build_material(inp, amount_mode="exp", hit_mode="linear", with_hits=True,
 # so the density of candidate i is exactly N(0, sigma_i sqrt(V_i)) with
 # ``V_i = v_other_i + sum_g A(k_g) v_{i,g}``.
 # ---------------------------------------------------------------------------
-def make_gauss_toy(n=4000, nt=40, ngroup=3, tmax=8.0, seed=101, scale=None,
-                   collinear=False):
+def make_gauss_toy(
+    n=4000, nt=40, ngroup=3, tmax=8.0, seed=101, scale=None, collinear=False
+):
     rng = np.random.default_rng(seed)
     tgrid = np.linspace(0.0, tmax, nt)
     sigma = 0.02 + 0.01 * rng.random(n)
@@ -269,24 +311,43 @@ def make_gauss_toy(n=4000, nt=40, ngroup=3, tmax=8.0, seed=101, scale=None,
     z0 = np.random.default_rng(seed + 999).standard_normal(n)
     mobs = z0 * sigma * np.sqrt(V)
 
-    Sg = (-0.5 * vrow[:, None] * (tgrid ** 2)[None, :]).astype(np.float64)
-    return dict(tgrid=tgrid, sigma=sigma, mobs=mobs, n=n, nt=nt,
-                ngroup=ngroup, grp_ptr=ptr, grp_id=gid, Sg=Sg,
-                v_other=v_other, V=V, scale=ss)
+    Sg = (-0.5 * vrow[:, None] * (tgrid**2)[None, :]).astype(np.float64)
+    return dict(
+        tgrid=tgrid,
+        sigma=sigma,
+        mobs=mobs,
+        n=n,
+        nt=nt,
+        ngroup=ngroup,
+        grp_ptr=ptr,
+        grp_id=gid,
+        Sg=Sg,
+        v_other=v_other,
+        V=V,
+        scale=ss,
+    )
 
 
 def build_gauss_term(toy, amount_mode="exp", chunk=4096):
     # the un-scaled Gaussian remainder v_other rides in the FIXED baseline, so
     # that k = 0 is the truth of an un-injected toy
-    fix = (-0.5 * toy["v_other"][:, None] * (toy["tgrid"] ** 2)[None, :])
+    fix = -0.5 * toy["v_other"][:, None] * (toy["tgrid"] ** 2)[None, :]
     return unbinned.MaterialCFTerm(
-        "g", sigma=toy["sigma"], mobs=toy["mobs"], tgrid=toy["tgrid"],
-        families=[], vgf=toy["v_other"],
+        "g",
+        sigma=toy["sigma"],
+        mobs=toy["mobs"],
+        tgrid=toy["tgrid"],
+        families=[],
+        vgf=toy["v_other"],
         group_params=group_names(toy["ngroup"]),
         group_families=[{"name": "all", "re": toy["Sg"], "fix_re": fix}],
-        grp_ptr=toy["grp_ptr"], grp_id=toy["grp_id"],
-        amount_mode=amount_mode, floor="none", chunk=chunk,
-        param_defaults=np.zeros(toy["ngroup"]))
+        grp_ptr=toy["grp_ptr"],
+        grp_id=toy["grp_id"],
+        amount_mode=amount_mode,
+        floor="none",
+        chunk=chunk,
+        param_defaults=np.zeros(toy["ngroup"]),
+    )
 
 
 def _grad(term, z):
@@ -369,14 +430,16 @@ def test_reduction():
     inp1["grp_id"] = np.zeros(inp1["n"], np.int64)
     for fam in list(inp1["fam"]):
         re, im = inp1["fam"][fam]
-        inp1["fam"][fam] = (re[:inp1["n"]], None if im is None else im[:inp1["n"]])
+        inp1["fam"][fam] = (re[: inp1["n"]], None if im is None else im[: inp1["n"]])
     flat1 = flatten(inp1)
     m1 = build_mass(inp1, flat1)
     t1 = build_material(inp1)
     a = nll_at(m1, {p: 1.0 for p in m1.param_names})
     b = nll_at(t1, {p: 0.0 for p in t1.param_names})
-    print(f"  single-group NLL mass {a!r}\n               material {b!r}  "
-          f"identical: {a == b}")
+    print(
+        f"  single-group NLL mass {a!r}\n               material {b!r}  "
+        f"identical: {a == b}"
+    )
     assert a == b, (a, b)
     print("  PASS")
 
@@ -393,9 +456,15 @@ def test_legacy_families():
                 e[comp] = flat[f"{fam}_{comp}"]
         fams.append(e)
     npar = len(fams)
-    common = dict(sigma=inp["sigma"], mobs=inp["mobs"], tgrid=inp["tgrid"],
-                  families=fams, vgf=flat["vgf"], floor="none",
-                  param_defaults=np.ones(npar))
+    common = dict(
+        sigma=inp["sigma"],
+        mobs=inp["mobs"],
+        tgrid=inp["tgrid"],
+        families=fams,
+        vgf=flat["vgf"],
+        floor="none",
+        param_defaults=np.ones(npar),
+    )
     m = unbinned.MassCFTerm("m", **common)
     t = unbinned.MaterialCFTerm("t", **common)
     v = {p: 0.7 + 0.1 * i for i, p in enumerate(m.param_names)}
@@ -422,8 +491,10 @@ def test_gradient():
             fd = (nll_at(t, up) - nll_at(t, dn)) / (2 * h)
             rel = abs(fd - g[i]) / max(abs(fd), 1e-6)
             worst = max(worst, rel)
-            print(f"  {mode:<6}/{hmode:<6} {p:<16} ana {g[i]:+12.6f}  "
-                  f"fd {fd:+12.6f}  rel {rel:.2e}")
+            print(
+                f"  {mode:<6}/{hmode:<6} {p:<16} ana {g[i]:+12.6f}  "
+                f"fd {fd:+12.6f}  rel {rel:.2e}"
+            )
         assert worst < 3e-6, worst
     print("  PASS")
 
@@ -441,8 +512,9 @@ def test_units():
         v0[p] = k[i] * u[i]
         vu[p] = k[i]
     a, b = nll_at(t0, v0), nll_at(tu, vu)
-    print(f"  NLL(k*u, units=1) {a!r}\n  NLL(k,   units=u) {b!r}  "
-          f"identical: {a == b}")
+    print(
+        f"  NLL(k*u, units=1) {a!r}\n  NLL(k,   units=u) {b!r}  " f"identical: {a == b}"
+    )
     assert a == b, (a, b)
     print("  PASS")
 
@@ -482,26 +554,31 @@ def test_injection():
     for mode in ("linear", "exp"):
         truth = d if mode == "linear" else np.log1p(d)
         base = make_gauss_toy(n=4000, ngroup=3, seed=21)
-        inj = make_gauss_toy(n=4000, ngroup=3, seed=21,
-                             scale=[1.0, 1.0 + d, 1.0])
+        inj = make_gauss_toy(n=4000, ngroup=3, seed=21, scale=[1.0, 1.0 + d, 1.0])
         v0, e0, _ = fit_groups(build_gauss_term(base, amount_mode=mode))
         v1, e1, _ = fit_groups(build_gauss_term(inj, amount_mode=mode))
-        print(f"  {mode:<6} truth shift = (0, {truth:+.5f}, 0);  "
-              f"stat error on each parameter ~ {e0.mean():.4f}")
+        print(
+            f"  {mode:<6} truth shift = (0, {truth:+.5f}, 0);  "
+            f"stat error on each parameter ~ {e0.mean():.4f}"
+        )
         names = list(build_gauss_term(base).param_names)
         for i, nm in enumerate(names):
             tr = truth if i == 1 else 0.0
-            print(f"      {nm:<14} base {v0[i]:+.5f}  inj {v1[i]:+.5f}  "
-                  f"shift {v1[i]-v0[i]:+.6f}  truth {tr:+.6f}  "
-                  f"(err {e0[i]:.5f})")
+            print(
+                f"      {nm:<14} base {v0[i]:+.5f}  inj {v1[i]:+.5f}  "
+                f"shift {v1[i]-v0[i]:+.6f}  truth {tr:+.6f}  "
+                f"(err {e0[i]:.5f})"
+            )
         # The mode-independent statement: the AMOUNT factor A(k_1) must go up
         # by exactly the injected 1 + d.  The two toys share their noise, so
         # what is left is the estimator's own non-linearity -- a few % of the
         # injection, i.e. a few % of ONE statistical sigma.
         A = np.exp if mode == "exp" else (lambda z: 1.0 + z)
         r = A(v1[1]) / A(v0[1])
-        print(f"      A(k_1) ratio {r:.6f}  injected {1+d:.6f}  "
-              f"({100*(r/(1+d)-1):+.2f} %)")
+        print(
+            f"      A(k_1) ratio {r:.6f}  injected {1+d:.6f}  "
+            f"({100*(r/(1+d)-1):+.2f} %)"
+        )
         assert abs(r / (1.0 + d) - 1.0) < 0.01, r
         assert abs((v1[1] - v0[1]) - truth) < 0.15 * abs(truth), (v0, v1)
         for i in (0, 2):
@@ -519,10 +596,16 @@ def test_degeneracy():
         rank = int((w > 1e-7 * w.max()).sum())
         print(f"  {tag}:")
         print("    eigenvalues " + "  ".join(f"{x:10.4g}" for x in w))
-        print(f"    rank(1e-7) {rank}/{len(w)}   cond "
-              f"{w.max()/max(w.min(), 1e-300):.3e}")
-        print("    softest     " + "  ".join(
-            f"{n.split('_')[-1]} {v:+.3f}" for n, v in zip(t.param_names, V[:, 0])))
+        print(
+            f"    rank(1e-7) {rank}/{len(w)}   cond "
+            f"{w.max()/max(w.min(), 1e-300):.3e}"
+        )
+        print(
+            "    softest     "
+            + "  ".join(
+                f"{n.split('_')[-1]} {v:+.3f}" for n, v in zip(t.param_names, V[:, 0])
+            )
+        )
         if collin:
             # only the 0 <-> 1 antisymmetric combination is unmeasured
             v0 = V[:, 0]
@@ -544,20 +627,32 @@ def test_hdf5_roundtrip():
     before = nll_at(t, v)
 
     datasets = {
-        "sigma": inp["sigma"], "mobs": inp["mobs"], "tgrid": inp["tgrid"],
-        "grp_ptr": t.g_ptr, "grp_id": np.asarray(inp["grp_id"]),
-        "hit_ptr": inp["hit_ptr"], "hit_cls": inp["hit_cls"],
-        "hit_v": inp["hit_v"], "vg_other": inp["vg_other"],
+        "sigma": inp["sigma"],
+        "mobs": inp["mobs"],
+        "tgrid": inp["tgrid"],
+        "grp_ptr": t.g_ptr,
+        "grp_id": np.asarray(inp["grp_id"]),
+        "hit_ptr": inp["hit_ptr"],
+        "hit_cls": inp["hit_cls"],
+        "hit_v": inp["hit_v"],
+        "vg_other": inp["vg_other"],
     }
     for fam, (re, im) in inp["fam"].items():
         datasets[f"Sg_re_{fam}"] = re
         if im is not None:
             datasets[f"Sg_im_{fam}"] = im
-    raw = [dict(name="mat", config=t.config(), params=list(t.param_names),
-                param_defaults=t.param_defaults,
-                param_prior_sigmas=t.param_prior_sigmas,
-                param_prior_means=t.param_prior_means,
-                param_is_poi=t.param_is_poi, datasets=datasets)]
+    raw = [
+        dict(
+            name="mat",
+            config=t.config(),
+            params=list(t.param_names),
+            param_defaults=t.param_defaults,
+            param_prior_sigmas=t.param_prior_sigmas,
+            param_prior_means=t.param_prior_means,
+            param_is_poi=t.param_is_poi,
+            datasets=datasets,
+        )
+    ]
     with tempfile.TemporaryDirectory() as d:
         fn = os.path.join(d, "card.hdf5")
         with h5py.File(fn, "w") as f:
@@ -568,8 +663,10 @@ def test_hdf5_roundtrip():
     t2 = back[0]
     assert list(t2.param_names) == list(t.param_names), t2.param_names
     after = nll_at(t2, v)
-    print(f"  NLL before {before!r}\n      after  {after!r}  "
-          f"identical: {before == after}")
+    print(
+        f"  NLL before {before!r}\n      after  {after!r}  "
+        f"identical: {before == after}"
+    )
     assert before == after, (before, after)
     print("  PASS")
 
@@ -592,25 +689,33 @@ def test_self_consistent_sigma():
     # sits where the truncated inverse-Fourier integral is small enough that a
     # few-% change of s can push it through zero.  That is a property of the
     # toy, not of the correction, and it would hide the thing being tested.
-    inp["mobs"] = 0.3 * inp["sigma"] * np.random.default_rng(77).standard_normal(
-        inp["n"])
+    inp["mobs"] = (
+        0.3 * inp["sigma"] * np.random.default_rng(77).standard_normal(inp["n"])
+    )
     # a mass term with a scale parameter, so `delta` actually moves
     tab = np.linspace(0.0, 400.0, 4096)
     pk = np.exp(-0.5 * (0.004 * tab) ** 2)
-    common = dict(sigma=inp["sigma"], mobs=inp["mobs"], tgrid=inp["tgrid"],
-                  families=[{"name": "hit", "param": "k_hit", "kind": "gauss"}],
-                  # softplus, the production default: with floor="none" a
-                  # candidate whose truncated inverse-Fourier integral dips
-                  # negative in the tail gives log(<=0) = NaN, and moving s by
-                  # 1 % is enough to flip one
-                  vgf=flat["vgf"], floor="softplus", m_ref=3.0969,
-                  scale_param="alpha",
-                  phik=(tab, pk, np.zeros_like(pk)),
-                  param_defaults=np.zeros(2))
+    common = dict(
+        sigma=inp["sigma"],
+        mobs=inp["mobs"],
+        tgrid=inp["tgrid"],
+        families=[{"name": "hit", "param": "k_hit", "kind": "gauss"}],
+        # softplus, the production default: with floor="none" a
+        # candidate whose truncated inverse-Fourier integral dips
+        # negative in the tail gives log(<=0) = NaN, and moving s by
+        # 1 % is enough to flip one
+        vgf=flat["vgf"],
+        floor="softplus",
+        m_ref=3.0969,
+        scale_param="alpha",
+        phik=(tab, pk, np.zeros_like(pk)),
+        param_defaults=np.zeros(2),
+    )
     base = unbinned.MassCFTerm("b", **common)
     zero = unbinned.MassCFTerm("z", a_res=np.zeros(inp["n"]), **common)
-    off = unbinned.MassCFTerm("o", a_res=0.011 * np.ones(inp["n"]),
-                              self_consistent_sigma=False, **common)
+    off = unbinned.MassCFTerm(
+        "o", a_res=0.011 * np.ones(inp["n"]), self_consistent_sigma=False, **common
+    )
     on = unbinned.MassCFTerm("c", a_res=0.011 * np.ones(inp["n"]), **common)
     v = {"alpha": 0.3, "k_hit": 1.0}
     nb, nz, no, nc = (nll_at(t, v) for t in (base, zero, off, on))
@@ -618,9 +723,9 @@ def test_self_consistent_sigma():
     print(f"  a=0         {nz!r}   identical: {nb == nz}")
     print(f"  a!=0, off   {no!r}   identical: {nb == no}")
     print(f"  a!=0, on    {nc!r}   d = {nc-nb:+.6f}")
-    assert nb == nz, (nb, nz)          # G1
-    assert nb == no, (nb, no)          # the switch
-    assert nc != nb                    # the correction does something
+    assert nb == nz, (nb, nz)  # G1
+    assert nb == no, (nb, no)  # the switch
+    assert nc != nb  # the correction does something
 
     # the dynamic path at a = 0 must agree with the static one: this is the
     # in-graph kernel-CF interpolation against np.interp
@@ -637,8 +742,10 @@ def test_self_consistent_sigma():
     dn["alpha"] -= h
     fd = (nll_at(on, up) - nll_at(on, dn)) / (2 * h)
     i = list(on.param_names).index("alpha")
-    print(f"  d(NLL)/d(alpha)  ana {g[i]:+.6f}  fd {fd:+.6f}  "
-          f"rel {abs(fd-g[i])/max(abs(fd),1e-9):.2e}")
+    print(
+        f"  d(NLL)/d(alpha)  ana {g[i]:+.6f}  fd {fd:+.6f}  "
+        f"rel {abs(fd-g[i])/max(abs(fd),1e-9):.2e}"
+    )
     assert abs(fd - g[i]) / max(abs(fd), 1e-9) < 1e-5
 
     # THE SIGN.  s_i = sigma_i - a_i delta_i, so a candidate whose observed
@@ -648,14 +755,20 @@ def test_self_consistent_sigma():
     # direction of the resulting alpha shift is what gates G2/G3 of the spec
     # measure on a toy generated WITH the defect -- this toy has no defect to
     # correct, so a fit here would test the toy, not the term.
-    d = on._chunk_residual(on._values(tf.constant(
-        [v[p] for p in on.param_names], tf.float64)), 0).numpy()
-    ss = on._chunk_sigma(on._values(tf.constant(
-        [v[p] for p in on.param_names], tf.float64)), 0, tf.constant(d)).numpy()
+    d = on._chunk_residual(
+        on._values(tf.constant([v[p] for p in on.param_names], tf.float64)), 0
+    ).numpy()
+    ss = on._chunk_sigma(
+        on._values(tf.constant([v[p] for p in on.param_names], tf.float64)),
+        0,
+        tf.constant(d),
+    ).numpy()
     sig = np.asarray(on.sigma.numpy())[: len(d)]
     a = 0.011
-    print(f"  s vs sigma: max |s/sigma - 1| = {np.abs(ss/sig - 1).max():.4e}, "
-          f"corr(sign) = {np.sign(np.corrcoef(d, ss - sig)[0,1]):+.0f}")
+    print(
+        f"  s vs sigma: max |s/sigma - 1| = {np.abs(ss/sig - 1).max():.4e}, "
+        f"corr(sign) = {np.sign(np.corrcoef(d, ss - sig)[0,1]):+.0f}"
+    )
     assert np.allclose(ss, np.maximum(sig - a * d, on.sigma_floor * sig)), "s formula"
     assert np.corrcoef(d, ss - sig)[0, 1] < -0.99, "s must shrink where delta > 0"
     print("  PASS")
@@ -663,11 +776,20 @@ def test_self_consistent_sigma():
 
 if __name__ == "__main__":
     tf.config.threading.set_intra_op_parallelism_threads(
-        int(os.environ.get("OMP_NUM_THREADS", "8")))
+        int(os.environ.get("OMP_NUM_THREADS", "8"))
+    )
     only = sys.argv[1:] or None
-    tests = [test_reduction, test_legacy_families, test_gradient, test_units,
-             test_pruned_baseline, test_injection, test_degeneracy,
-             test_hdf5_roundtrip, test_self_consistent_sigma]
+    tests = [
+        test_reduction,
+        test_legacy_families,
+        test_gradient,
+        test_units,
+        test_pruned_baseline,
+        test_injection,
+        test_degeneracy,
+        test_hdf5_roundtrip,
+        test_self_consistent_sigma,
+    ]
     for fn in tests:
         if only and not any(o in fn.__name__ for o in only):
             continue

@@ -768,8 +768,9 @@ class ZGammaLineshape:
         if self.vpow is None:
             return
         p = self.vpow
-        self.v_grid = np.linspace(_vmap(self.window[0], p),
-                                  _vmap(self.window[1], p), self.nm)
+        self.v_grid = np.linspace(
+            _vmap(self.window[0], p), _vmap(self.window[1], p), self.nm
+        )
         self.dv = float(self.v_grid[1] - self.v_grid[0])
         m_of_v = _vinv(self.v_grid, p)
         # linear interpolation from the (uniform) mass grid onto m(v)
@@ -778,7 +779,7 @@ class ZGammaLineshape:
         self._v_i0 = tf.constant(i0, tf.int32)
         self._v_w = tf.constant(u - i0, self.dtype)
         # p_v(v) = p(m(v)) (dm/dv) = p(m) m^p
-        self._v_jac = tf.constant(m_of_v ** p, self.dtype)
+        self._v_jac = tf.constant(m_of_v**p, self.dtype)
         self.v_ref = _vmap(float(self.m_ref), p)
         # the CF prefactors, in v
         # `tau_max` is given in units conjugate to the MASS. The term evaluates
@@ -798,8 +799,9 @@ class ZGammaLineshape:
         self.tau_tab = np.arange(ntau_v) * dtau_v
         theta = self.tau_tab * self.dv
         with np.errstate(invalid="ignore"):
-            khat = np.where(theta == 0.0, 1.0,
-                            (np.sin(0.5 * theta) / (0.5 * theta)) ** 2)
+            khat = np.where(
+                theta == 0.0, 1.0, (np.sin(0.5 * theta) / (0.5 * theta)) ** 2
+            )
         psi = self.tau_tab * (self.v_grid[0] - self.v_ref)
         self._pref_re = tf.constant(self.dv * khat * np.cos(psi), dtype)
         self._pref_im = tf.constant(self.dv * khat * np.sin(psi), dtype)
@@ -807,8 +809,10 @@ class ZGammaLineshape:
     def pdf_v(self, values=None, **kw):
         """The lineshape as a density in `v`, normalised on the `v` grid."""
         y = self.pdf(values, **kw)
-        y = tf.gather(y, self._v_i0) * (self.npdt(1.0) - self._v_w) + \
-            tf.gather(y, tf.minimum(self._v_i0 + 1, self.nm - 1)) * self._v_w
+        y = (
+            tf.gather(y, self._v_i0) * (self.npdt(1.0) - self._v_w)
+            + tf.gather(y, tf.minimum(self._v_i0 + 1, self.nm - 1)) * self._v_w
+        )
         y = y * self._v_jac
         return y / (tf.reduce_sum(y) * self.npdt(self.dv))
 
@@ -839,7 +843,8 @@ class ZGammaLineshape:
             # probability, so clip and count rather than let a negative density
             # reach the likelihood
             self.fsr_table_neg = getattr(self, "fsr_table_neg", 0) + int(
-                np.sum(K < 0.0))
+                np.sum(K < 0.0)
+            )
             K = np.maximum(K, 0.0)
             p0 = np.maximum(p0, 0.0)
         else:
@@ -953,15 +958,15 @@ class ZGammaLineshape:
                     # sampling it on a grid of spacing `r dm` is not a
                     # partition of unity, and the O(1-r) ripple that leaves in
                     # the OUTPUT density does not go away with dm.
-                    val = np.concatenate([
-                        v / rr * np.maximum(1.0 - f / rr, 0.0),
-                        v / rr * np.maximum(1.0 - (1.0 - f) / rr, 0.0),
-                    ])
+                    val = np.concatenate(
+                        [
+                            v / rr * np.maximum(1.0 - f / rr, 0.0),
+                            v / rr * np.maximum(1.0 - (1.0 - f) / rr, 0.0),
+                        ]
+                    )
                 keep = (idx >= 0) & (idx < nm)
                 if keep.any():
-                    buf[j, :nm] += np.bincount(
-                        idx[keep], val[keep], minlength=nm
-                    )[:nm]
+                    buf[j, :nm] += np.bincount(idx[keep], val[keep], minlength=nm)[:nm]
                 # ---- wide cells: the exact projection of their density --
                 # Each carries its mass spread over its own width; the deposit
                 # onto node i is the hat-basis projection int rho lambda_i,
@@ -978,7 +983,8 @@ class ZGammaLineshape:
                 cumM = np.concatenate([[0.0], np.cumsum(A)])
                 wd = np.diff(E)
                 cumN = np.concatenate(
-                    [[0.0], np.cumsum(0.5 * (cumM[:-1] + cumM[1:]) * wd)])
+                    [[0.0], np.cumsum(0.5 * (cumM[:-1] + cumM[1:]) * wd)]
+                )
                 k = np.clip(np.searchsorted(E, xs, "right") - 1, 0, ncell - 1)
                 dx = xs - E[k]
                 N = np.where(
@@ -987,9 +993,9 @@ class ZGammaLineshape:
                     np.where(
                         xs >= E[-1],
                         cumN[-1] + (xs - E[-1]) * cumM[-1],
-                        cumN[k] + cumM[k] * dx
-                        + A[k] * dx * dx
-                        / (2.0 * np.where(wd[k] > 0.0, wd[k], 1.0)),
+                        cumN[k]
+                        + cumM[k] * dx
+                        + A[k] * dx * dx / (2.0 * np.where(wd[k] > 0.0, wd[k], 1.0)),
                     ),
                 )
                 buf[j, :nm] += (N[2:] - 2.0 * N[1:-1] + N[:-2]) / dm
@@ -1103,11 +1109,7 @@ class ZGammaLineshape:
         if not values:
             return None
         c = tf.stack(
-            [
-                tf.cast(values[p], self.dtype)
-                for p in self.shape_params
-                if p in values
-            ]
+            [tf.cast(values[p], self.dtype) for p in self.shape_params if p in values]
         )
         if int(c.shape[0]) != self.shape:
             return None
@@ -1158,17 +1160,19 @@ class ZGammaLineshape:
             "fsr": (
                 None
                 if self.fsr is None
-                else self._table_config()
-                if self.fsr_kind == "table"
-                else {
-                    "r": self.fsr["r"].tolist(),
-                    "w": self.fsr["w"].tolist(),
-                    "m_lo": self.fsr["m_lo"].tolist(),
-                    "m_hi": [
-                        None if not np.isfinite(v) else float(v)
-                        for v in self.fsr["m_hi"]
-                    ],
-                }
+                else (
+                    self._table_config()
+                    if self.fsr_kind == "table"
+                    else {
+                        "r": self.fsr["r"].tolist(),
+                        "w": self.fsr["w"].tolist(),
+                        "m_lo": self.fsr["m_lo"].tolist(),
+                        "m_hi": [
+                            None if not np.isfinite(v) else float(v)
+                            for v in self.fsr["m_hi"]
+                        ],
+                    }
+                )
             ),
         }
 
