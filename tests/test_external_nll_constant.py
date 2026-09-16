@@ -28,15 +28,15 @@ import os
 import tempfile
 
 import numpy as np
-from test_external_term import (
+
+from rabbit import external_likelihood
+from tests.test_external_term import (
     build_writer,
     loss_grad_hess_at,
     make_grad_hist,
     make_hess_hist,
     make_hess_sparsehist,
 )
-
-from rabbit import external_likelihood
 
 PARAM = "shape"  # the single systematic in build_writer's model
 TOL = 1e-9
@@ -55,10 +55,10 @@ def write(tmpdir, fname, **kwargs):
 def loss_at(filename, parms_ref, value, full=False):
     """Loss of ``filename`` with PARAM set to ``value``, everything else at 0."""
     import tensorflow as tf
-    from test_external_term import make_options
 
     from rabbit import fitter, inputdata
     from rabbit.param_models.helpers import load_model
+    from tests.test_external_term import make_options
 
     indata_obj = inputdata.FitInputData(filename)
     f = fitter.Fitter(indata_obj, load_model("Mu", indata_obj), make_options())

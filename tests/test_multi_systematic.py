@@ -5,11 +5,12 @@ to booking each systematic individually.
 """
 
 import os
-import tempfile
+from types import SimpleNamespace
 
 import h5py
 import hist
 import numpy as np
+import pytest
 
 from rabbit import tensorwriter
 
@@ -313,223 +314,166 @@ def read_hdf5_arrays(path):
         return {"systs": systs, "hnorm": hnorm, "hlogk": hlogk}
 
 
-def main():
-    nsyst = 4
+NSYST = 4
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        h_bkg, var_up, var_dn = make_base_histograms(nsyst)
+# An Integer axis named "syst" auto-names its entries shape_0 .. shape_{n-1};
+# the reference path books those same systematics one at a time. Every variation
+# below is a booking or storage difference that must land on identical tensors.
+EXPECTED_NAMES = [f"shape_{i}" for i in range(NSYST)]
 
-        # Reference path: individual systematics
-        ref_writer = make_writer_with_individual_systs(h_bkg, var_up, var_dn, "shape")
-        ref_path = os.path.join(tmpdir, "ref.hdf5")
-        ref_writer.write(outfolder=tmpdir, outfilename="ref")
 
-        # New path: single histogram with extra axis
-        multi_writer = make_writer_with_multi_axis(h_bkg, var_up, var_dn, "shape")
-        multi_writer.write(outfolder=tmpdir, outfilename="multi")
-        multi_path = os.path.join(tmpdir, "multi.hdf5")
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    """Write every variant once and read back the tensors they produced."""
+    tmpdir = str(tmp_path_factory.mktemp("multi_systematic"))
+    h_bkg, var_up, var_dn = make_base_histograms(NSYST)
 
-        ref = read_hdf5_arrays(ref_path)
-        multi = read_hdf5_arrays(multi_path)
+    def write(writer, name):
+        writer.write(outfolder=tmpdir, outfilename=name)
+        return read_hdf5_arrays(os.path.join(tmpdir, f"{name}.hdf5"))
 
-        # Auto-generated names for an Integer axis named "syst" should be "shape_0", "shape_1", ...
-        expected_names = [f"shape_{i}" for i in range(nsyst)]
+    cat_writer, cat_labels = make_writer_with_str_category(h_bkg, var_up, var_dn)
+    out = SimpleNamespace(
+        cat_labels=cat_labels,
+        ref=write(
+            make_writer_with_individual_systs(h_bkg, var_up, var_dn, "shape"), "ref"
+        ),
+        multi=write(
+            make_writer_with_multi_axis(h_bkg, var_up, var_dn, "shape"), "multi"
+        ),
+        cat=write(cat_writer, "cat"),
+        sparse_ref=write(
+            make_writer_with_individual_systs(
+                h_bkg, var_up, var_dn, "shape", sparse=True
+            ),
+            "sparse_ref",
+        ),
+        sparse_multi=write(
+            make_writer_with_multi_axis(h_bkg, var_up, var_dn, "shape", sparse=True),
+            "sparse_multi",
+        ),
+        sparsehist_multi=write(
+            make_writer_with_sparsehist_multi_axis(h_bkg, var_up, var_dn, "shape"),
+            "sparsehist_multi",
+        ),
+        masked_ref=write(
+            make_writer_masked_flow_individual(h_bkg, var_up, var_dn, "shape"),
+            "masked_ref",
+        ),
+        masked_sh=write(
+            make_writer_masked_flow_sparsehist(h_bkg, var_up, var_dn, "shape"),
+            "masked_sh",
+        ),
+    )
+    batch_fast, batch_manual = _write_batched_pair(tmpdir, write)
+    out.batch_fast, out.batch_manual = batch_fast, batch_manual
+    return out
 
-        print("Reference systs:    ", ref["systs"])
-        print("Multi-axis systs:   ", multi["systs"])
-        print("Expected names:     ", expected_names)
 
-        assert (
-            ref["systs"] == expected_names
-        ), f"Reference systs {ref['systs']} != expected {expected_names}"
-        assert (
-            multi["systs"] == expected_names
-        ), f"Multi-axis systs {multi['systs']} != expected {expected_names}"
+def _write_batched_pair(tmpdir, write):
+    """The vectorized add_systematic path against per-syst manual booking.
 
-        assert np.allclose(ref["hnorm"], multi["hnorm"]), "norm mismatch"
-        assert np.allclose(ref["hlogk"], multi["hlogk"]), "logk mismatch"
+    mirror=True + as_difference=True on a single batched SparseHist takes the
+    fast path that bypasses per-slice dispatch entirely. The data deliberately
+    includes bins the delta pushes negative, so the logkepsilon fallback runs.
+    """
+    import scipy.sparse as _sp
+    from wums.sparse_hist import SparseHist as _SH
 
-        print("PASS: multi-axis Integer matches individual systematics")
+    nbatch = 12
+    ax_bx = hist.axis.Regular(8, -4, 4, name="x")
+    ax_by = hist.axis.Regular(6, 0, 3, name="y")
+    ax_bs = hist.axis.Integer(0, nbatch, underflow=False, overflow=False, name="syst")
 
-        # StrCategory axis: names should come from the string bin labels
-        cat_writer, cat_labels = make_writer_with_str_category(h_bkg, var_up, var_dn)
-        cat_writer.write(outfolder=tmpdir, outfilename="cat")
-        cat_path = os.path.join(tmpdir, "cat.hdf5")
-        cat = read_hdf5_arrays(cat_path)
+    rng = np.random.default_rng(17)
+    h_bproc = hist.Hist(ax_bx, ax_by, storage=hist.storage.Weight())
+    x_v = rng.normal(0, 1, 1000)
+    y_v = rng.uniform(0, 3, 1000)
+    h_bproc.fill(x_v, y_v, weight=np.ones(1000))
+    h_bdata = hist.Hist(ax_bx, ax_by, storage=hist.storage.Double())
+    h_bdata.fill(x_v, y_v)
 
-        expected_cat_names = sorted([f"shape_{lbl}" for lbl in cat_labels])
-        print("StrCategory systs:  ", cat["systs"])
-        assert (
-            cat["systs"] == expected_cat_names
-        ), f"Category systs {cat['systs']} != expected {expected_cat_names}"
-        # Same logk values, just different names
-        assert np.allclose(ref["hnorm"], cat["hnorm"]), "norm mismatch (cat)"
-        assert np.allclose(ref["hlogk"], cat["hlogk"]), "logk mismatch (cat)"
+    ext_shape = (ax_bx.extent, ax_by.extent, ax_bs.extent)
+    dense_systs = rng.normal(0, 0.1, ext_shape)
+    dense_systs[rng.random(ext_shape) < 0.5] = 0
+    sh_batch = _SH(_sp.csr_array(dense_systs.reshape(1, -1)), [ax_bx, ax_by, ax_bs])
 
-        print("PASS: multi-axis StrCategory matches individual systematics")
-
-        # Sparse mode: hist with extra axis
-        sparse_ref_writer = make_writer_with_individual_systs(
-            h_bkg, var_up, var_dn, "shape", sparse=True
-        )
-        sparse_ref_writer.write(outfolder=tmpdir, outfilename="sparse_ref")
-        sparse_ref = read_hdf5_arrays(os.path.join(tmpdir, "sparse_ref.hdf5"))
-
-        sparse_multi_writer = make_writer_with_multi_axis(
-            h_bkg, var_up, var_dn, "shape", sparse=True
-        )
-        sparse_multi_writer.write(outfolder=tmpdir, outfilename="sparse_multi")
-        sparse_multi = read_hdf5_arrays(os.path.join(tmpdir, "sparse_multi.hdf5"))
-
-        print("Sparse-mode multi-axis systs:", sparse_multi["systs"])
-        assert sparse_multi["systs"] == expected_names
-        assert np.allclose(
-            sparse_ref["hnorm"], sparse_multi["hnorm"]
-        ), "norm mismatch (sparse multi vs sparse ref)"
-        assert np.allclose(
-            sparse_ref["hlogk"], sparse_multi["hlogk"]
-        ), "logk mismatch (sparse multi vs sparse ref)"
-        # Sparse and dense paths should agree
-        assert np.allclose(
-            ref["hnorm"], sparse_ref["hnorm"]
-        ), "norm mismatch (sparse ref vs dense ref)"
-        assert np.allclose(
-            ref["hlogk"], sparse_ref["hlogk"]
-        ), "logk mismatch (sparse ref vs dense ref)"
-        print("PASS: sparse mode multi-axis matches sparse mode individual")
-
-        # SparseHist input + sparse mode + multi-axis
-        sh_writer = make_writer_with_sparsehist_multi_axis(
-            h_bkg, var_up, var_dn, "shape"
-        )
-        sh_writer.write(outfolder=tmpdir, outfilename="sparsehist_multi")
-        sh = read_hdf5_arrays(os.path.join(tmpdir, "sparsehist_multi.hdf5"))
-
-        print("SparseHist multi-axis systs:", sh["systs"])
-        assert sh["systs"] == expected_names
-        assert np.allclose(
-            sparse_ref["hnorm"], sh["hnorm"]
-        ), "norm mismatch (SparseHist multi vs sparse ref)"
-        assert np.allclose(
-            sparse_ref["hlogk"], sh["hlogk"]
-        ), "logk mismatch (SparseHist multi vs sparse ref)"
-        print("PASS: SparseHist multi-axis matches sparse mode individual")
-
-        # Flow test: SparseHist with flow=True on a masked channel with flow=True
-        masked_ref_writer = make_writer_masked_flow_individual(
-            h_bkg, var_up, var_dn, "shape"
-        )
-        masked_ref_writer.write(outfolder=tmpdir, outfilename="masked_ref")
-        masked_ref = read_hdf5_arrays(os.path.join(tmpdir, "masked_ref.hdf5"))
-
-        masked_sh_writer = make_writer_masked_flow_sparsehist(
-            h_bkg, var_up, var_dn, "shape"
-        )
-        masked_sh_writer.write(outfolder=tmpdir, outfilename="masked_sh")
-        masked_sh = read_hdf5_arrays(os.path.join(tmpdir, "masked_sh.hdf5"))
-
-        print("Masked-flow individual systs:", masked_ref["systs"])
-        print("Masked-flow SparseHist systs:", masked_sh["systs"])
-        assert masked_ref["systs"] == expected_names
-        assert masked_sh["systs"] == expected_names
-        assert np.allclose(
-            masked_ref["hnorm"], masked_sh["hnorm"]
-        ), "norm mismatch (masked SparseHist flow vs masked individual)"
-        assert np.allclose(
-            masked_ref["hlogk"], masked_sh["hlogk"]
-        ), "logk mismatch (masked SparseHist flow vs masked individual)"
-        print("PASS: SparseHist on masked flow=True channel matches individual")
-
-        # --- Batched SparseHist path: single hist, mirror=True, as_difference=True ---
-        # This exercises the vectorized fast path in add_systematic which
-        # bypasses the per-slice dispatch entirely. We compare byte-for-byte
-        # against the equivalent per-syst manual booking (which goes through
-        # the regular single-syst path) using log_normal systematic type on
-        # a dense process, on data that includes positions where the delta
-        # pushes the bin negative (so the logkepsilon fallback is exercised).
-        import scipy.sparse as _sp
-        from wums.sparse_hist import SparseHist as _SH
-
-        nbatch = 12
-        ax_bx = hist.axis.Regular(8, -4, 4, name="x")
-        ax_by = hist.axis.Regular(6, 0, 3, name="y")
-        ax_bs = hist.axis.Integer(
-            0, nbatch, underflow=False, overflow=False, name="syst"
-        )
-
-        rng = np.random.default_rng(17)
-        h_bproc = hist.Hist(ax_bx, ax_by, storage=hist.storage.Weight())
-        x_v = rng.normal(0, 1, 1000)
-        y_v = rng.uniform(0, 3, 1000)
-        h_bproc.fill(x_v, y_v, weight=np.ones(1000))
-        h_bdata = hist.Hist(ax_bx, ax_by, storage=hist.storage.Double())
-        h_bdata.fill(x_v, y_v)
-
-        ext_shape = (ax_bx.extent, ax_by.extent, ax_bs.extent)
-        dense_systs = rng.normal(0, 0.1, ext_shape)
-        sparse_mask = rng.random(ext_shape) < 0.5
-        dense_systs[sparse_mask] = 0
-        flat_data = dense_systs.reshape(1, -1)
-        sh_batch = _SH(_sp.csr_array(flat_data), [ax_bx, ax_by, ax_bs])
-
-        def make_batch_writer(use_batched):
-            w = tensorwriter.TensorWriter(sparse=True, systematic_type="log_normal")
-            w.add_channel([ax_bx, ax_by], "ch0")
-            w.add_data(h_bdata, "ch0")
-            w.add_process(h_bproc, "proc", "ch0", signal=True)
-            if use_batched:
+    def make_batch_writer(use_batched):
+        w = tensorwriter.TensorWriter(sparse=True, systematic_type="log_normal")
+        w.add_channel([ax_bx, ax_by], "ch0")
+        w.add_data(h_bdata, "ch0")
+        w.add_process(h_bproc, "proc", "ch0", signal=True)
+        common = dict(mirror=True, as_difference=True, constrained=False, groups=["g"])
+        if use_batched:
+            w.add_systematic(sh_batch, "syst", "proc", "ch0", **common)
+        else:
+            for i in range(nbatch):
+                sub = _sp.csr_array(dense_systs[:, :, i].reshape(1, -1))
                 w.add_systematic(
-                    sh_batch,
-                    "syst",
+                    _SH(sub, [ax_bx, ax_by]),
+                    f"syst_{i}",
                     "proc",
                     "ch0",
-                    mirror=True,
-                    as_difference=True,
-                    constrained=False,
-                    groups=["g"],
+                    syst_axes=[],
+                    **common,
                 )
-            else:
-                for i in range(nbatch):
-                    sub_dense = dense_systs[:, :, i]
-                    sub_flat = _sp.csr_array(sub_dense.reshape(1, -1))
-                    sub_sh = _SH(sub_flat, [ax_bx, ax_by])
-                    w.add_systematic(
-                        sub_sh,
-                        f"syst_{i}",
-                        "proc",
-                        "ch0",
-                        mirror=True,
-                        as_difference=True,
-                        constrained=False,
-                        groups=["g"],
-                        syst_axes=[],
-                    )
-            return w
+        return w
 
-        wb = make_batch_writer(True)
-        wb.write(outfolder=tmpdir, outfilename="batch_fast")
-        wm = make_batch_writer(False)
-        wm.write(outfolder=tmpdir, outfilename="batch_manual")
+    return (
+        write(make_batch_writer(True), "batch_fast"),
+        write(make_batch_writer(False), "batch_manual"),
+    )
 
-        bf = read_hdf5_arrays(os.path.join(tmpdir, "batch_fast.hdf5"))
-        bm = read_hdf5_arrays(os.path.join(tmpdir, "batch_manual.hdf5"))
 
-        print("Batched-path fast systs:    ", bf["systs"])
-        print("Batched-path manual systs:  ", bm["systs"])
-        assert (
-            bf["systs"] == bm["systs"]
-        ), f"syst lists differ: fast {bf['systs']} vs manual {bm['systs']}"
-        assert np.allclose(
-            bf["hnorm"], bm["hnorm"]
-        ), "hnorm mismatch (batched fast vs manual)"
-        assert np.allclose(
-            bf["hlogk"], bm["hlogk"]
-        ), "hlogk mismatch (batched fast vs manual)"
-        print("PASS: batched SparseHist path matches per-syst manual booking")
+def _assert_same_tensors(a, b, what):
+    assert np.allclose(a["hnorm"], b["hnorm"]), f"norm mismatch ({what})"
+    assert np.allclose(a["hlogk"], b["hlogk"]), f"logk mismatch ({what})"
 
-        print()
-        print("ALL CHECKS PASSED")
+
+def test_reference_path_auto_names_the_systematics(built):
+    assert built.ref["systs"] == EXPECTED_NAMES
+
+
+def test_multi_axis_integer_matches_individual(built):
+    assert built.multi["systs"] == EXPECTED_NAMES
+    _assert_same_tensors(built.ref, built.multi, "multi-axis vs individual")
+
+
+def test_multi_axis_str_category_matches_individual(built):
+    """Names come from the bin labels; the tensors are the same either way."""
+    assert built.cat["systs"] == sorted(f"shape_{lbl}" for lbl in built.cat_labels)
+    _assert_same_tensors(built.ref, built.cat, "StrCategory vs individual")
+
+
+def test_sparse_mode_multi_axis_matches_sparse_individual(built):
+    assert built.sparse_multi["systs"] == EXPECTED_NAMES
+    _assert_same_tensors(
+        built.sparse_ref, built.sparse_multi, "sparse multi vs sparse ref"
+    )
+    _assert_same_tensors(built.ref, built.sparse_ref, "sparse ref vs dense ref")
+
+
+def test_sparsehist_multi_axis_matches_sparse_individual(built):
+    assert built.sparsehist_multi["systs"] == EXPECTED_NAMES
+    _assert_same_tensors(
+        built.sparse_ref, built.sparsehist_multi, "SparseHist multi vs sparse ref"
+    )
+
+
+def test_sparsehist_on_masked_flow_channel_matches_individual(built):
+    assert built.masked_ref["systs"] == EXPECTED_NAMES
+    assert built.masked_sh["systs"] == EXPECTED_NAMES
+    _assert_same_tensors(
+        built.masked_ref, built.masked_sh, "masked SparseHist flow vs masked individual"
+    )
+
+
+def test_batched_sparsehist_path_matches_manual_booking(built):
+    assert built.batch_fast["systs"] == built.batch_manual["systs"]
+    _assert_same_tensors(built.batch_fast, built.batch_manual, "batched fast vs manual")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

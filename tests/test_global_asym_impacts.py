@@ -28,8 +28,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from rabbit import io_tools
 
@@ -294,49 +296,70 @@ def t6_unconstrained_skipped(res_full: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+COMMON = ["--doImpacts", "--gaussianGlobalImpacts"]
+
+
+@pytest.fixture(scope="module")
+def results():
+    """Three fits, run once: the fits are ~a minute, the checks are instant.
+
+    chdir because make_tensor.py and the fit are invoked by relative path;
+    restored afterwards so the rest of the pytest session is unaffected, which
+    a bare script never had to care about.
+    """
+    cwd = os.getcwd()
     os.chdir(os.environ.get("RABBIT_BASE", "."))
-    make_tensor()
+    try:
+        make_tensor()
+        base_h5 = fit("baseline", *COMMON)
+        small_h5 = fit(
+            "small_sigma",
+            *COMMON,
+            "--globalAsymImpacts",
+            "--globalAsymImpactsSigma",
+            "0.01",
+        )
+        full_h5 = fit(
+            "full_sigma",
+            *COMMON,
+            "--globalAsymImpacts",
+            "--globalAsymImpactsSigma",
+            "1.0",
+        )
+        return SimpleNamespace(
+            base=load_results(base_h5),
+            small=load_results(small_h5),
+            full=load_results(full_h5),
+        )
+    finally:
+        os.chdir(cwd)
 
-    common = [
-        "--doImpacts",
-        "--gaussianGlobalImpacts",
-    ]
 
-    # baseline: just the fit, no asym scan -> reference parms
-    base_h5 = fit("baseline", *common)
+def test_output_schema(results):
+    t5_output_schema(results.full)
 
-    # small-sigma asym for Gaussian closure & symmetry
-    small_h5 = fit(
-        "small_sigma",
-        *common,
-        "--globalAsymImpacts",
-        "--globalAsymImpactsSigma",
-        "0.01",
-    )
 
-    # full-sigma asym for asymmetry detection
-    full_h5 = fit(
-        "full_sigma",
-        *common,
-        "--globalAsymImpacts",
-        "--globalAsymImpactsSigma",
-        "1.0",
-    )
+def test_unconstrained_are_skipped(results):
+    t6_unconstrained_skipped(results.full)
 
-    res_base = load_results(base_h5)
-    res_small = load_results(small_h5)
-    res_full = load_results(full_h5)
 
-    t5_output_schema(res_full)
-    t6_unconstrained_skipped(res_full)
-    t1_gaussian_closure(res_small, res_small)  # gaussianGlobal is in same file
-    t2_small_sigma_symmetry(res_small)
-    t3_asymmetry_at_full_sigma(res_full, res_small)
-    t4_state_restoration(res_base, res_full)
+def test_gaussian_closure(results):
+    # both arguments are the small-sigma file on purpose: the gaussianGlobal
+    # impacts it is compared against live in that same output
+    t1_gaussian_closure(results.small, results.small)
 
-    print("\nAll tests passed.")
+
+def test_small_sigma_symmetry(results):
+    t2_small_sigma_symmetry(results.small)
+
+
+def test_asymmetry_at_full_sigma(results):
+    t3_asymmetry_at_full_sigma(results.full, results.small)
+
+
+def test_state_restoration(results):
+    t4_state_restoration(results.base, results.full)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(pytest.main([__file__, "-v"]))
