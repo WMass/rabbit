@@ -30,6 +30,9 @@ Checks, in order:
 9. **background round trip** -- every background kind written to a datacard
    and read back through ``read_unbinned_terms_from_h5`` gives the same
    parameters, the same density and the same NLL.
+10. **phik_grid guards** -- the pre-interpolated kernel CF is refused with an
+    upsampled tau grid or a parameter-dependent sigma, at construction and
+    through ``set_corrections``.
 
 Quick mode builds a small datacard from the step-1 caches (default 20k
 candidates, a 20k-sample kernel CF on 2048 points) and runs in a few minutes.
@@ -936,6 +939,70 @@ def test_background_roundtrip():
 
 
 # ---------------------------------------------------------------------------
+# 10. phik_grid is pinned to the exported sigma and tau grid
+# ---------------------------------------------------------------------------
+def test_phik_grid_guard():
+    """``phik_grid`` must be refused where it cannot be right.
+
+    The pre-interpolated ``(n, nt)`` kernel CF is evaluated at
+    ``tgrid / sigma_i`` with the EXPORTED sigma. A parameter-dependent sigma
+    moves the absolute ``t`` (the rest of ``_density`` would use the corrected
+    ``s_i(theta)`` -- a silently inconsistent density) and ``upsample`` changes
+    the number of columns (a TF shape error at the first NLL). Both have to be
+    errors at construction, and switching the correction on afterwards has to
+    be one too.
+    """
+    print("\n=== 10. phik_grid guards ===")
+    n, nt = 96, 32
+    grid = (np.ones((n, nt)), np.zeros((n, nt)))
+    ok = True
+
+    # it still works where it IS right
+    term, _ = _toy_term(
+        "plain", unbinned.UniformBackground((2.75, 3.45)), phik_grid=grid
+    )
+    v = float(term.nll(tf.constant([1.0, 1.0], tf.float64)).numpy())
+    ok &= np.isfinite(v)
+    print(f"  phik_grid alone: NLL = {v:.6f}")
+
+    a_res = np.full(n, 0.3)
+    for tag, kw in (
+        ("upsample > 1", dict(upsample=2)),
+        ("parameter-dependent sigma", dict(a_res=a_res)),
+        ("both", dict(upsample=2, a_res=a_res)),
+    ):
+        try:
+            _toy_term(
+                "bad", unbinned.UniformBackground((2.75, 3.45)), phik_grid=grid, **kw
+            )
+        except ValueError as e:
+            ok &= "phik" in str(e)
+            print(f"  {tag:26s}: refused -- {e}")
+        else:
+            ok = False
+            print(f"  {tag:26s}: NOT REFUSED")
+
+    # and through the other door: the variant ladder runs off one card
+    later, _ = _toy_term(
+        "later",
+        unbinned.UniformBackground((2.75, 3.45)),
+        phik_grid=grid,
+        a_res=a_res,
+        self_consistent_sigma=False,
+    )
+    try:
+        later.set_corrections(self_consistent_sigma=True)
+    except ValueError as e:
+        ok &= "phik" in str(e)
+        print(f"  set_corrections            : refused -- {e}")
+    else:
+        ok = False
+        print("  set_corrections            : NOT REFUSED")
+    print("  PASS" if ok else "  FAIL")
+    return ok
+
+
+# ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -961,7 +1028,7 @@ def parse_args():
     p.add_argument("--minimizer", default="trust-exact")
     p.add_argument("--threads", type=int, default=32)
     p.add_argument(
-        "--only", default=None, help="comma separated subset of tests to run (1..9)"
+        "--only", default=None, help="comma separated subset of tests to run (1..10)"
     )
     return p.parse_args()
 
@@ -985,7 +1052,7 @@ def main():
     which = (
         set(args.only.split(","))
         if args.only
-        else {"1", "2", "3", "4", "5", "6", "7", "8", "9"}
+        else {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
     )
     results = {}
 
@@ -1019,6 +1086,8 @@ def main():
         results["6 sparse D rows"] = test_jacobian_rows()
     if "9" in which:
         results["9 background round trip"] = test_background_roundtrip()
+    if "10" in which:
+        results["10 phik_grid guards"] = test_phik_grid_guard()
 
     print("\n=== summary ===")
     for k, v in results.items():

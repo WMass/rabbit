@@ -902,6 +902,10 @@ class MassCFTerm(UnbinnedTerm):
         ``t``; interpolated onto ``tgrid / sigma_i`` at construction.
     phik_grid : (ndarray, ndarray), optional
         Alternative to ``phik``: the already-interpolated ``(n, nt)`` arrays.
+        Pinned to the exported ``sigma`` and ``tgrid``, so it is refused with
+        ``upsample > 1`` and with a parameter-dependent sigma (``a_res`` and
+        ``self_consistent_sigma``), and by ``norm_window``; pass ``phik``,
+        which is re-interpolated in graph, to run any of those.
     kernel : PhysicsKernel
     background : BackgroundPdf
     m_ref : float
@@ -1308,7 +1312,33 @@ class MassCFTerm(UnbinnedTerm):
 
         # ---- kernel CF ----------------------------------------------------
         self.phik_tab = None
+        self._phik_grid = phik_grid is not None
         if phik_grid is not None:
+            # THE GRID IS PINNED to the exported sigma and to the exported tau
+            # grid: it is the kernel CF already interpolated at `tgrid / sigma`
+            # per candidate.  Neither device that MOVES those can be served
+            # from it -- a parameter-dependent sigma would read the kernel CF
+            # at the old absolute t while the rest of `_density` uses the
+            # corrected `s_i(theta)` (a silently inconsistent density), and an
+            # upsampled tau grid needs `nt_int` columns where the grid has
+            # `nt` (a TF shape error at the first NLL).  The tabulation
+            # `phik=(t, re, im)` re-interpolates IN GRAPH and is the way to
+            # run either; `_build_norm` refuses `norm_window + phik_grid` for
+            # the same reason.
+            why = []
+            if self.upsample > 1:
+                why.append(f"an upsampled tau grid (upsample = {self.upsample})")
+            if self._dyn_sigma:
+                why.append(
+                    "a parameter-dependent sigma (a_res with self_consistent_sigma)"
+                )
+            if why:
+                raise ValueError(
+                    "phik_grid is the kernel CF pre-interpolated at the "
+                    "exported sigma on the exported tau grid and cannot serve "
+                    + " or ".join(why)
+                    + "; pass the tabulation phik=(t, re, im) instead"
+                )
             pk_re, pk_im = phik_grid
             self.phik_re = tf.constant(np.asarray(pk_re), dtype)
             self.phik_im = tf.constant(np.asarray(pk_im), dtype)
@@ -1865,12 +1895,24 @@ class MassCFTerm(UnbinnedTerm):
                     f"jensen_mode='{jensen_mode}' but the term has no jensen_s2"
                 )
             self.jensen_mode = jensen_mode
-        self._dyn_sigma = bool(
+        dyn_sigma = bool(
             not self._fluct
             and self.a_res is not None
             and self.self_consistent_sigma
             and np.any(self._a_res_np != 0.0)
         )
+        if dyn_sigma and self._phik_grid:
+            # the constructor's refusal, through the other door: the variant
+            # ladder runs off ONE card, and switching the self-consistent
+            # width on for a term whose kernel CF is the pinned grid would
+            # silently evaluate it at the exported sigma.
+            raise ValueError(
+                f"term '{self.name}' was built from phik_grid, the kernel CF "
+                "pre-interpolated at the exported sigma; a parameter-dependent "
+                "sigma cannot be switched on for it. Rebuild the card with the "
+                "tabulation phik=(t, re, im)"
+            )
+        self._dyn_sigma = dyn_sigma
         self._jensen = bool(
             not self._fluct
             and self.jensen_mode != "off"
