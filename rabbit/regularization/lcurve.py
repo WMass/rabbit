@@ -34,10 +34,16 @@ def _compute_curvature(fitter):
 
         # 2) compute pdLx/pdx, pdLy/pdx and pd^2Lx/pdx^2, pd^2Ly/pdx^2
         with tf.GradientTape(persistent=True) as t_inner:
+            # Same contract as the fit path (Fitter._compute_nll): build the
+            # full yields only if some regularizer actually reads them, and
+            # hand None to the penalties when none does. Without this the scan
+            # objective and the fit objective are different functions, so the
+            # tau it picks optimises something the fit never evaluates.
+            needs_observables = fitter._regularizers_need_observables()
             nexpfullcentral, _, beta = fitter._compute_yields_with_beta(
                 profile=False,
                 compute_norm=False,
-                full=len(fitter.regularizers),
+                full=needs_observables,
             )
 
             nexp = nexpfullcentral[: fitter.indata.nbins]
@@ -48,8 +54,21 @@ def _compute_curvature(fitter):
             lx = tf.math.log(ln + lc + lbeta)
 
             x = fitter.get_x()
+            # Per regularizer, not on the any() above: that decides whether the
+            # yields get built at all, which one reader is enough to require.
+            # Which penalties then *see* them is each one's own declaration, as
+            # in Fitter._compute_nll and arm_regularizers -- otherwise a mixed
+            # list hands the parameter-only penalties a vector they said they
+            # do not read, which is the bug this is fixing, one list longer.
             penalties = [
-                reg.compute_nll_penalty(x, nexpfullcentral)
+                reg.compute_nll_penalty(
+                    x,
+                    (
+                        nexpfullcentral
+                        if getattr(reg, "needs_observables", True)
+                        else None
+                    ),
+                )
                 for reg in fitter.regularizers
             ]
             ly = tf.math.log(tf.add_n(penalties))

@@ -350,7 +350,7 @@ def save_observed_hists(args, mappings, fitter, ws):
         )
 
 
-def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
+def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=False):
 
     for mapping in mappings:
         logger.info(f"Save inclusive histogram for {mapping.key}")
@@ -407,8 +407,32 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
             if saturated_indices is not None:
                 # saturated likelihood test
 
+                # Adopt the analysis model's positivity convention.
+                #
+                # The bin scales must stay positive either way (a negative one
+                # sends the expected yield negative and the Poisson log() to
+                # NaN). SaturatedProjectModel's default allowNegativeParam=False
+                # asks the FITTER to guarantee that by squaring the POI block --
+                # but the fitter applies one transform to the WHOLE block, so
+                # that is only available when the analysis model wants it too.
+                # Any model declaring allowNegativeParam=True (a POI that is a
+                # physical parameter, and/or one blinded additively -- and also
+                # plain `Mu --allowNegativeParam`) therefore made
+                # CompositeParamModel reject the mix, i.e. the projected
+                # saturated test was unreachable for those analyses.
+                #
+                # Passing the analysis model's flag through makes the two
+                # submodels agree by construction: with False nothing changes
+                # (the fitter squares the whole block, exactly as before), and
+                # with True SaturatedProjectModel squares its own slice inside
+                # compute() instead. Self-squaring is also the only form that
+                # composes with ADDITIVE POI blinding, since it happens after
+                # the offset is applied rather than before.
                 saturated_model = param_model.SaturatedProjectModel(
-                    fitter.indata, mapping.channel_info, saturated_indices
+                    fitter.indata,
+                    mapping.channel_info,
+                    saturated_indices,
+                    allowNegativeParam=fitter.param_model.allowNegativeParam,
                 )
                 composite_model = param_model.CompositeParamModel(
                     [fitter.param_model, saturated_model]
@@ -448,11 +472,75 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False):
                 fitter_saturated.tau.assign(saved_tau)
 
                 fitter_saturated.xdefaultassign()
+
+                # RE-ARM BLINDING. init_fit_parms() above re-created the offset
+                # Variables at the composite size, which creates them at the
+                # IDENTITY -- offsets_poi = 1, offsets_poi_add = 0 -- and
+                # nothing armed them again. So the saturated fit ran in an
+                # UNBLINDED frame and wrote an unblinded POI into
+                # results[...]["saturated_fit"]["parms"], silently unblinding
+                # any analysis that asked for this test.
+                #
+                # Arm BEFORE touching x: set_blinding_offsets holds the
+                # PHYSICAL point fixed for both offset forms, so arming has to
+                # precede any assignment to x.
+                #
+                # The warm start below depends on that, and not via the
+                # analysis POI -- via the SATURATED bin scales, which are POIs
+                # of the composite and so are blinded along with everything
+                # else. Reframed, they stay at their physical default of 1;
+                # unreframed they land at 1 * exp(N(0, 5)) and the composite
+                # opens millions of units above the main fit. Pinned by
+                # tests/test_saturated_blinding.py.
+                if fitter_saturated.do_blinding:
+                    fitter_saturated.set_blinding_offsets(blind=blind)
+
+                # WARM START from the main fit's converged point, with every bin
+                # scale left at its default of 1.
+                #
+                # xdefaultassign() puts the composite at x0default, i.e. a COLD
+                # start from the model's anchor, which re-solves the whole fit
+                # from scratch. That is wasteful, and for a multimodal
+                # likelihood it is also WRONG: if the cold saturated fit stops
+                # above the main fit's own NLL, the statistic
+                # q = 2*(NLL_main - NLL_sat) comes out NEGATIVE, which is not a
+                # deviance. Starting where the main fit converged, with the bin
+                # scales at 1, makes the composite loss EQUAL the main loss by
+                # construction, so q >= 0 is guaranteed and the statistic reads
+                # as "what do these free bin scales buy from HERE".
+                #
+                # The permutation is the one used for x0 just above:
+                #   main      [poi_o | pou_o | theta]
+                #   composite [poi_o | poi_sat | pou_o | theta]
+                # x is the internal (blinded) coordinate on both sides, so the
+                # entries copy verbatim without a frame conversion. That rests
+                # on the two fitters offsetting each shared parameter name
+                # IDENTICALLY: the draw is seeded by name, and
+                # CompositeParamModel propagates both the blinding form and its
+                # per-POI scale, so the composite reproduces the analysis
+                # model's offsets on the analysis model's slice. If a submodel
+                # declaration were ever dropped in that propagation the copied
+                # x would land at a different PHYSICAL point and the loss
+                # equality below would quietly stop holding.
+                x_main = fitter.x.numpy()
+                if orig_model.npoi > 0:
+                    fitter_saturated.x[: orig_model.npoi].assign(
+                        x_main[: orig_model.npoi]
+                    )
+                if orig_model.npou > 0:
+                    fitter_saturated.x[
+                        composite_model.npoi : composite_model.npoi + orig_model.npou
+                    ].assign(x_main[orig_model.npoi : orig_model.nparams])
+                fitter_saturated.x[composite_model.nparams :].assign(
+                    x_main[orig_model.nparams :]
+                )
+
                 # The composite re-init reordered and resized the parameter
-                # vector (one POI per projected bin, inserted ahead of the
-                # original model's block), so regularizers must be re-armed or
-                # they read the wrong entries. xdefaultassign() above is
-                # deliberate but does not arm them.
+                # vector (one POI per projected bin, appended AFTER the
+                # original model's POIs -- see the layout diagram above), so
+                # regularizers must be re-armed or they read the wrong
+                # entries. xdefaultassign() above is deliberate but does not
+                # arm them.
                 fitter_saturated.arm_regularizers()
                 cb = fitter_saturated.minimize()
                 cov_saturated = None
@@ -702,11 +790,18 @@ def fit(args, fitter, ws, dofit=True):
 
     nllvalreduced = fitter.reduced_nll().numpy()
 
-    ndfsat = (
-        tf.size(fitter.nobs)
-        - fitter.param_model.nparams
-        - fitter.indata.nsystnoconstraint
-    ).numpy()
+    # Charge a degree of freedom for FREE parameters only, wherever they are
+    # declared. A Gaussian-constrained parameter adds one parameter and one
+    # pseudo-measurement, so it costs net zero -- which is already why rabbit
+    # charges constrained card nuisances nothing. Constrained ParamModel
+    # parameters are the same statistical object and are now charged the same
+    # way; see Fitter.nfreeparms.
+    #
+    # No-op for any analysis whose model declares no priors: all of its
+    # ParamModel entries then have cw = 0, so nfreeparms is exactly
+    # param_model.nparams + indata.nsystnoconstraint, the previous expression.
+    ndfsat = int(tf.size(fitter.nobs).numpy()) - fitter.nfreeparms
+    nfree_params, nfree_systs = fitter.nfreeparms_breakdown
 
     # 2 * nllvalreduced is a saturated chi2 only for the *binned* likelihood,
     # whose reduced form carries the offset that makes it vanish at the
@@ -726,6 +821,11 @@ def fit(args, fitter, ws, dofit=True):
 
     logger.info("Saturated chi2:")
     logger.info(f"    ndof: {ndfsat}")
+    logger.info(
+        f"      = {int(tf.size(fitter.nobs).numpy())} bins"
+        f" - {nfree_params} free of {fitter.param_model.nparams} ParamModel params"
+        f" - {nfree_systs} free of {fitter.indata.nsyst} systematics"
+    )
     logger.info(f"    2*deltaNLL: {round(chi2_val, 2)}")
     logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
 
@@ -868,6 +968,58 @@ def main():
     if chosen is not None:
         tf.config.set_visible_devices(chosen, "GPU")
 
+    # Multi-device incompatibilities that the sharded Fitter would otherwise
+    # only discover at the point of use -- i.e. after the minimiser and the
+    # postfit Hessian have already run, taking the completed fit down with
+    # them. Checked here so the run ends in seconds with the flags named.
+    if args.nDevices > 1:
+        _md = []
+        if args.doImpacts and not args.noBinByBinStat:
+            # impacts_parms needs a second Hessian at profile=False to split
+            # out the stat-only covariance; the sharded loss supports
+            # profile=True only. Without bin-by-bin stat that branch is
+            # skipped, so --noBinByBinStat is a working combination.
+            _md.append("--doImpacts (unless --noBinByBinStat)")
+        if args.globalImpacts:
+            _md.append("--globalImpacts")
+        if args.gaussianGlobalImpacts:
+            _md.append("--gaussianGlobalImpacts")
+        if args.globalAsymImpacts and args.globalAsymImpactsLinearWarmstart:
+            # The warm start needs dx/dx0, the same all-bins jacobian as
+            # --gaussianGlobalImpacts. --globalAsymImpacts on its own is
+            # repeated minimize() calls and works sharded.
+            _md.append("--globalAsymImpacts with --globalAsymImpactsLinearWarmstart")
+        if any(t > 0 for t in args.toys):
+            _md.append("-t > 0 (toy generation)")
+        if args.fullNll:
+            _md.append("--fullNll")
+        if args.lCurveScan or args.lCurveOptimize:
+            # compute_curvature calls fitter._compute_nll and
+            # _compute_yields_with_beta directly and takes a dense full-bins
+            # jacobian; MultiDeviceFitter overrides none of those, so the
+            # curvature would run unsharded -- and for --lCurveScan it runs
+            # after each per-tau minimize, discarding finished fits mid-scan.
+            _md.append("--lCurveScan / --lCurveOptimize")
+        if args.covarianceFit:
+            # Fitter.__init__ builds a dense [nbins, nbins] tf.linalg.diag when
+            # no data_cov_inv is in the workspace -- ~68 GB at 92144 bins -- and
+            # that runs before init_fit_parms reaches _build_shards, so without
+            # this entry the user gets an allocation failure rather than the
+            # refusal naming the flag.
+            _md.append("--covarianceFit")
+        if args.diagnostics and not args.noBinByBinStat:
+            # loss_val_grad_hess_beta takes a jacobian over the full-length
+            # ubeta on one device; see MultiDeviceFitter.
+            _md.append("--diagnostics (unless --noBinByBinStat)")
+        if _md:
+            raise Exception(
+                "--nDevices > 1 is incompatible with: "
+                + ", ".join(_md)
+                + ". These run over all bins on one device, which is what "
+                "sharding exists to avoid. Drop --nDevices, or rerun the step "
+                "single-device from the fit output."
+            )
+
     # --noHessian skips computing the postfit Hessian, so the dense
     # parameter covariance matrix is never available. Any feature that
     # needs the covariance is incompatible.
@@ -894,6 +1046,12 @@ def main():
 
     global logger
     logger = logging.setup_logger(__file__, args.verbose, args.noColorLogger)
+
+    # The GPU selection above has to run before TF may touch a GPU, i.e. before
+    # the logger exists, so it buffers its messages rather than dropping them.
+    from rabbit.sharding import drain_selection_log
+
+    drain_selection_log()
 
     # SAY WHICH DEVICES THE FIT WILL RUN ON, and say it loudly when there are
     # none. When the CUDA libraries cannot be dlopened (a missing
@@ -948,6 +1106,17 @@ def main():
         args.filename, args.pseudoData, host_memory=args.nDevices > 1
     )
 
+    # Sparseness is a property of the file, so this cannot join the flag checks
+    # above -- but it still beats _build_shards, which does not raise until
+    # init_fit_parms, inside the Fitter constructor. Refusing here costs the
+    # load and nothing else.
+    if args.nDevices > 1 and indata.sparse:
+        raise Exception(
+            "--nDevices > 1 is incompatible with a sparse input tensor: the "
+            "shards slice dense bin-major tensors, which the CSR layout does "
+            "not provide. Drop --nDevices, or write the tensor dense."
+        )
+
     model_specs = args.paramModel or [["Mu"]]
     param_model = ph.load_models(model_specs, indata, **vars(args))
 
@@ -958,6 +1127,31 @@ def main():
         do_blinding=any(blinded_fits),
         globalImpactsFromJVP=not args.globalImpactsDisableJVP,
     )
+
+    # Not an incompatibility -- these converge to the same answer -- so it is a
+    # warning rather than an entry in the refusal list above, whose value is
+    # that everything in it is a hard no. But the cost is invisible from the
+    # flags and only shows up as a fit that will not finish, so it is said out
+    # loud, with the numbers, before the minimiser starts.
+    if args.nDevices > 1:
+        _hess_per_iter = []
+        if args.minimizerMethod in ("trust-exact", "dogleg", "tf-trust-exact"):
+            _hess_per_iter.append(f"--minimizerMethod {args.minimizerMethod}")
+        if args.asymImpacts and args.asymImpactsHess == "exact":
+            _hess_per_iter.append("--asymImpacts with --asymImpactsHess exact")
+        if _hess_per_iter:
+            _npar = int(ifitter.x.shape[0])
+            _nbatch = -(-_npar // max(1, ifitter.hvp_batch))
+            logger.warning(
+                f"{' and '.join(_hess_per_iter)} needs a dense Hessian on every "
+                f"iteration. Sharded that is assembled from {_npar} "
+                f"Hessian-vector products, {_nbatch} batched graph calls at "
+                f"--hvpBatch {ifitter.hvp_batch}, per iteration -- where "
+                "--minimizerMethod trust-krylov (the default) pays one HVP per "
+                "CG step. The answer is the same; the fit may look like it has "
+                "hung. Consider trust-krylov, a larger --hvpBatch, or "
+                "--asymImpactsHess hvp."
+            )
 
     # mappings for observables and parameters
     if len(args.mapping) == 0 and args.saveHists:
@@ -1096,6 +1290,7 @@ def main():
                             ws,
                             prefit=False,
                             profile=not args.noPostfitProfileBB,
+                            blind=blinded_fits[i],
                         )
                 else:
                     fit_time.append(time.time())

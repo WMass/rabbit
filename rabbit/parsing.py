@@ -426,19 +426,6 @@ def common_parser():
         "EACH BLOCK in rabbit/preconditioner.py.",
     )
     parser.add_argument(
-        "--hvpBatch",
-        default=256,
-        type=int,
-        help="Number of Hessian-vector products evaluated together when the "
-        "dense Hessian is assembled from HVPs (preconditioning and, on the "
-        "multi-device path, the postfit Hessian). Memory scales with this and "
-        "the number of graph calls scales inversely: on a 4-way shard of a "
-        "92144-bin model 256 costs a few GB and turns 6538 sequential HVPs into "
-        "26 batched ones. The batch is halved automatically if the device "
-        "cannot hold it, so this is an upper bound rather than a value that "
-        "has to be right. Set 1 for the sequential loop.",
-    )
-    parser.add_argument(
         "--snapshotFile",
         default=None,
         type=str,
@@ -460,6 +447,24 @@ def common_parser():
         "periodic ones; the interrupt, failure and convergence snapshots do not "
         "depend on it). Costs one small file write per interval. Worth setting "
         "on any fit long enough that losing it would hurt.",
+    )
+    parser.add_argument(
+        "--hvpBatch",
+        default=256,
+        type=int,
+        help="Number of Hessian-vector products evaluated together when the "
+        "dense Hessian is assembled from HVPs. Only the multi-device path "
+        "(--nDevices > 1) assembles it this way today, for both the "
+        "preconditioner reference matrix and the postfit Hessian; the "
+        "single-device path uses tape.jacobian and ignores this. NB the "
+        "assembly is O(nparams) graph evaluations where the jacobian is a "
+        "single pass, so the postfit covariance scales linearly in parameter "
+        "count there. Memory scales with this and "
+        "the number of graph calls scales inversely: on a 4-way shard of a "
+        "92144-bin model 256 costs a few GB and turns 6538 sequential HVPs into "
+        "26 batched ones. The batch is halved automatically if the device "
+        "cannot hold it, so this is an upper bound rather than a value that "
+        "has to be right. Set 1 for the sequential loop.",
     )
     parser.add_argument(
         "--unbinnedChunk",

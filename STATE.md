@@ -6,7 +6,7 @@ Developments made anywhere else — upstream PRs, other people's branches — ar
 **pulled in here**; nothing is developed on a second branch of this repo.
 
 Upstream is `WMass/rabbit` (`origin`). After the merge of `origin/main`
-(`822aa7a`) the branch is **81 ahead, 0 behind**. Nothing on this branch is
+(`c632e0e`) the branch is **82 ahead, 0 behind**. Nothing on this branch is
 pushed.
 
 What the branch adds is the machinery for the **unbinned CVH likelihood**: the
@@ -160,22 +160,35 @@ chunk index; the whole-sample sparse `D` is built in an `init_scope`, and the
 per-candidate `D` is stored **dense** because `sparse_dense_matmul` has no
 deterministic GPU kernel.
 
-**Sharding.** `--nDevices N` (and `--devices` to pin them) runs a bins-sharded
-likelihood on `MultiDeviceFitter` (`rabbit/sharding.py`). Two structural rules,
-established on 4 GPUs: backward placement must be explicit (one tape per shard,
-differentiating w.r.t. a device-local copy of `x`, else the placer drags every
-shard's `logk` across the bus — 6.5 ms -> 135 ms at 4 shards), and XLA clusters
-are single-device, so each shard is jit-compiled alone and the combiner stays a
-plain graph. Only the GPUs a fit actually uses are occupied, preferring
-unoccupied ones. Postfit steps that are not sharded are refused rather than run
-wrong. `make_fitter()` picks the subclass from `--nDevices` and forwards all
-kwargs, so it cannot drift from `Fitter.__init__`.
+**Sharding** (upstream #154). `--nDevices N` (and `--devices` to pin them) runs
+a bins-sharded likelihood on `MultiDeviceFitter` (`rabbit/sharding.py`). Two
+structural rules, established on 4 GPUs: backward placement must be explicit
+(one tape per shard, differentiating w.r.t. a device-local copy of `x`, else the
+placer drags every shard's `logk` across the bus — 6.5 ms -> 135 ms at 4
+shards), and XLA clusters are single-device, so each shard is jit-compiled alone
+and the combiner stays a plain graph. Only the GPUs a fit actually uses are
+occupied, preferring unoccupied ones. Postfit steps that are not sharded are
+refused rather than run wrong, and the refusal surface is enumerated by a test
+rather than found one review at a time. `make_fitter()` picks the subclass from
+`--nDevices` and forwards all kwargs, so it cannot drift from
+`Fitter.__init__`.
 
-**The dense Hessian** is assembled from **batched HVPs** (`--hvpBatch`, default
-256) rather than from the vectorised jacobian — this is also what makes a
-preconditioner reference matrix affordable on a large card.
+An **unbinned term is not sharded**: it is a sum over candidates and the shard
+views carry no candidate axis to cut. It is evaluated in the sharded loss's
+global (unsharded) part — the right answer, with its per-candidate tensors on
+one device — and `_build_shards` says so. Sharding one needs a candidate-range
+shard view.
 
-**Snapshots** (`--snapshotFile` / `--snapshotInterval`, upstream #155, carried here): the callback is the
+**The dense Hessian** of a card carrying unbinned terms is assembled from
+**HVPs** rather than from `tape.jacobian`, which vectorises over parameters and
+so holds `nparams` copies of the whole candidate tape (116 GB at 300 k
+candidates and 5 parameters) where one HVP costs one chunk. It is selected
+automatically, one HVP at a time; `--hvpBatch` (default 256) is the batch of the
+multi-device assembly, which a `tf.while_loop` with a custom gradient inside a
+`pfor` cannot use. This is also what makes a preconditioner reference matrix
+affordable on a large card.
+
+**Snapshots** (`--snapshotFile` / `--snapshotInterval`, upstream #155): the callback is the
 only place that sees the accepted iterate every iteration, so it writes them;
 a snapshot is always stored in **physical** coordinates (a preconditioned
 iterate would load without complaint and be wrong).
@@ -203,7 +216,7 @@ that one is physics: `Fitter.warn_unconstrained` names it, testing the **row**,
 not the diagonal (the diagonal test fires on the POIs of any card mixing a
 hit-chi2 term of curvature 7e13 with mass POIs at 0.06).
 
-**Preconditioning** (upstream #156/#157, in since this merge). `--precondition`
+**Preconditioning** (upstream #156/#157). `--precondition`
 reparameterises blocks of the parameter vector by a factorisation of a
 reference Hessian, so the trust region is spherical in the new coordinates.
 `--preconditionTransform spectral` whitens by `|H| = Q|Lambda|Q^T`, giving every
@@ -280,16 +293,26 @@ Tests:
 
 ```bash
 python -m pytest tests -q          # with $RABBIT and $RABBIT/tests on PYTHONPATH
+                                   # and $RABBIT/bin on PATH (tests that shell
+                                   # out to rabbit_fit.py need it, as CI does)
 python tests/test_zgamma_kernel.py # script-style: takes `args`, pytest cannot collect it
 python tests/test_unbinned_mass.py # likewise
 ```
 
-217 collected tests pass, plus `test_zgamma_kernel.py` (7/7) and
-`test_unbinned_mass.py` (10/10) as scripts. The branch's own suites are
-`test_unbinned_mass.py`, `test_unbinned_norm.py`, `test_material_cf.py`,
-`test_zgamma_kernel.py`, `test_zgamma_shape.py`, `test_global_term.py`,
-`test_jensen.py`, `test_fluctuation.py`, `test_corr_a_max.py`,
-`test_frozen_subspace.py`, `test_sharded_fit.py`.
+**336 collected tests pass**, plus the script-style suites
+`test_zgamma_kernel.py` (8/8), `test_unbinned_mass.py` (10/10),
+`test_unbinned_norm.py` (6/6), `test_zgamma_shape.py` (7/7) and
+`test_jensen.py` (7/7). `pytest tests` additionally reports **14 collection
+errors**, and they are not failures: they are the two `args`-taking script
+suites above, which pytest sees as test functions wanting a fixture named
+`args`. Every CI test also runs standalone the way `.github/workflows/main.yml`
+runs it (`python tests/<name>.py`), `test_sharded_fit.py` included — its 42
+tests shard across logical CPU devices and need no GPU.
+
+The branch's own suites are `test_unbinned_mass.py`, `test_unbinned_norm.py`,
+`test_material_cf.py`, `test_zgamma_kernel.py`, `test_zgamma_shape.py`,
+`test_global_term.py`, `test_jensen.py`, `test_fluctuation.py`,
+`test_corr_a_max.py` and `test_frozen_subspace.py`.
 
 ---
 

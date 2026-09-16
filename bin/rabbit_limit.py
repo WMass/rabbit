@@ -250,6 +250,27 @@ def main():
     start_time = time.time()
     args = make_parser().parse_args()
 
+    # --nDevices/--devices come from the shared common_parser, but this script
+    # builds a plain Fitter and never calls make_fitter or pick_physical_gpus,
+    # so they would parse and then do nothing. Refuse rather than run a
+    # single-device fit for someone who asked for sharding precisely because a
+    # single device was not enough. Sharding is not simply unwired here: limits
+    # generate toys, and toyassign is one of the paths multi-device refuses
+    # (it runs over all bins on one device).
+    if getattr(args, "nDevices", 1) > 1:
+        raise Exception(
+            "--nDevices > 1 is not supported by rabbit_limit.py: limit scans "
+            "generate toys, and toy generation is not available in "
+            "multi-device mode. Run the limit single-device."
+        )
+    if getattr(args, "devices", None):
+        raise Exception(
+            "--devices is not supported by rabbit_limit.py: the selection is "
+            "applied by pick_physical_gpus, which this script never calls, so "
+            "the run would land on the default GPU instead of the one asked "
+            "for. Use CUDA_VISIBLE_DEVICES to pin the limit scan."
+        )
+
     if args.eager:
         tf.config.run_functions_eagerly(True)
 

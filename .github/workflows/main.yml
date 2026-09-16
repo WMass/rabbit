@@ -17,6 +17,20 @@ env:
   EOS_DIR: /eos/user/c/cmsmwbot
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
+# One CI run per ref, because runs are not isolated from each other: the
+# runners share a filesystem, so concurrent runs compete for $RABBIT_OUTDIR
+# (and a finishing run's copy-clean deletes it) and for the checkouts under
+# each runner's _work directory.
+#
+# The same lack of isolation is why every job derives PYTHONPATH and PATH from
+# its own $GITHUB_WORKSPACE after checking out, rather than inheriting them
+# from setenv: a workspace path is specific to the runner that produced it, so
+# an inherited one makes every job import rabbit from one runner's tree wherever
+# it happens to run -- and that tree belongs to whichever run checked out last.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
 
   linting:
@@ -27,6 +41,12 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: run isort
         run: |
@@ -59,11 +79,15 @@ jobs:
       RABBIT_OUTDIR: ${{steps.export.outputs.RABBIT_OUTDIR}}
       WEB_DIR: ${{steps.export.outputs.WEB_DIR}}
       PLOT_DIR: ${{steps.export.outputs.PLOT_DIR}}
-      PYTHONPATH: ${{steps.export.outputs.PYTHONPATH}}
-      PATH: ${{steps.export.outputs.PATH}}
 
     steps:
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: setup kerberos
         run: |
@@ -85,11 +109,6 @@ jobs:
       - name: setup outdir
         run: echo "RABBIT_OUTDIR=/tmp/${USER}/$(uuidgen)" >> $GITHUB_ENV
 
-      - name: setup python path
-        run: |
-          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
-          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
-
       - name: setup webdir
         run: echo "WEB_DIR=$RABBIT_OUTDIR/$LOCAL_WEB_DIR" >> $GITHUB_ENV
 
@@ -101,8 +120,6 @@ jobs:
           echo "RABBIT_OUTDIR=$RABBIT_OUTDIR" >> $GITHUB_OUTPUT
           echo "WEB_DIR=$WEB_DIR" >> $GITHUB_OUTPUT
           echo "PLOT_DIR=$PLOT_DIR" >> $GITHUB_OUTPUT
-          echo "PYTHONPATH=$PYTHONPATH" >> $GITHUB_OUTPUT
-          echo "PATH=$PATH" >> $GITHUB_OUTPUT
 
   symmerizations:
     runs-on: [self-hosted, linux, x64]
@@ -111,18 +128,20 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
           WEB_DIR: ${{ needs.setenv.outputs.WEB_DIR }}
           PLOT_DIR: ${{ needs.setenv.outputs.PLOT_DIR }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
           echo "WEB_DIR=${WEB_DIR}" >> $GITHUB_ENV
           echo "PLOT_DIR=${PLOT_DIR}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
     
       - name: symmetrizations
         run: >- 
@@ -142,20 +161,30 @@ jobs:
           - test_bbstat.py
           - test_external_term.py
           - test_global_asym_impacts.py
+          - test_blinding.py
+          - test_blinding_multiplicative.py
+          - test_blinding_noi.py
+          - test_saturated_blinding.py
+          - test_logk_no_copy.py
           - test_multi_systematic.py
+          - test_ndfsat.py
+          - test_saturated_composite.py
+          - test_sharded_fit.py
           - test_sparse_fit.py
 
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: run ${{ matrix.test }}
         run: python tests/${{ matrix.test }}
@@ -167,18 +196,20 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
           WEB_DIR: ${{ needs.setenv.outputs.WEB_DIR }}
           PLOT_DIR: ${{ needs.setenv.outputs.PLOT_DIR }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
           echo "WEB_DIR=${WEB_DIR}" >> $GITHUB_ENV
           echo "PLOT_DIR=${PLOT_DIR}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: make tensor
         run: >-
@@ -224,14 +255,16 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: nominal fit
         run: >- 
@@ -275,14 +308,16 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: sparse tensor fit 
         run: >- 
@@ -322,18 +357,20 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
           WEB_DIR: ${{ needs.setenv.outputs.WEB_DIR }}
           PLOT_DIR: ${{ needs.setenv.outputs.PLOT_DIR }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
           echo "WEB_DIR=${WEB_DIR}" >> $GITHUB_ENV
           echo "PLOT_DIR=${PLOT_DIR}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: fit ${{ matrix.name }}
         run: >-
@@ -388,16 +425,20 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
           WEB_DIR: ${{ needs.setenv.outputs.WEB_DIR }}
           PLOT_DIR: ${{ needs.setenv.outputs.PLOT_DIR }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
           echo "WEB_DIR=${WEB_DIR}" >> $GITHUB_ENV
           echo "PLOT_DIR=${PLOT_DIR}" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: lcurve scan
         run: >-
@@ -416,14 +457,16 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: bsm limits
         run: >-
@@ -442,18 +485,20 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
           WEB_DIR: ${{ needs.setenv.outputs.WEB_DIR }}
           PLOT_DIR: ${{ needs.setenv.outputs.PLOT_DIR }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
           echo "WEB_DIR=${WEB_DIR}" >> $GITHUB_ENV
           echo "PLOT_DIR=${PLOT_DIR}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: print pulls & constraints blinded
         run: rabbit_print_pulls_and_constraints.py $RABBIT_OUTDIR/fitresults_blinded.hdf5 
@@ -539,18 +584,20 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
           WEB_DIR: ${{ needs.setenv.outputs.WEB_DIR }}
           PLOT_DIR: ${{ needs.setenv.outputs.PLOT_DIR }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
           echo "WEB_DIR=${WEB_DIR}" >> $GITHUB_ENV
           echo "PLOT_DIR=${PLOT_DIR}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: nominal fit with scans
         run: >- 
@@ -578,14 +625,16 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: make ABCD tensor
         run: >-
@@ -602,14 +651,16 @@ jobs:
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
-          PYTHONPATH: ${{ needs.setenv.outputs.PYTHONPATH }}
-          PATH: ${{ needs.setenv.outputs.PATH }}
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
-          echo "PYTHONPATH=${PYTHONPATH}" >> $GITHUB_ENV
-          echo "PATH=${PATH}" >> $GITHUB_ENV
 
       - uses: actions/checkout@v5
+
+      # Per job, from its own checkout -- see the note on the concurrency group.
+      - name: setup python path
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
       - name: ABCD fit
         run: >-

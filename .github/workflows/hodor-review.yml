@@ -1,0 +1,176 @@
+name: Hodor AI review
+
+# Automated PR code review with hodor, driving Kimi K3 on the CERN AI
+# gateway (aigw.cern.ch). aigw is firewalled to the CERN network, so this
+# job MUST run on the repository's CERN self-hosted runners; GitHub-hosted
+# runners cannot reach the endpoint (verified: TCP connect blackholed).
+#
+# The trigger is pull_request_target DELIBERATELY: a plain pull_request run
+# never receives secrets for fork PRs — and ~all of this repo's PRs are
+# forks — so the endpoint key would be missing for exactly the PRs that
+# need review most. pull_request_target runs the BASE branch's workflow in
+# the base-repo context (secrets available), and who may run stays governed
+# by the repository's fork-contributor approval gate (approval_policy:
+# first_time_contributors — approval required until a contributor's first
+# merged commit, then automatic, as for main.yml). Consequences, baked in
+# below:
+#   - The workflow file is read from the base branch by GitHub; PRs cannot
+#     modify what runs. There is NO checkout of this repository at all
+#     (this is hodor's README flow): hodor clones the repo and checks out
+#     the PR head itself via gh, so its review state always keys on the
+#     real PR commit — base-or-merge-commit workspace confusion is
+#     impossible by construction.
+#   - Trusted configuration comes from the WMass/hodor fork, pinned by
+#     commit SHA: the fork branch carries the custom-endpoint patch
+#     (upstream PR mr-karan/hodor#25) and models.cern.json (base URL,
+#     1M context, token limits, thinking-level remap for the endpoint's
+#     chat template). Nothing from the PR enters the reviewer's config.
+#   - The review workspace contains the PR tree: the agent reads PR
+#     content with a read-oriented toolset and loads .agents/skills from
+#     the (PR) workspace. Exposure is NOT identical to main.yml: this job
+#     runs with secrets, fork pull_request runs of main.yml never receive
+#     any, and the approval gate goes automatic after a contributor's
+#     first merged commit. The auto-running set is therefore: org members
+#     plus every fork author with >=1 merged commit. That set is accepted
+#     deliberately (established collaborators only, at time of writing);
+#     if it widens, harden by snapshotting .agents/skills from the base
+#     tree and pointing hodor's skillPaths at the copy (hodor-side
+#     override), so PR content stops feeding reviewer instructions.
+#   - HODOR_LLM_API_KEY is an ORGANIZATION-level secret shared by every
+#     repo running this workflow. The review agent can run bash while
+#     reading checked-out PR content, so a prompt-injected PR could in
+#     principle exfil it. Accepted under the same trusted-set argument as
+#     the skills bullet above, with worst case limited to abuse of the
+#     aigw quota (the job's GITHUB_TOKEN is task-scoped and expires with
+#     the job). The org secret must only be visible to repos whose fork-PR
+#     gating is at least this strict.
+#
+# Required configuration:
+#   secret   HODOR_LLM_API_KEY   API key for the endpoint (organization
+#                                secret shared with the repos using this
+#                                workflow; repository secret also works)
+#   variable HODOR_LLM_MODEL     optional model-id override
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+
+concurrency:
+  group: hodor-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Skip drafts; reviews start when the PR is marked ready. Fork
+    # contributors additionally pass the repository's approval gate
+    # (trusted contributors run automatically, as for main.yml).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !github.event.pull_request.draft
+    # CERN-network self-hosted runners only (see header comment).
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write # review comments on the PR
+      issues: write # PR comments are issue comments via the API
+    env:
+      # WMass/hodor fork, branch cern-ci: upstream v0.7.7 + the
+      # HODOR_MODELS_JSON patch (upstream PR mr-karan/hodor#25) +
+      # models.cern.json. Pinned by commit SHA.
+      HODOR_SOURCE: https://github.com/WMass/hodor
+      HODOR_COMMIT: 8bb33632a5fe059815cab669a176c40fed404a0b
+      HODOR_MODEL: ${{ vars.HODOR_LLM_MODEL || 'Kimi-K3-FLATIRON' }}
+      LLM_API_KEY: ${{ secrets.HODOR_LLM_API_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PI_OFFLINE: "1" # never download rg/fd binaries mid-review
+    steps:
+      - name: Preflight configuration
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "::error::HODOR_LLM_API_KEY secret is not configured. Add it as an organization or repository secret."
+            exit 1
+          fi
+
+      - name: Ensure review tools (gh, rg, fd)
+        # Self-hosted runner image has no guaranteed gh/rg/fd and no sudo;
+        # fall back to pinned static builds in a job-local bin dir.
+        run: |
+          set -e
+          BIN="$RUNNER_TEMP/bin"
+          mkdir -p "$BIN"
+          echo "$BIN" >> "$GITHUB_PATH"
+          export PATH="$BIN:$PATH"
+          fetch() { # url sha256 -> extracts tarball into $RUNNER_TEMP
+            tmp="$(mktemp)"
+            curl -fsSL "$1" -o "$tmp"
+            echo "$2  $tmp" | sha256sum -c -
+            tar -xzf "$tmp" -C "$RUNNER_TEMP"
+            rm -f "$tmp"
+          }
+          command -v gh >/dev/null || {
+            fetch https://github.com/cli/cli/releases/download/v2.83.0/gh_2.83.0_linux_amd64.tar.gz \
+                  a5cf6cdb40fc67751adf561126b3314044779cea81ba4f254fbe8e9a69f1676f
+            cp "$RUNNER_TEMP/gh_2.83.0_linux_amd64/bin/gh" "$BIN/"
+          }
+          command -v rg >/dev/null || {
+            fetch https://github.com/BurntSushi/ripgrep/releases/download/15.1.0/ripgrep-15.1.0-x86_64-unknown-linux-musl.tar.gz \
+                  1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+            cp "$RUNNER_TEMP/ripgrep-15.1.0-x86_64-unknown-linux-musl/rg" "$BIN/"
+          }
+          command -v fd >/dev/null || {
+            fetch https://github.com/sharkdp/fd/releases/download/v10.5.0/fd-v10.5.0-x86_64-unknown-linux-musl.tar.gz \
+                  761c72dc8e120d85b22292063be8a796e2eeb20eb3e4f38b8fa2343ccf3514a7
+            cp "$RUNNER_TEMP/fd-v10.5.0-x86_64-unknown-linux-musl/fd" "$BIN/"
+          }
+          gh --version
+          rg --version | head -1
+          fd --version
+
+      - name: Set up bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache bun dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: hodor-${{ env.HODOR_COMMIT }}
+          restore-keys: hodor-
+
+      - name: Fetch hodor (fork @ pinned commit)
+        run: |
+          set -e
+          HODOR_SRC="$RUNNER_TEMP/hodor-src"
+          git init -q "$HODOR_SRC"
+          git -C "$HODOR_SRC" remote add origin "$HODOR_SOURCE"
+          git -C "$HODOR_SRC" fetch -q --depth 1 origin "$HODOR_COMMIT"
+          git -C "$HODOR_SRC" checkout -q FETCH_HEAD
+          cd "$HODOR_SRC"
+          bun install --frozen-lockfile
+
+      - name: Run hodor review
+        run: |
+          PR="${{ github.event.pull_request.number || inputs.pr_number }}"
+          export HODOR_MODELS_JSON="$RUNNER_TEMP/hodor-src/models.cern.json"
+          # These self-hosted runners are shared and persistent, so
+          # GITHUB_WORKSPACE contains a STALE checkout of this repo left by
+          # other workflows. hodor's CI detection reuses any such checkout
+          # as the review workspace without fetching the PR head (observed:
+          # 0-byte embedded diffs and review state keyed to a stale commit).
+          # Point it at a fresh empty dir so detection declines and hodor
+          # clones + gh-pr-checkouts the real PR head instead.
+          export GITHUB_WORKSPACE="$RUNNER_TEMP/hodor-workspace"
+          # "cern" selects the provider defined in models.cern.json
+          # (HODOR_MODELS_JSON); the prefix is not a pi builtin.
+          bun run "$RUNNER_TEMP/hodor-src/src/cli.ts" \
+            "https://github.com/${{ github.repository }}/pull/$PR" \
+            --model "cern/$HODOR_MODEL" \
+            --reasoning-effort max \
+            --post \
+            --require-delivery

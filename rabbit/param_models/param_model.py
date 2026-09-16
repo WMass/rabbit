@@ -34,6 +34,56 @@ class ParamModel:
         #                     # to the model (e.g. POIs free, POUs constrained).
         # self.prior_means  = # np.ndarray, shape (nparams,). Optional; defaults
         #                     # to self.xparamdefault when not provided.
+        #
+        # # optional: how this model's POIs should be BLINDED.
+        # # rabbit blinds a POI MULTIPLICATIVELY (poi * exp(N(0, 5))), which is
+        # # the right choice for the default `Mu`: a signal strength centred at
+        # # 1 that scales YIELDS, so any value it is handed is still evaluable
+        # # and positivity is preserved.
+        # #
+        # # It is the wrong choice for a POI that is a PHYSICAL parameter fed
+        # # into a calculation with a restricted domain. Two things go wrong:
+        # # the calculation can be asked for a value it cannot evaluate, and --
+        # # because the reported coordinate is then poi_true / offset -- the
+        # # curvature scales as offset^2, so the reported SIGMA, the POI row of
+        # # the covariance and every impact on that POI are all divided by the
+        # # random factor. Only the RELATIVE uncertainty survives.
+        # #
+        # # Setting this to True switches the model's POIs to ADDITIVE
+        # # blinding, the same form rabbit already uses for nuisances of
+        # # interest. The offset is the same N(0, 5) draw, applied in the
+        # # parameter's OWN fit units. Because d(model)/d(internal) = 1 for a
+        # # translation, the covariance, the uncertainties and the impacts come
+        # # out EXACTLY unblinded while the central value is still hidden --
+        # # which is the point.
+        # #
+        # # Requires allowNegativeParam=True: with the squared storage an
+        # # additive offset could hand compute() a negative value, destroying
+        # # the only guarantee that branch provides (the Fitter raises).
+        # self.blind_additive = # bool, default False.
+        #
+        # # optional: the SCALE of that additive draw, in the POI's own units.
+        # # Unlike the multiplicative form, additive blinding is NOT scale
+        # # free: exp(N(0, 5)) spans e^+-10 whatever the POI means, but
+        # # + N(0, 5) is an absolute shift, so how well it hides depends on
+        # # the units. A POI whose uncertainty is O(1) in its fit units is
+        # # offset by well under a sigma and is effectively unblinded.
+        # #
+        # # The model is the only thing that knows its own units, so it
+        # # declares them here: the offset drawn is
+        # #     blind_additive_scale * N(0, 5)
+        # # and the default of 1.0 reproduces the historical draw exactly.
+        # # A POI measured to sigma ~ 1e-3 (alpha_s) is already hidden by
+        # # thousands of sigma at the default; a POI in units where sigma is
+        # # O(1) or larger should set this to a few times its expected
+        # # uncertainty. The Fitter additionally WARNS at startup whenever it
+        # # can see a prefit sigma and the drawn offset is small against it.
+        # #
+        # # A scalar applies to all of the model's POIs. A per-POI array is
+        # # also accepted, and is what CompositeParamModel produces: the scale
+        # # is in each parameter's OWN units, so submodel declarations compose
+        # # as a vector rather than reducing to one value.
+        # self.blind_additive_scale = # float or array (npoi,), default 1.0.
 
     @property
     def nparams(self):
@@ -135,11 +185,20 @@ class CompositeParamModel(ParamModel):
 
         poi_flags = {bool(m.allowNegativeParam) for m in param_models if m.npoi > 0}
         if len(poi_flags) > 1:
+            names = {
+                bool(m.allowNegativeParam): type(m).__name__
+                for m in param_models
+                if m.npoi > 0
+            }
             raise ValueError(
                 "CompositeParamModel: submodels with POIs disagree on "
                 "allowNegativeParam; the fitter applies a single squaring "
                 "transform to the composite POI block, so a mix cannot be "
-                "represented."
+                f"represented (True: {names.get(True)}, False: "
+                f"{names.get(False)}). A submodel that needs positivity "
+                "inside a permissive composite must declare "
+                "allowNegativeParam=True and enforce it in its own compute(), "
+                "as AxisNormModel and SaturatedProjectModel do."
             )
         derived = next(iter(poi_flags)) if poi_flags else None
         if allowNegativeParam is None:
@@ -191,6 +250,71 @@ class CompositeParamModel(ParamModel):
             self.prior_means = np.concatenate(
                 [v[: m.npoi] for v, m in zip(means, param_models)]
                 + [v[m.npoi :] for v, m in zip(means, param_models)]
+            )
+
+        # Blinding form: a boolean, so unlike prior_sigmas there is no index
+        # permutation to track. Any submodel asking for additive blinding makes
+        # the composite additive -- the composite's POI block is the
+        # concatenation of the submodels' POIs, and mixing forms within one POI
+        # block is exactly what the Fitter refuses for a blinding group.
+        #
+        # "Any one makes all" is a policy the caller did not necessarily ask
+        # for, so SAY SO rather than infer it silently: a submodel that
+        # declared the multiplicative form gets the additive one, and the only
+        # other way to notice would be to read this line. Not a refusal (the
+        # way allowNegativeParam above is), because refusing would block the
+        # legitimate composition this exists for -- an additively blinded
+        # physical POI alongside a default signal strength, which is exactly a
+        # mix. The override is safe there: both forms hide the value, and the
+        # dangerous mix (an additive offset reaching a squared POI) is already
+        # refused by the Fitter.
+        # Only POI-carrying submodels vote: the form governs the POI block, so a
+        # submodel with no POIs flipping the whole composite (and then being
+        # named as the reason) would be misleading.
+        additive_models = [
+            type(m).__name__
+            for m in param_models
+            if m.npoi > 0 and getattr(m, "blind_additive", False)
+        ]
+        if additive_models:
+            self.blind_additive = True
+            overridden = [
+                type(m).__name__
+                for m in param_models
+                if m.npoi > 0 and not getattr(m, "blind_additive", False)
+            ]
+            if overridden:
+                logger.info(
+                    "CompositeParamModel: blinding form set to ADDITIVE for the whole "
+                    f"POI block because {additive_models} declared blind_additive=True; "
+                    f"this overrides the (default multiplicative) form of {overridden}."
+                )
+
+            # The SCALE, unlike the form, is per-parameter units -- so it is
+            # carried as a per-POI VECTOR rather than reduced to one composite
+            # value. Each submodel contributes its own declaration over its own
+            # POI slice and there is no "any one wins" rule to get wrong, which
+            # is the same treatment prior_sigmas gets above. A composite of
+            # composites therefore works too: the vector is itself a legal
+            # declaration.
+            #
+            # Dropping this is NOT a benign default: the Fitter reads the scale
+            # off its effective model, so a submodel declaring scale=7 would
+            # blind at scale=1 the moment it is composited -- silently, and in
+            # the under-blinding direction. The weak-blinding warning cannot
+            # backstop it, because an additively blinded POI is typically free
+            # and so has no prefit sigma to compare against.
+            self.blind_additive_scale = np.concatenate(
+                [
+                    np.broadcast_to(
+                        np.asarray(
+                            getattr(m, "blind_additive_scale", 1.0), dtype=np.float64
+                        ),
+                        (m.npoi,),
+                    )
+                    for m in param_models
+                    if m.npoi > 0
+                ]
             )
 
         # impact groups are name-based, so a plain merge survives the
@@ -392,6 +516,29 @@ class SaturatedProjectModel(ParamModel):
         For each channel of the input data that enters the mapping, the flat index of the
         output bin each of its bins contributes to, and -1 for bins that are not used,
         as returned by 'Mapping.output_indices()'.
+    allowNegativeParam : bool
+        WHO enforces positivity of the bin scales, not whether it is enforced.
+        The scales multiply YIELDS, so a negative one sends the expected yield
+        negative and the Poisson log() to NaN; the parameters are therefore
+        always stored as sqrt(scale) and the physical space is always
+        [0, inf).
+
+        ``False`` (the default, and the historical behaviour) asks the Fitter
+        to do the squaring, via its transform of the POI block. ``True`` means
+        "pass my slice through raw, I square it myself in compute()" -- the
+        same contract :class:`AxisNormModel` documents.
+
+        The distinction exists because the Fitter applies ONE transform to the
+        WHOLE POI block, so ``False`` is unavailable as soon as this model is
+        composited (by ``--computeSaturatedProjectionTests``) with an analysis
+        model that needs ``allowNegativeParam=True`` -- a POI that is a
+        physical parameter, e.g. alpha_s, and/or one blinded additively.
+        ``CompositeParamModel`` rejects such a mix. Self-squaring also
+        composes correctly with ADDITIVE POI blinding, which the Fitter's
+        transform does not: blinding is applied to the value handed to
+        compute(), so squaring afterwards keeps the scale positive for any
+        offset, whereas squaring first leaves ``x**2 + offset`` free to go
+        negative.
     """
 
     def __init__(
@@ -445,9 +592,21 @@ class SaturatedProjectModel(ParamModel):
 
         self.allowNegativeParam = allowNegativeParam
 
-        self.is_linear = self.nparams == 0 or self.allowNegativeParam
+        # allowNegativeParam=True => the Fitter does not transform this slice,
+        # so compute() squares it here instead. See the class docstring: the
+        # bin scales are positive in BOTH branches, only the owner of the
+        # transform differs.
+        self._square_internally = bool(allowNegativeParam)
 
-        self.set_param_default(expectSignal, allowNegativeParam)
+        # x -> x**2 in either branch, so the model is never linear in its
+        # stored parameters. (Identical to the previous expression for the
+        # default allowNegativeParam=False.)
+        self.is_linear = self.nparams == 0
+
+        # Store sqrt(default) regardless of which branch squares, so both open
+        # at the same physical point. allowNegativeParam=False selects the
+        # sqrt in set_param_default; it is passed literally, not forwarded.
+        self.set_param_default(expectSignal, allowNegativeParam=False)
 
     def compute(self, param, full=False):
         start = 0
@@ -458,9 +617,14 @@ class SaturatedProjectModel(ParamModel):
 
             if k in self.indices.keys():
                 nbins = self.nbins_channel[k]
+                iscale = param[start : start + nbins]
+                if self._square_internally:
+                    iscale = tf.square(iscale)
                 iparam = tf.concat(
                     [
-                        param[start : start + nbins],
+                        iscale,
+                        # the trailing entry is the scale of the input bins the
+                        # mapping does not use: a physical 1, never squared
                         tf.ones([1], dtype=self.indata.dtype),
                     ],
                     axis=0,
