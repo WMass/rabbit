@@ -473,6 +473,28 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
 
                 fitter_saturated.xdefaultassign()
 
+                # ARM THE REGULARIZERS HERE TOO. They are armed again at the
+                # warm-started point just before minimize(), which is where the
+                # expectations they record should come from -- but the blinding
+                # re-arm below cannot wait for that: set_blinding_offsets(True)
+                # ends in _check_blinded_start_is_evaluable(), which COMPUTES THE
+                # LOSS, and _compute_nll_components() refuses to evaluate a loss
+                # whose regularizers are not armed against the current parameter
+                # layout (init_fit_parms() above cleared the flag when it swapped
+                # in the composite model's parms).
+                #
+                # Without this, blinding + a regularizer + this test is a hard
+                # crash, surfaced as the misleading "blinded starting point is
+                # outside the range this model can be evaluated at" -- the outer
+                # half of a chained exception, in which neither the blinding nor
+                # the start point is at fault. It takes all three to fire:
+                # unblinded runs return from set_blinding_offsets() before the
+                # check, and unregularized runs have nothing to arm.
+                #
+                # Arming is idempotent, so the call before minimize() still wins
+                # and the recorded expectations are unchanged.
+                fitter_saturated.arm_regularizers()
+
                 # RE-ARM BLINDING. init_fit_parms() above re-created the offset
                 # Variables at the composite size, which creates them at zero,
                 # and nothing armed them again. So the saturated fit would run

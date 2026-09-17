@@ -18,6 +18,18 @@ silently before the commits this file ships with.
    are never offset. Blind them and the composite opens far above the main fit
    and ``q = 2*(NLL_main - NLL_sat)`` starts NEGATIVE, which is not a deviance.
 
+3. THE REGULARIZERS MUST BE ARMED BEFORE THE BLINDED-START CHECK. The composite
+   re-init also discharges ``_regularizers_armed`` (the layout changed), and
+   ``set_blinding_offsets(True)`` ends in
+   ``_check_blinded_start_is_evaluable()``, which COMPUTES THE LOSS.
+   ``_compute_nll_components()`` refuses to evaluate a loss whose regularizers
+   are unarmed, so a blinded, regularized saturated test died outright -- and
+   said "the blinded starting point is outside the range this model can be
+   evaluated at", which is the outer half of a chained exception and blames the
+   wrong thing entirely. It takes all three (blinding, a regularizer, this
+   test) to reproduce, which is why the two properties above could be written
+   without noticing it.
+
 Every check is an INVARIANCE or a guard, and each one asserts that blinding is
 genuinely armed first, so none of them can pass vacuously through an
 accidentally unblinded fitter.
@@ -25,6 +37,7 @@ accidentally unblinded fitter.
 
 import copy
 import os
+import pathlib
 import tempfile
 from types import SimpleNamespace
 
@@ -34,8 +47,38 @@ import pytest
 
 from rabbit import fitter, inputdata, tensorwriter
 from rabbit.param_models import param_model as pm
+from rabbit.regularization.regularizer import Regularizer
 
 NBINS = 20
+
+
+class OneParamPenalty(Regularizer):
+    """A parameter-only penalty on a single named parameter.
+
+    Deliberately minimal, and deliberately name-resolved: what the tests below
+    need is only that ``len(fitter.regularizers)`` is nonzero, so that
+    ``_compute_nll_components`` takes its armed branch. Name resolution (rather
+    than positional indexing) is also what a real regularizer must do to
+    survive this path at all -- the composite prepends a second model's POIs,
+    so a cached index points at the wrong parameter.
+    """
+
+    needs_observables = False
+
+    def __init__(self, name="bkgNorm", dtype=np.float64):
+        self.name = name
+        self.dtype = dtype
+        self._idx = None
+
+    def set_expectations(self, initial_params, initial_observables, parms=None):
+        self._idx = self.resolve_indices(parms, [self.name], who="OneParamPenalty")[
+            self.name
+        ]
+
+    def compute_nll_penalty(self, params, observables):
+        import tensorflow as tf
+
+        return tf.square(params[self._idx])
 
 
 def make_tensor(path):
@@ -88,18 +131,25 @@ def path():
         yield p
 
 
-def build_main(path, do_blinding=True):
-    """A plain ``Mu``: the default model, with squared storage."""
+def build_main(path, do_blinding=True, regularize=False):
+    """A plain ``Mu``: the default model, with squared storage.
+
+    ``regularize`` attaches an :class:`OneParamPenalty` the way the driver does
+    (``tau`` then ``regularizers``), before ``defaultassign()`` arms it.
+    """
     ind = inputdata.FitInputData(path)
     model = pm.Mu(ind)
     f = fitter.Fitter(ind, model, make_options(), do_blinding=do_blinding)
+    if regularize:
+        f.tau.assign(1.0)
+        f.regularizers = [OneParamPenalty()]
     f.defaultassign()
     if do_blinding:
         f.set_blinding_offsets(True)
     return ind, model, f
 
 
-def build_saturated(f, blind, rearm=True):
+def build_saturated(f, blind, rearm=True, arm_regularizers_early=True):
     """Mirror of the composite re-init in ``bin/rabbit_fit.py::save_hists``.
 
     Reproduced here rather than imported because ``rabbit_fit.py`` is a script;
@@ -114,10 +164,18 @@ def build_saturated(f, blind, rearm=True):
     composite = pm.CompositeParamModel([orig, sat])
 
     fs = copy.deepcopy(f)
+    saved_regularizers = fs.regularizers
+    saved_tau = float(fs.tau.numpy())
     fs.init_fit_parms(
         composite, [], unblind=[], blinding_group=[], freeze_parameters=[]
     )
+    fs.regularizers = saved_regularizers
+    fs.tau.assign(saved_tau)
     fs.xdefaultassign()
+    # `arm_regularizers_early=False` is the pre-fix driver order, kept so the
+    # tests below can show the early call is load bearing rather than defensive.
+    if arm_regularizers_early:
+        fs.arm_regularizers()
     if fs.do_blinding and rearm:
         fs.set_blinding_offsets(blind=blind)
 
@@ -129,6 +187,9 @@ def build_saturated(f, blind, rearm=True):
             x_main[orig.npoi : orig.nparams]
         )
     fs.x[composite.nparams :].assign(x_main[orig.nparams :])
+    # The driver arms again here, at the warm-started point, which is where the
+    # expectations a regularizer records should come from.
+    fs.arm_regularizers()
     return orig, sat, composite, fs
 
 
@@ -234,6 +295,131 @@ def test_the_same_holds_unblinded(path):
 
     _, _, _, fs = build_saturated(f, blind=False)
     assert np.isclose(float(fs.reduced_nll().numpy()), nll_main, rtol=0, atol=1e-6)
+
+
+# --- 3. blinding + a regularizer + this test ----------------------------------
+#
+# NOTE ON WHAT PINS WHAT. The mirror above is a copy of the driver's sequence,
+# so a test that only exercises the mirror cannot catch the driver drifting away
+# from it -- it would just test the copy. So this section has two kinds of check:
+# the Fitter-level contract (the requirement itself, order-parameterised), and
+# one source-level guard that reads bin/rabbit_fit.py and asserts it honours
+# that contract. The guard is the regression test; the others document why.
+
+
+def _save_hists_source():
+    """The text of ``save_hists`` from the driver, via ast (never imported).
+
+    ``bin/rabbit_fit.py`` is a script, so importing it to reach the function is
+    not safe; parsing is. Consistent with the module docstring's reason for
+    mirroring rather than importing the composite re-init.
+    """
+    import ast
+
+    src = (
+        pathlib.Path(__file__).resolve().parents[1] / "bin" / "rabbit_fit.py"
+    ).read_text()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "save_hists":
+            return ast.get_source_segment(src, node)
+    raise AssertionError("save_hists not found in bin/rabbit_fit.py")
+
+
+def test_driver_arms_regularizers_before_the_blinded_start_check():
+    """THE REGRESSION TEST. ``save_hists`` must arm before it blinds.
+
+    ``set_blinding_offsets(True)`` ends in
+    ``_check_blinded_start_is_evaluable()``, which computes the loss, and
+    ``_compute_nll_components()`` refuses a loss whose regularizers are unarmed
+    after ``init_fit_parms`` changed the layout. The driver's own
+    ``arm_regularizers()`` sits just before ``minimize()``, which is the right
+    place for the expectations it records but far too late for this check --
+    hence a second, earlier call.
+
+    A source check rather than a behavioural one because the behaviour lives in
+    a script's function; see ``_save_hists_source``.
+    """
+    src = _save_hists_source()
+    arm = src.find("arm_regularizers()")
+    blind = src.find("set_blinding_offsets(blind=blind)")
+
+    assert arm != -1, "save_hists no longer arms the regularizers at all"
+    assert blind != -1, (
+        "save_hists no longer re-arms blinding; if that is deliberate this test "
+        "can go, but check test_saturated_fit_does_not_run_unblinded first"
+    )
+    assert arm < blind, (
+        "save_hists arms the regularizers only AFTER "
+        "set_blinding_offsets(blind=blind), which computes the loss -- a "
+        "blinded, regularized saturated test will die there, reported as "
+        "'the blinded starting point is outside the range this model can be "
+        "evaluated at'"
+    )
+
+
+def test_the_unarmed_order_really_does_raise(path):
+    """Why the guard above matters: the wrong order is a hard crash.
+
+    Pinned at the Fitter level so the requirement survives even if the driver
+    is restructured -- and so the guard above cannot be dismissed as cosmetic.
+    """
+    _, _, f = build_main(path, regularize=True)
+    assert _armed(f), "vacuous: the main fitter is not blinded"
+    assert len(f.regularizers) == 1, "vacuous: no regularizer to arm"
+
+    with pytest.raises(RuntimeError, match="blinded starting point"):
+        build_saturated(f, blind=True, arm_regularizers_early=False)
+
+
+def test_blinded_regularized_saturated_reinit_can_evaluate_its_loss(path):
+    """And the driver's order works: all three at once, loss finite."""
+    _, _, f = build_main(path, regularize=True)
+    assert _armed(f), "vacuous: the main fitter is not blinded"
+    assert len(f.regularizers) == 1, "vacuous: no regularizer to arm"
+
+    _, _, _, fs = build_saturated(f, blind=True)
+    assert _armed(fs)
+    assert fs._regularizers_armed
+    assert np.isfinite(float(fs._compute_loss().numpy()))
+
+
+def test_the_penalty_follows_the_parameter_through_the_composite(path):
+    """Arming after the re-init must re-resolve by NAME, not reuse an index.
+
+    The composite prepends the saturated model's POIs, so the penalized
+    parameter sits at a different position than it did in the main fit. If the
+    index were cached the penalty would silently apply to another parameter.
+    """
+    _, _, f = build_main(path, regularize=True)
+    idx_main = f.regularizers[0]._idx
+
+    _, _, _, fs = build_saturated(f, blind=True)
+    idx_comp = fs.regularizers[0]._idx
+
+    names_main = np.asarray(f.parms).astype(str)
+    names_comp = np.asarray(fs.parms).astype(str)
+    assert names_main[idx_main] == "bkgNorm"
+    assert names_comp[idx_comp] == "bkgNorm"
+    assert idx_main != idx_comp, (
+        "vacuous: the composite did not move bkgNorm, so a cached index would "
+        "have worked and this asserts nothing"
+    )
+
+
+def test_unregularized_and_unblinded_paths_are_unaffected(path):
+    """Neither arm that could not reproduce the bug regresses.
+
+    These two are why it went unnoticed: with no regularizer there is nothing to
+    arm, and unblinded ``set_blinding_offsets`` returns before the check.
+    """
+    _, _, f = build_main(path, regularize=False)
+    _, _, _, fs = build_saturated(f, blind=True, arm_regularizers_early=False)
+    assert np.isfinite(float(fs._compute_loss().numpy()))
+
+    _, _, f = build_main(path, do_blinding=False, regularize=True)
+    _, _, _, fs = build_saturated(f, blind=False, arm_regularizers_early=False)
+    assert np.isfinite(float(fs._compute_loss().numpy()))
 
 
 if __name__ == "__main__":
