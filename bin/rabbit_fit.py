@@ -25,7 +25,7 @@ import time
 import numpy as np
 from scipy.stats import chi2
 
-from rabbit import fitter, inputdata, parsing, workspace
+from rabbit import fitter, inputdata, parsing, snapshot, workspace
 from rabbit.mappings import helpers as mh
 from rabbit.mappings import mapping as mp
 from rabbit.param_models import helpers as ph
@@ -439,6 +439,20 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 )
 
                 fitter_saturated = copy.deepcopy(fitter)
+
+                # GIVE IT ITS OWN SNAPSHOT PATH. The deepcopy inherits
+                # --snapshotFile, so without this the saturated fit's periodic
+                # snapshots land on the main fit's file and OVERWRITE its
+                # `converged` snapshot -- the one artefact that lets a fit whose
+                # postfit died be recovered. Worse, what replaces it is a
+                # composite-layout vector (the analysis parameters plus one bin
+                # scale per projection bin), which cannot be loaded back into
+                # the main fit at all, while the snapshotter's own log line
+                # invites precisely that: "resume with --externalPostfit <path>".
+                # Per mapping, because each projection runs its own saturated fit.
+                fitter_saturated.snapshot_file = snapshot.sibling_snapshot_path(
+                    fitter.snapshot_file, f"saturated_{mapping.key}"
+                )
 
                 # preserve the (possibly toy-randomized) constraint centers
                 # across the re-init: the theta block maps 1:1, and the
