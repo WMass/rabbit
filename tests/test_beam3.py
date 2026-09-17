@@ -546,6 +546,29 @@ def test_zero_record_row():
     print("  PASS")
 
 
+def test_rechunk_with_jac():
+    print("\n=== 9c. re-chunking a term that carries a sparse D ===")
+    inp = make_inputs(n=210, nt=16, seed=22)
+    n = inp["n"]
+    lev = 2.9 * (2 * RNG.random(n) - 1)
+    dmean = -inp["w"][:, 0] * lev
+    idx = np.stack([np.arange(n), np.zeros(n, np.int64)], 1)
+    t = build(inp, jac=(idx, dmean, (n, 1)), jac_params=["beamtilt_x"])
+    v = values(t, beamtilt_x=3e-5, beamwidth_x=0.04)
+    n0, g0 = nll_at(t, v), grad_at(t, v)
+    for c in (64, 7, 210, 1000):
+        t.rechunk(c)
+        n1, g1 = nll_at(t, v), grad_at(t, v)
+        d = abs(n1 - n0) / max(abs(n0), 1e-300)
+        dg = np.abs(g1 - g0).max()
+        print(
+            f"  chunk {c:5d} ({t.nchunk} chunk(s)): NLL rel {d:.2e}, "
+            f"max |dgrad| {dg:.2e}"
+        )
+        assert d < 1e-12 and dg < 1e-6
+    print("  PASS")
+
+
 def test_hdf5_roundtrip():
     print("\n=== 9. datacard round trip ===")
     import h5py
@@ -607,6 +630,7 @@ if __name__ == "__main__":
         test_one_parameter_two_roles,
         test_norm_window,
         test_zero_record_row,
+        test_rechunk_with_jac,
         test_hdf5_roundtrip,
     ]
     for fn in tests:

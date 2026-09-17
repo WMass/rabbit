@@ -731,24 +731,36 @@ class UnbinnedTerm:
 
         The chunk size is a pure memory / dispatch knob -- the objective is a
         sum over candidates and does not depend on how it is partitioned -- so
-        this is safe to expose on the command line. It is NOT safe for a term
-        carrying a per-candidate sparse ``D``: those blocks are sliced at write
-        time, so a different chunking would pair chunk ``ci`` of the candidates
-        with block ``ci`` of a different partition. That case raises rather
-        than silently mis-aligning.
+        this is safe to expose on the command line.
+
+        A term carrying a per-candidate sparse ``D`` needs one more step: its
+        blocks were sliced at the OLD partition, so leaving them alone would
+        pair chunk ``ci`` of the candidates with block ``ci`` of a different
+        partition.  They are re-sliced here from the whole matrix, which is the
+        same reconstruction :meth:`candidate_slice` does and is exact -- the
+        blocks are the partition, not data.
         """
         chunk = int(chunk)
         if chunk <= 0:
             raise ValueError(f"chunk must be positive, got {chunk}")
-        if getattr(self, "_jac_chunks", None) is not None:
-            raise ValueError(
-                f"term '{self.name}' carries a per-candidate sparse D whose "
-                "per-chunk blocks were built at write time; re-chunking it "
-                "would silently mis-align them"
-            )
         self.chunk = int(min(chunk, self.n)) if self.n else 1
         self.nchunk = int(np.ceil(self.n / self.chunk)) if self.n else 0
         self._chunks = ChunkTable(self.chunk, self.n, self.nchunk)
+        jc = getattr(self, "_jac_chunks", None)
+        if jc is not None:
+            njac = jc.njac
+            if jc.is_dense:
+                whole = jc._whole_dense()
+                blocks = [whole[lo:hi] for lo, hi in self._chunks]
+            else:
+                whole = jc._whole_sparse()
+                blocks = [
+                    tf.sparse.slice(whole, [lo, 0], [hi - lo, njac])
+                    for lo, hi in self._chunks
+                ]
+            self._jac_chunks = JacChunkTable(
+                blocks, self._chunks, njac, dense=jc.is_dense
+            )
         return self
 
     def _nll_graph(self, params):
