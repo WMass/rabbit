@@ -874,6 +874,15 @@ class UnbinnedTerm:
 # ---------------------------------------------------------------------------
 # the CVH mass likelihood
 # ---------------------------------------------------------------------------
+# The luminous-region block's five parameter ROLES, in the order `beam3_params`
+# and `beam3_units` are given in, and the packing of a symmetric 3x3 used for
+# `Q_ab` and for `covBS` throughout (`MULT` counts each off-diagonal twice, so
+# `sum(C * Q * MULT)` is the full double sum `sum_ab C_ab Q_ab`).
+BEAM3_ROLES = ("width_x", "width_y", "corr_xy", "tilt_x", "tilt_y")
+BEAM3_PACK = ((0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2))
+BEAM3_MULT = np.array([1.0, 2.0, 2.0, 1.0, 2.0, 1.0])
+
+
 class MassCFTerm(UnbinnedTerm):
     """Unbinned per-candidate mass likelihood built from characteristic functions.
 
@@ -2874,8 +2883,48 @@ class MaterialCFTerm(MassCFTerm):
     with ``H(eps) = 1 + eps`` (``hit_mode="linear"``) or ``exp(eps)``.
     ``v_{c,i}`` is the summed exported influence variance ``resinfvarv`` of the
     candidate's parmtype-8/9 blocks of class ``c``, in units of ``sigma_i^2``,
-    and ``v_other`` the Gaussian remainder (beamspot / vertex constraint) that
-    no parameter scales.
+    and ``v_other`` the Gaussian remainder (vertex constraint) that no
+    parameter scales.
+
+    THE LUMINOUS REGION (``beam3``)
+    -------------------------------
+    The beam-line constraint is a Gaussian block like a hit, but its
+    covariance is a PHYSICAL object with six entries and five parameters, not
+    a scale on a number.  ``beam3`` floats it as the 3x3 covariance itself.
+    The block contributes to a functional's variance EXACTLY
+
+        Var_bs = w^T covBS w = sum_ab covBS_ab Q_ab ,   Q_ab = w_a w_b ,
+
+    with ``w`` the functional's influence weight on the three beam rows -- so
+    the per-candidate input is the six ``Q_ab`` (packed xx, xy, xz, yy, yz,
+    zz, in units of the functional's own variance), the record the block was
+    built from, and the block's nominal share.  ``covBS`` is the CMS
+    beam-spot-fitter form
+
+        C_xx = k_x sigma_x^2                C_yy = k_y sigma_y^2
+        C_xy = rho sqrt(C_xx C_yy)          C_zz = sigma_z^2
+        C_xz = dxdz (C_zz - C_xx) - dydz C_xy
+        C_yz = dydz (C_zz - C_yy) - dxdz C_xy
+
+    and the five parameters are the two transverse variance scales ``k = 1 +
+    eps`` (``beamwidth_x`` / ``beamwidth_y``: the share is EXACTLY linear in
+    ``sigma^2``, so ``eps`` is the fractional change of the variance with
+    nothing truncated, and the physical domain is ``eps > -1``), the x-y
+    correlation through ``rho = tanh(eta)`` (a smooth bijection of an
+    unbounded parameter onto ``(-1, 1)``, nominal 0 -- a reparameterisation,
+    not a clip), and the two tilts as OFFSETS from the record.  ``sigma_z`` is
+    fixed: the z beam row is weightless against a ~100 um vertex error.
+
+    The share is written in the ANCHORED form
+    ``v(p) = v_nominal + sum_ab [C_ab(p) - C_ab(record)] Q_ab``, so at the
+    nominal parameters every difference is identically zero and the block
+    reproduces the maker's own exported share bit for bit.
+
+    The tilts and the transverse centre also move the functional's MEAN -- and
+    that is the dominant effect -- but through the sparse ``D`` of
+    :class:`MassCFTerm`, not here.  A tilt parameter therefore appears in BOTH
+    lists; the constructor de-duplicates the names, so ONE parameter drives
+    the mean and the covariance together.
 
     Field and alignment parameters enter this term ONLY through the mean, via
     the sparse ``D`` rows of :class:`MassCFTerm` -- they move where the mass
@@ -2907,6 +2956,19 @@ class MaterialCFTerm(MassCFTerm):
     hit_share : (hit_ptr, hit_cls, hit_v, vg_other), optional
     hit_units : ndarray (ncls,), optional
     amount_mode, hit_mode : {"exp", "linear"}
+    beam3_params : list[str], optional
+        The five luminous-region parameter names, in the FIXED role order
+        ``(width_x, width_y, corr_xy, tilt_x, tilt_y)``.  An empty string
+        freezes that role at the record.
+    beam3_units : ndarray (5,), optional
+        Physical unit of each: ``k = 1 + value * unit`` for the two widths,
+        ``rho = tanh(value * unit)``, ``dxdz = record + value * unit``.
+    beam3 : dict, optional
+        ``{"q": (n, 6), "ref": (n, 5), "v0": (n,)}`` -- the packed
+        ``Q_ab = w_a w_b`` in units of the functional's variance, the record
+        ``(sigma_x, sigma_y, sigma_z, dxdz, dydz)`` in cm, and the block's
+        nominal variance share.  ``vg_other`` must already have the nominal
+        share removed.
     """
 
     kind = "MaterialCF"
@@ -2923,6 +2985,9 @@ class MaterialCFTerm(MassCFTerm):
         hit_params=(),
         hit_share=None,
         hit_units=None,
+        beam3_params=(),
+        beam3_units=None,
+        beam3=None,
         amount_mode="exp",
         hit_mode="linear",
         amount_clip=5.0,
@@ -2935,6 +3000,19 @@ class MaterialCFTerm(MassCFTerm):
             raise ValueError(f"hit_mode {hit_mode!r} is not exp/linear")
         self.group_params = list(group_params)
         self.hit_params = list(hit_params)
+        self.beam3_params = [str(p) for p in beam3_params]
+        if self.beam3_params and len(self.beam3_params) != len(BEAM3_ROLES):
+            raise ValueError(
+                f"beam3_params must have one entry per role {BEAM3_ROLES}, "
+                f"got {self.beam3_params}"
+            )
+        self.beam3_units = (
+            np.ones(len(BEAM3_ROLES))
+            if beam3_units is None
+            else np.asarray(beam3_units, dtype=np.float64).ravel()
+        )
+        if self.beam3_params and self.beam3_units.shape != (len(BEAM3_ROLES),):
+            raise ValueError("beam3_units must have one entry per beam3 role")
         self.amount_mode = amount_mode
         self.hit_mode = hit_mode
         # FINITENESS GUARD, not a physics choice.  A trust-region step early in
@@ -2947,7 +3025,12 @@ class MaterialCFTerm(MassCFTerm):
         # a fit that ends ON the clip is telling you something is wrong.
         self.amount_clip = float(amount_clip)
         self.hit_clip = float(hit_clip)
-        # set BEFORE super().__init__, which calls _extra_param_names()
+        # set BEFORE super().__init__, which calls _extra_param_names() -- and,
+        # when a truncation normalisation is given, _build_norm(), which has to
+        # know whether a luminous-region block is coming before its tensors can
+        # be built (they need `self.n` and `self.dtype`, which super() sets)
+        self._b3_q = None
+        self._b3_src = beam3
         super().__init__(name, *args, **kwargs)
 
         npdt = self.npdt
@@ -3062,6 +3145,34 @@ class MaterialCFTerm(MassCFTerm):
             )
         elif len(self.hit_params):
             raise ValueError("hit_params given without hit_share")
+
+        # ---- the luminous-region 3x3 block -------------------------------
+        if beam3 is not None:
+            if not self.beam3_params:
+                raise ValueError("beam3 given without beam3_params")
+            q = np.asarray(beam3["q"], dtype=np.float64)
+            ref = np.asarray(beam3["ref"], dtype=np.float64)
+            v0 = np.asarray(beam3["v0"], dtype=np.float64).ravel()
+            if q.shape != (self.n, 6):
+                raise ValueError(f"beam3 q has shape {q.shape}, expected {(self.n, 6)}")
+            if ref.shape != (self.n, 5):
+                raise ValueError(
+                    f"beam3 ref has shape {ref.shape}, expected {(self.n, 5)}"
+                )
+            if v0.shape != (self.n,):
+                raise ValueError(f"beam3 v0 has shape {v0.shape}, expected {(self.n,)}")
+            self._b3_q = tf.constant(q, self.dtype)
+            self._b3_ref = tf.constant(ref, self.dtype)
+            self._b3_v0 = tf.constant(v0, self.dtype)
+            # NOT shaped (6,) / (5,): `candidate_slice` slices every tensor
+            # attribute whose leading axis is `n`, and a 5- or 6-candidate
+            # shard would then silently slice these too.
+            self._b3_mult = tf.constant(BEAM3_MULT[None, :], self.dtype)
+            self._b3_units = [
+                tf.constant(float(u), self.dtype) for u in self.beam3_units
+            ]
+        elif self.beam3_params:
+            raise ValueError("beam3_params given without beam3")
         del npdt
 
     # -- the truncation normalisation --------------------------------------
@@ -3159,6 +3270,35 @@ class MaterialCFTerm(MassCFTerm):
                 "a MaterialCF truncation normalisation needs norm['vg_other'] "
                 "whenever the term carries a Gaussian hit share"
             )
+        # THE LUMINOUS-REGION BLOCK AT CLASS LEVEL.  `Z_c` has to carry the
+        # beam parameters for the same reason it has to carry the material
+        # ones: a window normalisation that does not depend on the width
+        # leaves the truncated fit exactly as biased as the untruncated one.
+        # The share is LINEAR in `covBS` at fixed `Q`, so the class row is the
+        # class MEAN of `Q` and of the nominal share; the record is constant
+        # over an IOV, so its class mean is the record.
+        self._norm_b3q = None
+        if norm.get("beam3_q") is not None:
+            bq = np.asarray(norm["beam3_q"], np.float64)
+            br = np.asarray(norm["beam3_ref"], np.float64)
+            bv = np.asarray(norm["beam3_v0"], np.float64).ravel()
+            if (
+                bq.shape != (self._nclass, 6)
+                or br.shape != (self._nclass, 5)
+                or bv.shape != (self._nclass,)
+            ):
+                raise ValueError(
+                    "norm beam3 arrays must be (K, 6), (K, 5) and (K,) with "
+                    f"K = {self._nclass}"
+                )
+            self._norm_b3q = tf.constant(bq, dtype)
+            self._norm_b3ref = tf.constant(br, dtype)
+            self._norm_b3v0 = tf.constant(bv, dtype)
+        elif self._b3_src is not None and self._norm_vgother is not None:
+            raise ValueError(
+                "a beam3 term with a truncation normalisation needs "
+                "norm['beam3_q'] / ['beam3_ref'] / ['beam3_v0']"
+            )
 
     def _norm_extra(self, values, s_re, s_im, t):
         dtype = self.dtype
@@ -3184,13 +3324,22 @@ class MaterialCFTerm(MassCFTerm):
             v = vgo
             if self._norm_hitv is not None and len(self.hit_params):
                 v = v + tf.linalg.matvec(self._norm_hitv, self._hitscale(values))
+            if getattr(self, "_norm_b3q", None) is not None:
+                v = v + self._beam3_share(
+                    values, self._norm_b3q, self._norm_b3ref, self._norm_b3v0
+                )
             gauss = self.npdt(-0.5) * v[:, None] * t[None, :] ** 2
             s_re = gauss if s_re is None else s_re + gauss
         return s_re, s_im
 
     # -- internals ---------------------------------------------------------
     def _extra_param_names(self):
-        return list(self.group_params) + list(self.hit_params)
+        # a role named "" is FROZEN at the record and contributes no parameter
+        return (
+            list(self.group_params)
+            + list(self.hit_params)
+            + [p for p in self.beam3_params if p]
+        )
 
     def _amount(self, values):
         k = tf.stack([values[p] for p in self.group_params]) * self._gunits
@@ -3201,6 +3350,94 @@ class MaterialCFTerm(MassCFTerm):
         if self.amount_mode == "exp":
             return tf.exp(k)
         return tf.maximum(tf.constant(1.0, self.dtype) + k, self.npdt(0.0))
+
+    def _beam3_pars(self, values):
+        """The five luminous-region parameters, physical, in role order.
+
+        A frozen role (an empty name) returns a hard zero, which makes every
+        term it enters identically the record's.
+        """
+        out = []
+        for i, nm in enumerate(self.beam3_params):
+            if not nm:
+                out.append(tf.constant(0.0, self.dtype))
+                continue
+            v = values[nm]
+            # a PYTHON float would go `tf.cast(float, float64)` through the
+            # float32 default dtype and lose 1e-7 of itself; the fit always
+            # passes a float64 tensor, a direct caller may not
+            v = (
+                tf.cast(v, self.dtype)
+                if tf.is_tensor(v)
+                else tf.constant(v, self.dtype)
+            )
+            out.append(v * self._b3_units[i])
+        return out
+
+    def _beam3_share(self, values, q, ref, v0):
+        """The block's variance share of rows whose ``(Q, record, nominal)``
+        are given, in the ANCHORED form.
+
+        ``v(p) = v0 + sum_ab [C_ab(p) - C_ab(record)] Q_ab``.  Every difference
+        is written so that it is EXACTLY zero at the nominal parameters -- the
+        two sides are the same expression on the same inputs -- so the block
+        reproduces the maker's exported share bit for bit there, and only the
+        CHANGE is computed from the record.
+
+        ``sigma_z`` does not float, so the ``zz`` difference is identically
+        zero and is not assembled.
+        """
+        ex, ey, eta, tx, ty = self._beam3_pars(values)
+        one = tf.constant(1.0, self.dtype)
+        sx = ref[:, 0]
+        sy = ref[:, 1]
+        sx2 = sx * sx
+        sy2 = sy * sy
+        vz = ref[:, 2] ** 2
+        # THE WIDTHS.  `k = 1 + eps` is EXACT, not a first-order form: the
+        # block's variance is linear in sigma^2, so eps IS the fractional
+        # change of the variance.  There is no clip -- `eps <= -1` is not a
+        # small parameter value, it is a negative variance, and a model that
+        # is asked for one must say so rather than be floored into a
+        # different model.  The published fits sit at eps ~ -0.14 +- 0.06,
+        # fifteen sigma from the edge.
+        vx = (one + ex) * sx2
+        vy = (one + ey) * sy2
+        # THE CORRELATION.  `rho = tanh(eta)` is a smooth bijection of the
+        # unbounded parameter onto the physical (-1, 1) -- a change of
+        # variable, not a bound: the Jacobian is 1 at the nominal rho = 0, so
+        # `eta` IS rho to first order and the fitted error needs no transform
+        # to be read as one on rho.
+        rho = tf.tanh(eta)
+        # `rho sqrt(C_xx C_yy)`, but with the square root taken of the
+        # PARAMETERS and not of the variances: `sqrt(k)` is differentiable at
+        # the nominal `k = 1`, while `sqrt(sigma^2 k)` has an INFINITE
+        # derivative wherever the record's width is zero -- which is not a
+        # hypothetical, it is every unused class row of a truncation
+        # normalisation, and `rho = 0` there turns that infinity into `0 * inf
+        # = NaN` in the Hessian while leaving the VALUE finite.  The two forms
+        # are identical for any positive record.
+        cxy = rho * tf.sqrt(one + ex) * tf.sqrt(one + ey) * sx * sy
+        dxdz = ref[:, 3] + tx
+        dydz = ref[:, 4] + ty
+        cxz = dxdz * (vz - vx) - dydz * cxy
+        cyz = dydz * (vz - vy) - dxdz * cxy
+        # the record, by the same expression (rho = 0, so its cross terms drop
+        # out exactly rather than to rounding)
+        cxz0 = ref[:, 3] * (vz - sx2)
+        cyz0 = ref[:, 4] * (vz - sy2)
+        d = tf.stack(
+            [
+                vx - sx2,
+                cxy,
+                cxz - cxz0,
+                vy - sy2,
+                cyz - cyz0,
+                tf.zeros_like(vz),
+            ],
+            axis=-1,
+        )
+        return v0 + tf.reduce_sum(d * q * self._b3_mult, axis=-1)
 
     def _hitscale(self, values):
         e = tf.stack([values[p] for p in self.hit_params]) * self._hunits
@@ -3272,6 +3509,12 @@ class MaterialCFTerm(MassCFTerm):
                 )
             gv = v if gv is None else gv + v
 
+        if self._b3_q is not None:
+            vb = self._beam3_share(
+                values, self._b3_q[lo:hi], self._b3_ref[lo:hi], self._b3_v0[lo:hi]
+            )
+            gv = vb if gv is None else gv + vb
+
         return s_re, s_im, gv
 
     def config(self):
@@ -3284,6 +3527,8 @@ class MaterialCFTerm(MassCFTerm):
                 "hit_mode": self.hit_mode,
                 "amount_clip": self.amount_clip,
                 "hit_clip": self.hit_clip,
+                "beam3_params": list(self.beam3_params),
+                "beam3_units": [float(u) for u in self.beam3_units],
                 "group_families": [{"name": f["name"]} for f in self.group_families],
             }
         )
@@ -3472,6 +3717,16 @@ def read_unbinned_terms_from_h5(group, dtype=tf.float64):
                     data.pop("hit_v"),
                     data.pop("vg_other"),
                 )
+            if "beam3_q" in data:
+                extra["beam3"] = {
+                    "q": data.pop("beam3_q"),
+                    "ref": data.pop("beam3_ref"),
+                    "v0": data.pop("beam3_v0"),
+                }
+            if norm is not None and "norm_beam3_q" in data:
+                norm["beam3_q"] = data.pop("norm_beam3_q")
+                norm["beam3_ref"] = data.pop("norm_beam3_ref")
+                norm["beam3_v0"] = data.pop("norm_beam3_v0")
             # the CLASS-level copies the truncation normalisation needs, so
             # that `Z` carries the material / hit-class dependence (see
             # `MaterialCFTerm._build_norm`)
