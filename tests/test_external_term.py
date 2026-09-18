@@ -21,6 +21,7 @@ from types import SimpleNamespace
 
 import hist
 import numpy as np
+import pytest
 import scipy.sparse
 from wums.sparse_hist import SparseHist
 
@@ -158,119 +159,94 @@ def make_hess_sparsehist(values, param_names):
     return SparseHist(scipy.sparse.csr_array(full), [ax0, ax1])
 
 
-def main():
+SHAPE = "shape"
+
+# L_ext(x) = g^T x + 0.5 x^T H x contributes (g + H x) to the NLL gradient and
+# H to its hessian. Evaluated at the baseline minimum, where x[shape] == 0, so
+# H x is zero there and the gradient delta is exactly g. Asserting that rather
+# than post-fit values, which depend on the data hessian and the constraint and
+# have no clean closed form.
+_TERMS = [
+    ("grad only (g=1)", dict(grad=[1.0], hess=None), 1.0, 0.0),
+    ("grad+dense hess (g=1, h=2)", dict(grad=[1.0], hess=[[2.0]]), 1.0, 2.0),
+    (
+        "grad+SparseHist hess (g=1, h=2)",
+        dict(grad=[1.0], hess=[[2.0]], sparse_hess=True),
+        1.0,
+        2.0,
+    ),
+    ("hess only (h=5)", dict(grad=None, hess=[[5.0]]), 0.0, 5.0),
+]
+
+
+def _build(grad, hess, sparse_hess=False):
+    make_hess = make_hess_sparsehist if sparse_hess else make_hess_hist
+    return build_writer(
+        grad=None if grad is None else make_grad_hist(grad, [SHAPE]),
+        hess=None if hess is None else make_hess(hess, [SHAPE]),
+    )
+
+
+@pytest.fixture(scope="module")
+def baseline(tmp_path_factory):
+    """The no-external-term fit, and its loss/grad/hess, built once."""
     import tensorflow as tf
 
     tf.config.experimental.enable_op_determinism()
 
-    SHAPE = "shape"
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-
-        # --- Baseline: no external term ---
-        baseline_writer = build_writer()
-        baseline_writer.write(outfolder=tmpdir, outfilename="baseline")
-        baseline = run_fit(os.path.join(tmpdir, "baseline.hdf5"))
-        baseline_shape = get_param_value(baseline, SHAPE)
-        print(f"Baseline (no external):    {SHAPE} = {baseline_shape:.6f}")
-        assert (
-            abs(baseline_shape) < 1e-6
-        ), f"Asimov baseline should give {SHAPE} ~ 0, got {baseline_shape}"
-        print("PASS: baseline Asimov fit gives shape ~ 0")
-
-        # Reference loss/grad/hess at the baseline x (no external term).
-        # The contribution of L_ext(x) = g^T x + 0.5 x^T H x to the NLL gradient
-        # at any x is (g + H x), and to the NLL hessian is H. We test these
-        # exactly (not analytical post-fit values, which depend on the data
-        # Hessian and the constraint and don't have a clean closed form).
-        parms, val0, grad0, hess0 = loss_grad_hess_at(
-            os.path.join(tmpdir, "baseline.hdf5")
-        )
-        i_shape = get_param_index(parms, SHAPE)
-        x0 = baseline["x"].copy()
-        # the test below evaluates external terms at the baseline minimum
-        # where x[i_shape] = 0, so H x_sub = 0 → grad delta == g exactly.
-
-        configs = [
-            (
-                "grad only (g=1)",
-                build_writer(grad=make_grad_hist([1.0], [SHAPE])),
-                {i_shape: 1.0},
-                {(i_shape, i_shape): 0.0},
-            ),
-            (
-                "grad+dense hess (g=1, h=2)",
-                build_writer(
-                    grad=make_grad_hist([1.0], [SHAPE]),
-                    hess=make_hess_hist([[2.0]], [SHAPE]),
-                ),
-                {i_shape: 1.0},
-                {(i_shape, i_shape): 2.0},
-            ),
-            (
-                "grad+SparseHist hess (g=1, h=2)",
-                build_writer(
-                    grad=make_grad_hist([1.0], [SHAPE]),
-                    hess=make_hess_sparsehist([[2.0]], [SHAPE]),
-                ),
-                {i_shape: 1.0},
-                {(i_shape, i_shape): 2.0},
-            ),
-            (
-                "hess only (h=5)",
-                build_writer(hess=make_hess_hist([[5.0]], [SHAPE])),
-                {i_shape: 0.0},
-                {(i_shape, i_shape): 5.0},
-            ),
-        ]
-
-        for label, writer, expected_grad_delta, expected_hess_delta in configs:
-            tag = (
-                label.replace(" ", "_")
-                .replace("(", "")
-                .replace(")", "")
-                .replace(",", "")
-                .replace("=", "")
-            )
-            writer.write(outfolder=tmpdir, outfilename=tag)
-            _, val, grad, hess = loss_grad_hess_at(
-                os.path.join(tmpdir, f"{tag}.hdf5"),
-                x_override=x0,
-            )
-            for idx, expected in expected_grad_delta.items():
-                actual = grad[idx] - grad0[idx]
-                print(
-                    f"{label}: grad delta @ idx {idx} = {actual:+.6f}  (expected {expected:+.6f})"
-                )
-                assert (
-                    abs(actual - expected) < 1e-8
-                ), f"{label}: grad delta {actual} != expected {expected}"
-            for (i, j), expected in expected_hess_delta.items():
-                actual = hess[i, j] - hess0[i, j]
-                print(
-                    f"{label}: hess delta @ ({i},{j}) = {actual:+.6f}  (expected {expected:+.6f})"
-                )
-                assert (
-                    abs(actual - expected) < 1e-8
-                ), f"{label}: hess delta {actual} != expected {expected}"
-            print(f"PASS: {label}")
-
-        # Sanity check: also verify that running the full fit shifts the
-        # baseline shape value in the expected direction (negative for g=+1).
-        grad_only_writer = build_writer(grad=make_grad_hist([1.0], [SHAPE]))
-        grad_only_writer.write(outfolder=tmpdir, outfilename="grad_only_fit")
-        grad_only = run_fit(os.path.join(tmpdir, "grad_only_fit.hdf5"))
-        v = get_param_value(grad_only, SHAPE)
-        print(f"Full fit with g=+1: shape = {v:.6f}  (expected negative)")
-        assert v < -1e-3, f"Expected shape to pull negative, got {v}"
-        print("PASS: full fit with positive gradient pulls shape negative")
-
-        print()
-        print("ALL CHECKS PASSED")
+    tmpdir = str(tmp_path_factory.mktemp("external_term"))
+    build_writer().write(outfolder=tmpdir, outfilename="baseline")
+    path = os.path.join(tmpdir, "baseline.hdf5")
+    res = run_fit(path)
+    parms, _, grad0, hess0 = loss_grad_hess_at(path)
+    return SimpleNamespace(
+        tmpdir=tmpdir,
+        res=res,
+        parms=parms,
+        grad0=grad0,
+        hess0=hess0,
+        i_shape=get_param_index(parms, SHAPE),
+        x0=res["x"].copy(),
+    )
 
 
-if __name__ == "__main__":
-    main()
+def test_asimov_baseline_sits_at_zero(baseline):
+    """Without an external term the Asimov fit must not pull the parameter."""
+    value = get_param_value(baseline.res, SHAPE)
+    assert abs(value) < 1e-6, f"Asimov baseline should give {SHAPE} ~ 0, got {value}"
+
+
+@pytest.mark.parametrize(
+    "label,kwargs,expected_grad,expected_hess",
+    _TERMS,
+    ids=[t[0] for t in _TERMS],
+)
+def test_external_term_enters_grad_and_hess(
+    baseline, label, kwargs, expected_grad, expected_hess
+):
+    tag = "".join(c if c.isalnum() else "_" for c in label)
+    _build(**kwargs).write(outfolder=baseline.tmpdir, outfilename=tag)
+    _, _, grad, hess = loss_grad_hess_at(
+        os.path.join(baseline.tmpdir, f"{tag}.hdf5"), x_override=baseline.x0
+    )
+    i = baseline.i_shape
+    assert (
+        abs((grad[i] - baseline.grad0[i]) - expected_grad) < 1e-8
+    ), f"{label}: grad delta {grad[i] - baseline.grad0[i]} != {expected_grad}"
+    assert (
+        abs((hess[i, i] - baseline.hess0[i, i]) - expected_hess) < 1e-8
+    ), f"{label}: hess delta {hess[i, i] - baseline.hess0[i, i]} != {expected_hess}"
+
+
+def test_positive_gradient_pulls_the_fit_negative(baseline):
+    """End to end, not just the derivatives: a g = +1 term must move the minimum."""
+    _build(grad=[1.0], hess=None).write(
+        outfolder=baseline.tmpdir, outfilename="grad_only_fit"
+    )
+    value = get_param_value(
+        run_fit(os.path.join(baseline.tmpdir, "grad_only_fit.hdf5")), SHAPE
+    )
+    assert value < -1e-3, f"expected {SHAPE} to pull negative, got {value}"
 
 
 def test_partial_external_covariance_leaves_uncovered_variances_nan():
@@ -427,7 +403,6 @@ def test_partial_external_coverage_refuses_global_impacts():
     reported as data-statistical instead. Nothing in the output looks wrong,
     which is why this is a refusal and not a warning.
     """
-    import pytest
     from wums import logging as wums_logging
 
     driver = _driver()
@@ -452,3 +427,9 @@ def test_partial_external_coverage_refuses_global_impacts():
         driver.external_postfit_variances(_args(globalImpacts=True), full),
         [0.25, 0.25, 4.0],
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -4,11 +4,11 @@ runs a fit on each, and verifies that sparse mode produces consistent results.
 """
 
 import os
-import tempfile
 from types import SimpleNamespace
 
 import hist
 import numpy as np
+import pytest
 
 from rabbit import fitter, inputdata, tensorwriter
 from rabbit.param_models.helpers import load_model
@@ -241,69 +241,44 @@ def check_results(label_a, res_a, label_b, res_b, atol=1e-5, rtol=1e-4):
     return all_ok
 
 
-def main():
+# Every mode must reproduce the dense reference: sparse storage, the
+# as_difference booking and scipy-sparse input are all storage/bookkeeping
+# variations, not different mathematics.
+_CONFIGS = {
+    "Dense": dict(sparse=False),
+    "Sparse": dict(sparse=True),
+    "Dense (as_difference)": dict(sparse=False, as_difference=True),
+    "Sparse (as_difference)": dict(sparse=True, as_difference=True),
+    "Sparse (scipy)": dict(sparse=True, scipy_sparse_input=True),
+    "Sparse (scipy+diff)": dict(
+        sparse=True, as_difference=True, scipy_sparse_input=True
+    ),
+}
+
+REFERENCE = "Dense"
+
+
+@pytest.fixture(scope="module")
+def fit_results(tmp_path_factory):
+    """Run every mode once; the fits are the expensive part, the checks are not."""
     import tensorflow as tf
 
     tf.config.experimental.enable_op_determinism()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # create tensors in all modes
-        configs = [
-            ("Dense", make_test_tensor(tmpdir, sparse=False)),
-            ("Sparse", make_test_tensor(tmpdir, sparse=True)),
-            (
-                "Dense (as_difference)",
-                make_test_tensor(tmpdir, sparse=False, as_difference=True),
-            ),
-            (
-                "Sparse (as_difference)",
-                make_test_tensor(tmpdir, sparse=True, as_difference=True),
-            ),
-            (
-                "Sparse (scipy)",
-                make_test_tensor(tmpdir, sparse=True, scipy_sparse_input=True),
-            ),
-            (
-                "Sparse (scipy+diff)",
-                make_test_tensor(
-                    tmpdir, sparse=True, as_difference=True, scipy_sparse_input=True
-                ),
-            ),
-        ]
+    tmpdir = str(tmp_path_factory.mktemp("sparse_fit"))
+    return {
+        label: run_fit(make_test_tensor(tmpdir, **kw)) for label, kw in _CONFIGS.items()
+    }
 
-        results = {}
-        for label, fpath in configs:
-            print("=" * 60)
-            print(f"Running {label} fit...")
-            print("=" * 60)
-            results[label] = run_fit(fpath)
-            print()
 
-        # check consistency across all pairs vs the dense baseline
-        print("=" * 60)
-        print("Consistency checks")
-        print("=" * 60)
-
-        checks = [
-            ("Dense", "Sparse"),
-            ("Dense", "Dense (as_difference)"),
-            ("Dense", "Sparse (as_difference)"),
-            ("Dense", "Sparse (scipy)"),
-            ("Dense", "Sparse (scipy+diff)"),
-        ]
-
-        all_ok = True
-        for label_a, label_b in checks:
-            ok = check_results(label_a, results[label_a], label_b, results[label_b])
-            all_ok = all_ok and ok
-
-        print()
-        if all_ok:
-            print("ALL CHECKS PASSED")
-        else:
-            print("SOME CHECKS FAILED")
-            raise SystemExit(1)
+@pytest.mark.parametrize("label", [k for k in _CONFIGS if k != REFERENCE])
+def test_mode_matches_dense_reference(fit_results, label):
+    assert check_results(
+        REFERENCE, fit_results[REFERENCE], label, fit_results[label]
+    ), f"{label} does not reproduce the {REFERENCE} fit"
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

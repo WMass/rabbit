@@ -1,0 +1,213 @@
+imax    1 number of bins
+jmax    * number of processes minus 1
+kmax    * number of nuisance parameters
+--------------------------------------------------------------------------------
+shapes TT2mm TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes TT2me TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes TT2mT TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes TT2eT TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes TT2TT TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes TTbkg TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes ST TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes DY2mm TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes DY2TT TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes W TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes Dibosons TTmT TTTauMu_MC_2016pre.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+shapes data_obs TTmT TTTauMu_DT_2016pre.root data_BDT
+shapes QCD_Tau TTmT 2016preVFP_QCD_tt_mutau.root $PROCESS_BDT $PROCESS_BDT_$SYSTEMATIC
+--------------------------------------------------------------------------------
+bin          		TTmT     
+observation		-1   
+----------------------------------------------------------------------------------------------------------------------------------
+bin                                      TTmT      TTmT      TTmT      TTmT      TTmT      TTmT      TTmT      TTmT      TTmT      TTmT      TTmT      TTmT        
+process                                  TT2eT     TT2mT     TT2mm     DY2TT     DY2mm     TT2me     W         TTbkg     ST        Dibosons  TT2TT     QCD_Tau
+process                                  -7        -4        -3        -2        -1        0         1         2         3         4         5         6        
+rate                                     -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  -1.0e+00  
+--------------------------------------------------------------------------------------------------------------
+CMS_btag_fixedWP_light_uncorrelated_2016preVFP          shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_btag_fixedWP_light_correlated          shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_btag_fixedWP_bc_jes              shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -          
+CMS_btag_fixedWP_bc_type3              shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -        
+CMS_btag_fixedWP_bc_pileup              shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -    
+CMS_btag_fixedWP_bc_uncorrelated_2016preVFP              shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -        
+
+CMS_scale_j_AbsoluteMPFBias       shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_AbsoluteScale      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_Fragmentation      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_PileUpDataMC      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_SinglePionECAL      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_SinglePionHCAL      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_AbsoluteStat_2016preVFP       shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativeStatFSR_2016preVFP        shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_TimePtEta_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_PileUpPtBB      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_PileUpPtEC1      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativePtBB      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativeJEREC1_2016preVFP       shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativePtEC1_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativeStatEC_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_PileUpPtEC2      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativeJEREC2_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativePtEC2_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativeBal      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_FlavorQCD      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativeSample_2016preVFP        shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativeJERHF      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativePtHF      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_PileUpPtHF  shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+ CMS_scale_j_PileUpPtRef  shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+ CMS_scale_j_RelativeFSR      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+CMS_scale_j_RelativeStatHF_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -
+
+CMS_l1_ecal_prefiring_2016preVFP shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       - 
+ CMS_l1_muon_prefiring shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       - 
+ CMS_l1_muon_prefiring_2016preVFP            shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_scale_met_unclustered_energy_2016preVFP        shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0             -
+CMS_TOP24016_m_dxy_2016preVFP            shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -      
+
+ CMS_pileup_13TeV         shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_scale_t_2016             shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_fake_t_DeepTau2017v2p1_VSe_2016preVFP           shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_fake_t_DeepTau2017v2p1_VSmu_2016preVFP          shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_stat1_DM0_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_stat1_DM10_2016preVFP     shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_stat1_DM11_2016preVFP     shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_stat1_DM1_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_stat2_DM0_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_stat2_DM10_2016preVFP     shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_stat2_DM11_2016preVFP     shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_stat2_DM1_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_syst_2016preVFP           shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_syst_alleras           shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_syst_DM0_2016preVFP       shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_syst_DM10_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_syst_DM11_2016preVFP      shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_eff_t_DeepTau2017v2p1_VSjet_dm_syst_DM1_2016preVFP       shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+CMS_TOP24016_Z_reweight              shape            -         1.0       1.0       1.0       -         -         -         1.0       1.0       -         1.0       -         
+
+CMS_TOP24016_eff_m_id_pt0_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt0_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt0_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt0_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt1_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt1_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt1_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt1_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt2_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt2_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt2_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt2_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt3_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt3_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt3_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt3_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt4_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt4_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt4_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt4_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt5_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt5_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt5_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_id_pt5_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_id_AltSig	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_id_massBin	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_id_massRange	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_id_tagIso	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt0_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt0_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt0_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt0_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt1_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt1_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt1_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt1_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt2_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt2_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt2_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt2_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt3_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt3_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt3_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt3_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt4_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt4_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt4_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt4_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt5_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt5_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt5_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_iso_pt5_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_iso_AltSig	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_iso_massBin	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_iso_massRange	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_iso_tagIso	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt0_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt0_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt0_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt0_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt1_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt1_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt1_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt1_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt2_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt2_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt2_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt2_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt3_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt3_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt3_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt3_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt4_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt4_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt4_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt4_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt5_eta0_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt5_eta1_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt5_eta2_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_TOP24016_eff_m_trigger_pt5_eta3_2016preVFP	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_trigger_AltSig	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_trigger_massBin	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+CMS_eff_m_trigger_massRange	shape          1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0       1.0   1.0 -     
+
+CMS_eff_m_iso_extrapolation shape	1.00       1.00       1.00       1.00       1.00       1.00       1.00       1.00       1.00       1.00   1.00 -    
+
+lumi_2016               lnN              1.010      1.010      1.010      1.010      1.010      1.010      1.010      1.010      1.010      1.010      1.010      -      
+lumi_13TeV_correlated   lnN             1.006     1.006     1.006     1.006     1.006     1.006     1.006     1.006     1.006     1.006     1.006     -    
+
+ps_isr_otherttbar         	shape            1.0       1.0       1.0       -        -       1.0      -       1.0       -       -       1.0      -         
+ps_fsr_otherttbar        	shape            1.0       1.0       1.0       -        -       1.0      -       1.0       -       -       1.0      -         
+QCDscale_ren_otherttbar      shape            1.0       1.0       1.0       -        -       1.0      -       1.0       -       -       1.0      -        
+QCDscale_fac_otherttbar      shape            1.0       1.0       1.0       -        -       1.0      -       1.0       -       -       1.0      -        
+
+ps_isr_DYJets         	shape            -       -       -        1.0       1.0       -      -      -       -       -       -      -         
+ps_fsr_DYJets      		shape            -       -       -        1.0       1.0       -      -      -       -       -       -      -         
+QCDscale_ren_DYJets        	shape            -       -       -        1.0       1.0       -      -      -       -       -       -      -         
+QCDscale_fac_DYJets        	shape            -       -        -       1.0       1.0       -      -      -       -       -       -      -             
+
+ps_isr_W         	shape            -       -       -        -		-       -      1.0      -       -       -       -      -         
+ps_fsr_W       		shape            -       -       -        -		-       -      1.0      -       -       -       -      -         
+QCDscale_ren_W        	shape            -       -       -       -		-       -      1.0      -       -       -       -      -         
+QCDscale_fac_W        	shape            -       -        -       -		-      -      1.0      -       -       -       -      -         
+
+
+ps_isr_VV         	shape            -       -        -	-       -       -      -      -       -       1.0       -	-	     
+ps_fsr_VV      		shape            -       -        -	-       -       -      -      -       -       1.0       -	-	
+
+ps_isr_singletop        shape            -       -       -       -        -       -      -      -       1.0       -       -      -         
+ps_fsr_singletop        shape             -       -       -       -        -       -      -      -       1.0       -       -      -        
+QCDscale_ren_singletop        shape       -       -       -       -        -       -      -      -       1.0       -       -      -        
+QCDscale_fac_singletop        shape       -       -       -       -        -       -      -      -       1.0       -       -      -        
+
+cross_section_VV             lnN              -         -         -         -         -         -         -         -         -         1.06      -         -         
+cross_section_singletop                   lnN              -         -         -         -         -         -         -         -         1.055     -         -         -         
+cross_section_ttbar2tautau                lnN              -         -         -         -         -         -         -         -     -         -         1.055         -    
+cross_section_ttbarsemilep                lnN              -         -         -         -         -         -         -         1.055     -         -         -         -    
+cross_section_W                    lnN              -         -         -         -         -         -         1.05      -         -         -         -         -         
+
+
+fake_t_normalization_2016preVFP_QCD_Tau             lnN      -         -         -         -         -         -         -         -         -         -         -        1.1
+
+fake_t_shape_2016pre_QCD_Tau        shape         -         -         -         -         -         -         -         -         -         -         -           1.0
+
+BR_tmnn           lnN              -         -         -         1.0022         -         -         -         -         -         -         1.0022         -
+* autoMCStats 20 1

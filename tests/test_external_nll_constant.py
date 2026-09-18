@@ -28,15 +28,16 @@ import os
 import tempfile
 
 import numpy as np
-from test_external_term import (
+import pytest
+
+from rabbit import external_likelihood
+from tests.test_external_term import (
     build_writer,
     loss_grad_hess_at,
     make_grad_hist,
     make_hess_hist,
     make_hess_sparsehist,
 )
-
-from rabbit import external_likelihood
 
 PARAM = "shape"  # the single systematic in build_writer's model
 TOL = 1e-9
@@ -55,10 +56,10 @@ def write(tmpdir, fname, **kwargs):
 def loss_at(filename, parms_ref, value, full=False):
     """Loss of ``filename`` with PARAM set to ``value``, everything else at 0."""
     import tensorflow as tf
-    from test_external_term import make_options
 
     from rabbit import fitter, inputdata
     from rabbit.param_models.helpers import load_model
+    from tests.test_external_term import make_options
 
     indata_obj = inputdata.FitInputData(filename)
     f = fitter.Fitter(indata_obj, load_model("Mu", indata_obj), make_options())
@@ -99,8 +100,17 @@ def test_gaussian_scalars_closed_form():
     print("  test_gaussian_scalars_closed_form OK")
 
 
-def test_term_equals_analytic_gaussian(sparse=False):
-    """loss(with term) - loss(without term) == the analytic Gaussian."""
+@pytest.mark.parametrize("sparse", [False, True])
+def test_term_equals_analytic_gaussian(sparse):
+    """loss(with term) - loss(without term) == the analytic Gaussian.
+
+    Parametrized rather than defaulted: pytest drops arguments that have a
+    default from its fixture lookup, so ``(sparse=False)`` collected as ONE
+    test and the sparse external-hessian path -- the case with ``const=`` and
+    ``lognorm=``, which this file exists to pin and test_external_term's
+    SparseHist config does not cover -- ran nowhere once main() stopped being
+    the CI entry point.
+    """
     mu_val, sigma = 0.6, 0.25
     H = np.array([[1.0 / sigma**2]])
     g = -H @ np.array([mu_val])

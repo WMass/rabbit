@@ -151,26 +151,18 @@ jobs:
         run: >- 
           python tests/symmetrizations.py -o $WEB_DIR/$PLOT_DIR/symmetrizations/ --titlePos 0 --fluctuate
 
-  unit-tests:
+  # The unit test job. It used to be a hand-maintained matrix of filenames
+  # invoked as `python tests/<file>`, which meant an unlisted file ran nowhere
+  # and nothing reported the omission -- 137 tests across eight files had
+  # accumulated unrun that way (issue #173). Collecting the directory instead
+  # makes coverage the default: a new test file is included from the moment it
+  # lands, with nothing to remember.
+  #
+  # tests/test_ci_registration.py fails if a test file is not collectable, or
+  # if this job stops running the whole directory.
+  all-unit-tests:
     runs-on: [self-hosted, linux, x64]
     needs: setenv
-    strategy:
-      fail-fast: false
-      matrix:
-        test:
-          - test_bbstat.py
-          - test_external_term.py
-          - test_global_asym_impacts.py
-          - test_blinding.py
-          - test_blinding_noi.py
-          - test_blinding_start_point.py
-          - test_saturated_blinding.py
-          - test_logk_no_copy.py
-          - test_multi_systematic.py
-          - test_ndfsat.py
-          - test_saturated_composite.py
-          - test_sharded_fit.py
-          - test_sparse_fit.py
 
     steps:
       - env:
@@ -186,8 +178,13 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
           echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
-      - name: run ${{ matrix.test }}
-        run: python tests/${{ matrix.test }}
+      # --continue-on-collection-errors because an import failure in one file
+      # otherwise aborts collection for the whole run and nothing executes --
+      # which is exactly what a missing PyYAML on this runner did the first
+      # time this job ran. The error is still reported and the job still
+      # fails; the other ~290 tests just get to run first.
+      - name: run the whole test suite
+        run: python -m pytest tests/ -q --continue-on-collection-errors
 
   make-tensor:
     runs-on: [self-hosted, linux, x64]
@@ -250,7 +247,7 @@ jobs:
 
   fitting:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, unit-tests, make-tensor]
+    needs: [setenv, all-unit-tests, make-tensor]
 
     steps:
       - env:
@@ -304,7 +301,7 @@ jobs:
 
   sparse-fits:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, unit-tests, make-tensor]
+    needs: [setenv, all-unit-tests, make-tensor]
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
@@ -328,7 +325,7 @@ jobs:
 
   alternative-fits:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, unit-tests, make-tensor]
+    needs: [setenv, all-unit-tests, make-tensor]
     strategy:
       fail-fast: false
       matrix:
@@ -421,7 +418,7 @@ jobs:
 
   regularization:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, unit-tests, make-tensor]
+    needs: [setenv, all-unit-tests, make-tensor]
     steps:
       - env:
           RABBIT_OUTDIR: ${{ needs.setenv.outputs.RABBIT_OUTDIR }}
@@ -452,7 +449,7 @@ jobs:
 
   bsm:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, unit-tests, make-tensor]
+    needs: [setenv, all-unit-tests, make-tensor]
 
     steps:
       - env:
@@ -579,7 +576,7 @@ jobs:
 
   likelihoodscans:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, unit-tests, make-tensor]
+    needs: [setenv, all-unit-tests, make-tensor]
 
     steps:
       - env:
@@ -646,7 +643,7 @@ jobs:
 
   abcd-fits:
     runs-on: [self-hosted, linux, x64]
-    needs: [setenv, unit-tests, make-abcd-tensors]
+    needs: [setenv, all-unit-tests, make-abcd-tensors]
 
     steps:
       - env:
