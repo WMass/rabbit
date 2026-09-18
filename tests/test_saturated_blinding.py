@@ -195,7 +195,7 @@ def build_saturated(f, blind, rearm=True, arm_regularizers_early=True):
 
 def _armed(f):
     """Is this fitter's frame actually offset? Guards every test below."""
-    return not np.allclose(f._blinding_offsets_poi_add.numpy(), 0.0, rtol=0, atol=1e-12)
+    return not np.allclose(f.blinding.offsets_poi_add.numpy(), 0.0, rtol=0, atol=1e-12)
 
 
 # --- 1. the leak --------------------------------------------------------------

@@ -108,21 +108,29 @@ def test_every_blinding_offset_is_threaded_to_the_shards():
     AttributeError at the first armed fit rather than a type error at import.
 
     _BLINDING_OFFSET_ATTRS is what the three threading sites iterate; this
-    pins it against what a blinded Fitter actually creates. Adding an offset to
-    the Fitter without listing it, or listing one the Fitter no longer has,
-    fails here instead of in somebody's fit.
+    pins it against what a blinded Fitter's Blinding actually creates. Adding
+    an offset without listing it, or listing one that no longer exists, fails
+    here instead of in somebody's fit -- and the same names must exist on
+    BlindingView, which is what each shard pins the threaded tensors onto.
     """
+    from rabbit.blinding import BlindingView
     from rabbit.sharding import _BLINDING_OFFSET_ATTRS
 
     with tempfile.TemporaryDirectory() as tmp:
         f = _make_fitter(make_test_tensor(tmp), 1, do_blinding=True)
 
-    created = {n for n in vars(f) if n.startswith("_blinding_offsets_")}
+    created = {n for n in vars(f.blinding) if n.startswith("offsets_")}
     assert created, "no offsets created; test is vacuous"
     assert created == set(_BLINDING_OFFSET_ATTRS), (
         "the offsets a blinded Fitter creates and the ones sharding threads have "
-        f"diverged: Fitter has {sorted(created)}, sharding threads "
+        f"diverged: Blinding has {sorted(created)}, sharding threads "
         f"{sorted(_BLINDING_OFFSET_ATTRS)}"
+    )
+    view = set(vars(BlindingView(True)))
+    missing = sorted(set(_BLINDING_OFFSET_ATTRS) - view)
+    assert not missing, (
+        f"BlindingView has no slot for {missing}, so a shard would evaluate "
+        "with a stale or absent offset while the Fitter applies one"
     )
 
 
@@ -717,10 +725,11 @@ _SHARDED_SAFE = {
     "set_blinding_offsets",
     "prefit_covariance",
     "edmval_cov",
-    # postfit verdict on the blinding width: reads the variance vector the
-    # driver already has, the POI offsets and the model's declared scales.
-    # All [nparams]-sized, no bin axis anywhere, so sharding cannot change it.
-    "warn_if_blinding_is_weak",
+    # postfit verdict on the blinding width, reached as fitter.blinding.*:
+    # reads the variance vector the driver already has, the POI offsets and
+    # the model's declared scales. All [nparams]-sized, no bin axis anywhere,
+    # so sharding cannot change it.
+    "warn_if_weak",
 }
 
 
@@ -952,12 +961,22 @@ def test_every_driver_called_fitter_method_is_classified_for_sharding():
 
     # `fitter.` in the driver is both the module and the instance, so keep
     # only names that are genuinely Fitter methods (drops fitter.make_fitter)
+    from rabbit.blinding import Blinding
     from rabbit.fitter import Fitter
 
     called = {
         m
         for m in re.findall(r"\bi?fitter\.([a-z_][a-zA-Z_0-9]*)\s*\(", driver)
         if callable(getattr(Fitter, m, None))
+    }
+    # Calls the driver makes on a Fitter COLLABORATOR reach the same fit state
+    # and have to be classified too: without this, moving a method off the
+    # Fitter -- as blinding's weak-smearing verdict was -- would drop it from
+    # the enumeration rather than force a decision about it.
+    called |= {
+        m
+        for m in re.findall(r"\bi?fitter\.blinding\.([a-z_][a-zA-Z_0-9]*)\s*\(", driver)
+        if callable(getattr(Blinding, m, None))
     }
     # MultiDeviceFitter handles a name by defining it, or by rebinding it as an
     # instance attribute in _make_tf_functions

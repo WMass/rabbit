@@ -47,6 +47,7 @@ from wums import logging
 
 from rabbit import external_likelihood
 from rabbit.bbstat.bbstat import BinByBinStat
+from rabbit.blinding import BlindingView
 from rabbit.fitter import Fitter
 
 logger = logging.child_logger(__name__)
@@ -288,17 +289,18 @@ def shard_edges(nbins, n):
 # them explicitly -- and as a tensor, because XLA cannot read a Variable that
 # lives on another device.
 #
-# Listed once rather than at each of the three sites that thread them: a Fitter
-# that grows or drops an offset would otherwise have to be matched in all three,
-# and missing one is silent until the first armed sharded fit. That is exactly
-# how _blinding_offsets_poi_add arrived -- added to get_poi() on main, threaded
-# nowhere. test_sharded_fit.py checks this tuple against what a blinded Fitter
-# actually creates, which is how the reverse direction was caught too: #174
-# dropped the multiplicative _blinding_offsets_poi, and a list naming an
-# attribute the Fitter no longer has fails just as loudly as a missing one.
+# Listed once rather than at each of the three sites that thread them: a
+# Blinding that grows or drops an offset would otherwise have to be matched in
+# all three, and missing one is silent until the first armed sharded fit. That
+# is exactly how the additive POI offset arrived -- added to get_poi() on main,
+# threaded nowhere. test_sharded_fit.py checks this tuple against what a
+# blinded Fitter's Blinding actually creates, which is how the reverse
+# direction was caught too: #174 dropped the multiplicative offset, and a list
+# naming an attribute that no longer exists fails just as loudly as a missing
+# one.
 _BLINDING_OFFSET_ATTRS = (
-    "_blinding_offsets_poi_add",
-    "_blinding_offsets_theta",
+    "offsets_poi_add",
+    "offsets_theta",
 )
 
 
@@ -489,6 +491,10 @@ class MultiDeviceFitter(Fitter):
             # per-shard functions as arguments instead (see
             # _make_sharded_tf_functions), the same way x is.
             shard.do_blinding = self.do_blinding
+            # Same contract as the Fitter's Blinding, but the offsets are
+            # pinned per call as tensors rather than read from Variables
+            # (see _pin in _make_tf_functions).
+            shard.blinding = BlindingView(self.do_blinding)
             shard.chisqFit = self.chisqFit
             shard.covarianceFit = False
             shard.data_cov_inv = None
@@ -503,9 +509,7 @@ class MultiDeviceFitter(Fitter):
         gview.param_model = self.param_model
         gview.frozen_params_mask = self.frozen_params_mask
         gview.do_blinding = self.do_blinding
-        if self.do_blinding:
-            for _name in _BLINDING_OFFSET_ATTRS:
-                setattr(gview, _name, getattr(self, _name))
+        gview.blinding = self.blinding
         gview.cw = self.cw
         gview.x0 = self.x0
         for name in ("get_poi", "get_model_nui", "get_theta", "get_x", "_compute_lc"):
@@ -749,7 +753,7 @@ class MultiDeviceFitter(Fitter):
                 shard.frozen_params_mask = aux[0]
                 if shard.do_blinding:
                     for _k, _name in enumerate(_BLINDING_OFFSET_ATTRS, start=1):
-                        setattr(shard, _name, aux[_k])
+                        setattr(shard.blinding, _name, aux[_k])
 
             def nll_local(x, aux):
                 _pin(x, aux)
@@ -869,7 +873,7 @@ class MultiDeviceFitter(Fitter):
             aux = [tf.identity(self.frozen_params_mask)]
             if self.do_blinding:
                 aux.extend(
-                    tf.identity(getattr(self, _name))
+                    tf.identity(getattr(self.blinding, _name))
                     for _name in _BLINDING_OFFSET_ATTRS
                 )
             return tuple(aux)

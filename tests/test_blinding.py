@@ -162,7 +162,7 @@ def test_model_sees_the_offset_while_x_does_not(path):
     fb.defaultassign()
     fb.set_blinding_offsets(True)
 
-    add = float(fb._blinding_offsets_poi_add[0].numpy())
+    add = float(fb.blinding.offsets_poi_add[0].numpy())
     assert add != 0.0, "vacuous: POI was not blinded"
 
     assert np.isclose(float(fb.x[0].numpy()), START, rtol=0, atol=1e-12)
@@ -254,8 +254,8 @@ def test_additive_scale_multiplies_the_draw(path):
         make_options(),
         do_blinding=True,
     )
-    off_base = base._blinding_values_poi_add[0]
-    off_scaled = scaled._blinding_values_poi_add[0]
+    off_base = base.blinding.values_poi_add[0]
+    off_scaled = scaled.blinding.values_poi_add[0]
 
     assert off_base != 0.0, "vacuous: the unscaled draw is already zero"
     assert np.isclose(off_scaled, 1000.0 * off_base, rtol=1e-12, atol=0)
@@ -273,7 +273,7 @@ def test_default_scale_is_the_historical_draw(path):
         make_options(),
         do_blinding=True,
     )
-    assert implicit._blinding_values_poi_add[0] == explicit._blinding_values_poi_add[0]
+    assert implicit.blinding.values_poi_add[0] == explicit.blinding.values_poi_add[0]
 
 
 def _postfit_variances(f, ind):
@@ -329,7 +329,7 @@ def test_weak_blinding_is_reported_against_the_measured_uncertainty(path, caplog
     f.set_blinding_offsets(True)
     var = _postfit_variances(f, ind)
     with caplog.at_level("WARNING"):
-        f.warn_if_blinding_is_weak(var)
+        f.blinding.warn_if_weak(var)
     assert any(MSG in r.message for r in caplog.records)
 
     # and an ample one
@@ -341,7 +341,7 @@ def test_weak_blinding_is_reported_against_the_measured_uncertainty(path, caplog
     f2.set_blinding_offsets(True)
     var2 = _postfit_variances(f2, ind)
     with caplog.at_level("WARNING"):
-        f2.warn_if_blinding_is_weak(var2)
+        f2.blinding.warn_if_weak(var2)
     assert not any(MSG in r.message for r in caplog.records)
 
 
@@ -362,12 +362,12 @@ def test_the_weak_blinding_warning_does_not_leak_the_secret(path, caplog):
     var = _postfit_variances(f, ind)
 
     with caplog.at_level("WARNING"):
-        f.warn_if_blinding_is_weak(var)
+        f.blinding.warn_if_weak(var)
     msgs = [r.message for r in caplog.records if MSG in r.message]
     assert msgs, "warning did not fire; test is vacuous"
     text = " ".join(msgs)
 
-    offset = abs(float(f._blinding_values_poi_add[0]))
+    offset = abs(float(f.blinding.values_poi_add[0]))
     sigma = float(np.sqrt(var[0]))
     assert offset > 0.0 and sigma > 0.0, "vacuous: nothing drawn or no curvature"
 
@@ -393,7 +393,7 @@ def test_the_verdict_follows_the_measured_sigma_not_just_the_scale(path, caplog)
     different statistics would make the test depend on the fit as well as on
     the criterion.
     """
-    from rabbit.fitter import BLINDING_DRAW_STD
+    from rabbit.blinding import BLINDING_DRAW_STD
 
     ind = inputdata.FitInputData(path)
     f = fitter.Fitter(
@@ -401,7 +401,7 @@ def test_the_verdict_follows_the_measured_sigma_not_just_the_scale(path, caplog)
     )
     f.defaultassign()
     f.set_blinding_offsets(True)
-    assert float(f._blinding_offsets_poi_add[0].numpy()) != 0.0, "vacuous: not blinded"
+    assert float(f.blinding.offsets_poi_add[0].numpy()) != 0.0, "vacuous: not blinded"
 
     n = int(f.x.shape[0])
     smearing = BLINDING_DRAW_STD * 1.0
@@ -410,14 +410,14 @@ def test_the_verdict_follows_the_measured_sigma_not_just_the_scale(path, caplog)
     tight = np.full(n, (smearing / 500.0) ** 2)
     caplog.clear()
     with caplog.at_level("WARNING"):
-        f.warn_if_blinding_is_weak(tight)
+        f.blinding.warn_if_weak(tight)
     assert not any(MSG in r.message for r in caplog.records)
 
     # sigma well above it: the same smearing now hides nothing
     loose = np.full(n, (smearing * 20.0) ** 2)
     caplog.clear()
     with caplog.at_level("WARNING"):
-        f.warn_if_blinding_is_weak(loose)
+        f.blinding.warn_if_weak(loose)
     assert any(MSG in r.message for r in caplog.records)
 
 
@@ -437,11 +437,11 @@ def test_an_unblinded_poi_is_not_reported_as_weakly_blinded(path, caplog):
     )
     f.defaultassign()
     f.set_blinding_offsets(True)
-    assert float(f._blinding_offsets_poi_add[0].numpy()) == 0.0
+    assert float(f.blinding.offsets_poi_add[0].numpy()) == 0.0
     var = _postfit_variances(f, ind)
 
     with caplog.at_level("WARNING"):
-        f.warn_if_blinding_is_weak(var)
+        f.blinding.warn_if_weak(var)
     assert not any(MSG in r.message for r in caplog.records)
 
 
@@ -453,7 +453,7 @@ def _composite_offsets(path, models):
     ind = inputdata.FitInputData(path)
     composite = CompositeParamModel([m(ind) for m in models])
     f = fitter.Fitter(ind, composite, make_options(), do_blinding=True)
-    return composite, f._blinding_values_poi_add
+    return composite, f.blinding.values_poi_add
 
 
 def test_composite_preserves_a_declared_scale(path):
@@ -493,10 +493,10 @@ def test_scale_is_per_poi_not_one_composite_value(path):
     ind = inputdata.FitInputData(path)
     solo_a = fitter.Fitter(
         ind, ToyModel(ind), make_options(), do_blinding=True
-    )._blinding_values_poi_add[0]
+    ).blinding.values_poi_add[0]
     solo_b = fitter.Fitter(
         ind, SecondToyModel(ind), make_options(), do_blinding=True
-    )._blinding_values_poi_add[0]
+    ).blinding.values_poi_add[0]
     assert np.isclose(off[0], 7.0 * solo_a, rtol=1e-12, atol=0)
     assert np.isclose(off[1], 0.5 * solo_b, rtol=1e-12, atol=0)
 

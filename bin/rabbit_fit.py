@@ -1006,7 +1006,7 @@ def fit(args, fitter, ws, dofit=True):
     # --noHessian, which is all this needs -- so the check costs nothing and
     # works in either. Entries left NaN are skipped.
     if fitter.do_blinding:
-        fitter.warn_if_blinding_is_weak(parms_variances)
+        fitter.blinding.warn_if_weak(parms_variances)
 
     nllvalreduced = fitter.reduced_nll().numpy()
 
