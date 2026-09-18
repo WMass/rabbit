@@ -38,6 +38,8 @@ from a plain subprocess, where pulling in TensorFlow costs minutes.
 
 import contextlib
 import os
+import pathlib
+import re
 import signal
 import threading
 
@@ -75,6 +77,28 @@ def write_snapshot(filename, parms, x, meta=None):
         for key, value in (meta or {}).items():
             f.attrs[key] = value
     os.replace(tmp, filename)
+
+
+def sibling_snapshot_path(filename, tag):
+    """``filename`` with ``tag`` appended to its stem, or None if None.
+
+    For a nested fit that must not write to its parent's snapshot. Sharing one
+    path is not a cosmetic clash: the two fits have different parameter
+    LAYOUTS, so the nested one's vector both destroys a converged snapshot that
+    was the only record of the parent's minimum, and is not loadable by
+    ``--externalPostfit`` into the parent's fit -- while ``_write`` cheerfully
+    advises exactly that. Keeping a path (rather than passing None) preserves
+    crash protection for the nested fit, which can be the dominant cost of a
+    postfit.
+
+    ``tag`` is sanitised, since callers derive it from things like a mapping
+    key that may carry spaces.
+    """
+    if filename is None:
+        return None
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", str(tag)).strip("_")
+    path = pathlib.Path(filename)
+    return str(path.with_name(f"{path.stem}_{safe}{path.suffix}"))
 
 
 class Snapshotter:
