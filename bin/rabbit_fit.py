@@ -818,9 +818,20 @@ def fit(args, fitter, ws, dofit=True):
                 "computes neither the covariance nor its POI rows."
             )
         if not args.noEDM and not args.noHessian:
-            # compute the covariance matrix and estimated distance to minimum
+            # compute the covariance matrix and estimated distance to minimum.
+            # These two calls are the whole postfit "silence": one full Hessian
+            # plus its inversion, with no output until `edmval` below. Timed
+            # separately so a slow postfit can be attributed without bisecting
+            # flags across 30-minute runs.
+            _t_hess = time.perf_counter()
             _, grad, hess = fitter.loss_val_grad_hess()
+            logger.debug(
+                f"[timing] loss_val_grad_hess() (postfit cov): "
+                f"{time.perf_counter() - _t_hess:.1f} s"
+            )
+            _t_edm = time.perf_counter()
             edmval, cov = fitter.edmval_cov(grad, hess)
+            logger.debug(f"[timing] edmval_cov(): {time.perf_counter() - _t_edm:.1f} s")
             logger.info(f"edmval: {edmval}")
 
             ws.add_cov_hist(cov)
@@ -838,7 +849,11 @@ def fit(args, fitter, ws, dofit=True):
                 logger.info(f"edmvalbeta: {edmvalbeta}")
 
             if args.doImpacts:
+                _t_imp = time.perf_counter()
                 ws.add_impacts_hists(*fitter.impacts_parms(hess))
+                logger.debug(
+                    f"[timing] impacts_parms(): {time.perf_counter() - _t_imp:.1f} s"
+                )
 
             del hess
 
@@ -932,10 +947,15 @@ def fit(args, fitter, ws, dofit=True):
                 f"without {' / '.join(skipped) if skipped else '--noHessian / --noEDM'}."
             )
         if args.globalImpacts:
+            _t_gimp = time.perf_counter()
             ws.add_impacts_hists(
                 *fitter.global_impacts_parms(),
                 base_name="global_impacts",
                 global_impacts=True,
+            )
+            logger.debug(
+                f"[timing] global_impacts_parms(): "
+                f"{time.perf_counter() - _t_gimp:.1f} s"
             )
         if args.gaussianGlobalImpacts:
             ws.add_impacts_hists(
@@ -1414,6 +1434,10 @@ def main():
                     fit_time.append(time.time())
 
                     if args.saveHists:
+                        # Timed because this is where --computeSaturatedProjectionTests
+                        # runs its OWN nested fit per projection mapping, which can
+                        # dominate the postfit and is otherwise invisible.
+                        _t_sh = time.perf_counter()
                         save_hists(
                             args,
                             mappings,
@@ -1422,6 +1446,10 @@ def main():
                             prefit=False,
                             profile=not args.noPostfitProfileBB,
                             blind=blinded_fits[i],
+                        )
+                        logger.debug(
+                            f"[timing] save_hists() (postfit, incl. saturated "
+                            f"tests): {time.perf_counter() - _t_sh:.1f} s"
                         )
                 else:
                     fit_time.append(time.time())
