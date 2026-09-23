@@ -174,7 +174,7 @@ def test_offset_is_not_recoverable_from_the_prefit_coordinate(path):
     f.set_blinding_offsets(True)
 
     npoi = f.param_model.npoi
-    armed = f._blinding_offsets_poi_add.numpy()[:npoi]
+    armed = f.blinding.offsets_poi_add.numpy()[:npoi]
     assert not np.allclose(armed, 0.0), "offset is the identity; test is vacuous"
 
     leak = f.x0default.numpy()[:npoi] - f.x.numpy()[:npoi]

@@ -487,7 +487,7 @@ def test_bin_scales_are_exempt_from_blinding(tensor_path):
     sat, composite, fs = build_saturated(f, True)
     sl = slice(1, 1 + sat.npoi)
 
-    add = fs._blinding_offsets_poi_add.numpy()
+    add = fs.blinding.offsets_poi_add.numpy()
 
     # the analysis POI IS blinded, or the exemption below proves nothing
     assert abs(add[0]) > 1e-6
@@ -552,8 +552,8 @@ def test_declared_scale_survives_the_saturated_composite(tensor_path):
     f_plain = fitter.Fitter(ind, comp_plain, make_options(), do_blinding=True)
     f_scaled = fitter.Fitter(ind, comp_scaled, make_options(), do_blinding=True)
 
-    off_plain = f_plain._blinding_values_poi_add[0]
-    off_scaled = f_scaled._blinding_values_poi_add[0]
+    off_plain = f_plain.blinding.values_poi_add[0]
+    off_scaled = f_scaled.blinding.values_poi_add[0]
 
     assert off_plain != 0.0, "vacuous: the analysis POI is not being offset"
     assert np.isclose(off_scaled, 7.0 * off_plain, rtol=1e-12, atol=0)
@@ -585,7 +585,7 @@ def test_a_start_the_model_cannot_evaluate_is_refused(tensor_path):
 
     # ToyModel scales by 1 + 0.1 * poi, so anything past -10 drives the yields
     # negative whatever the seed produced
-    f._blinding_values_poi_add[0] = -50.0
+    f.blinding.values_poi_add[0] = -50.0
     with pytest.raises(RuntimeError, match="non-finite likelihood"):
         f.set_blinding_offsets(True)
 
@@ -598,7 +598,7 @@ def test_an_evaluable_start_arms_cleanly(tensor_path):
     f.defaultassign()
     f.set_nobs(f.expected_yield())
 
-    f._blinding_values_poi_add[0] = 2.0
+    f.blinding.values_poi_add[0] = 2.0
     f.set_blinding_offsets(True)
     assert np.isfinite(float(f.reduced_nll().numpy()))
 

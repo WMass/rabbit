@@ -21,6 +21,39 @@ def natural_sort_dict(dictionary):
     return sorted_dict
 
 
+def match_regexp_params(regular_expressions, parameter_names):
+    # Match parameter names against a list of expressions where each entry may
+    # be either an exact parameter name or a regex matched against the FULL
+    # parameter name (re.fullmatch). Full anchoring means an expression that
+    # names one parameter exactly can never also match parameters whose names
+    # merely extend it (important for --unblind, where a prefix match would
+    # silently unblind more than intended); match a family of parameters with
+    # an explicit pattern, e.g. 'alphaS.*'. Returns the union of exact and
+    # regex matches, preserving the parameter_names order and de-duplicating.
+    # Mixing exact and regex entries in the same call is supported.
+    #
+    # Lives here rather than in fitter.py because both the Fitter (freezing,
+    # systematic selection) and rabbit.blinding resolve user expressions to
+    # parameters, and blinding cannot import the Fitter it is a collaborator of.
+    if isinstance(regular_expressions, str):
+        regular_expressions = [regular_expressions]
+
+    exact_lookup = set(regular_expressions)
+    compiled_expressions = [re.compile(expr) for expr in regular_expressions]
+
+    matched = []
+    seen = set()
+    for s in parameter_names:
+        decoded = s.decode() if hasattr(s, "decode") else s
+        if decoded in exact_lookup or any(
+            r.fullmatch(decoded) for r in compiled_expressions
+        ):
+            if decoded not in seen:
+                seen.add(decoded)
+                matched.append(s)
+    return matched
+
+
 def load_class_from_module(class_name, class_module_dict, base_dir):
     if "." in class_name:
         # import from full relative or abslute path

@@ -18,7 +18,7 @@ THE FORM, FROM THE CODE. ``get_theta`` is
 
 with no transform in front of it, unlike ``get_poi``, whose squaring branch
 applies after the offset. Only nuisances OF INTEREST carry a non-zero offset --
-``init_blinding_values`` loops over ``indata.noiidxs`` -- so an ordinary
+``Blinding`` loops over ``indata.noiidxs`` -- so an ordinary
 constrained nuisance is untouched.
 
 THE CONSTRAINT TERM IS THE THING TO GET RIGHT. ``_compute_lc`` penalises
@@ -96,7 +96,7 @@ class OnePoiModel(NoPoiModel):
 def make_tensor(path, constrained=True):
     """One NOI (constrained or not) plus one ordinary constrained nuisance.
 
-    The ordinary one is the control: ``init_blinding_values`` only offsets
+    The ordinary one is the control: ``Blinding`` only offsets
     ``indata.noiidxs``, so an ordinary nuisance must never be offset.
     """
     np.random.seed(1234)
@@ -189,7 +189,7 @@ def _xtheta(f):
 def _blinded(f):
     """Is this NOI actually offset? Guards every check below against vacuity."""
     return not np.isclose(
-        float(f._blinding_offsets_theta[_inoi(f)].numpy()), 0.0, rtol=0, atol=1e-9
+        float(f.blinding.offsets_theta[_inoi(f)].numpy()), 0.0, rtol=0, atol=1e-9
     )
 
 
@@ -337,7 +337,7 @@ def test_arming_costs_prefit_penalty_but_does_not_move_the_minimum(path):
     f.set_nobs(asimov)
     lc_armed = float(f._compute_lc().numpy())
 
-    off = float(f._blinding_offsets_theta[_inoi(f)].numpy())
+    off = float(f.blinding.offsets_theta[_inoi(f)].numpy())
     assert np.isclose(lc_armed - lc_disarmed, 0.5 * off**2, rtol=1e-6, atol=1e-9)
 
 
