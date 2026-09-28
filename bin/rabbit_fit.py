@@ -407,32 +407,18 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
             if saturated_indices is not None:
                 # saturated likelihood test
 
-                # Adopt the analysis model's positivity convention.
-                #
-                # The bin scales must stay positive either way (a negative one
-                # sends the expected yield negative and the Poisson log() to
-                # NaN). SaturatedProjectModel's default allowNegativeParam=False
-                # asks the FITTER to guarantee that by squaring the POI block --
-                # but the fitter applies one transform to the WHOLE block, so
-                # that is only available when the analysis model wants it too.
-                # Any model declaring allowNegativeParam=True (a POI that is a
-                # physical parameter, and/or one blinded additively -- and also
-                # plain `Mu --allowNegativeParam`) therefore made
-                # CompositeParamModel reject the mix, i.e. the projected
-                # saturated test was unreachable for those analyses.
-                #
-                # Passing the analysis model's flag through makes the two
-                # submodels agree by construction: with False nothing changes
-                # (the fitter squares the whole block, exactly as before), and
-                # with True SaturatedProjectModel squares its own slice inside
-                # compute() instead. Self-squaring is also the only form that
-                # composes with ADDITIVE POI blinding, since it happens after
-                # the offset is applied rather than before.
+                # The bin scales are POUs of the composite, appended after the
+                # analysis model's own POUs:
+                #   main      [poi_o | pou_o | theta]
+                #   composite [poi_o | pou_o | pou_sat | theta]
+                # so the analysis model's block stays contiguous at
+                # [0 : orig.nparams]. Being POUs they are neither blinded nor
+                # squared by the Fitter (SaturatedProjectModel squares them
+                # itself), so they compose with any analysis model.
                 saturated_model = param_model.SaturatedProjectModel(
                     fitter.indata,
                     mapping.channel_info,
                     saturated_indices,
-                    allowNegativeParam=fitter.param_model.allowNegativeParam,
                 )
                 composite_model = param_model.CompositeParamModel(
                     [fitter.param_model, saturated_model]
@@ -455,11 +441,9 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 )
 
                 # preserve the (possibly toy-randomized) constraint centers
-                # across the re-init: the theta block maps 1:1, and the
-                # original model's prior centers land at [0:npoi] and
-                # [composite.npoi : composite.npoi+npou] in the composite
-                # [POIs | POUs] layout; the saturated model's own params keep
-                # the freshly initialized centers
+                # across the re-init: the theta block and the original model's
+                # block [0 : orig.nparams] map 1:1; the saturated model's own
+                # params keep the freshly initialized centers
                 orig_model = fitter_saturated.param_model
                 toy_x0 = tf.identity(fitter_saturated.x0.value())
                 saved_regularizers = fitter_saturated.regularizers
@@ -474,14 +458,9 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 fitter_saturated.x0[composite_model.nparams :].assign(
                     toy_x0[orig_model.nparams :]
                 )
-                if orig_model.npoi > 0:
-                    fitter_saturated.x0[: orig_model.npoi].assign(
-                        toy_x0[: orig_model.npoi]
-                    )
-                if orig_model.npou > 0:
-                    fitter_saturated.x0[
-                        composite_model.npoi : composite_model.npoi + orig_model.npou
-                    ].assign(toy_x0[orig_model.npoi : orig_model.nparams])
+                fitter_saturated.x0[: orig_model.nparams].assign(
+                    toy_x0[: orig_model.nparams]
+                )
                 fitter_saturated.regularizers = saved_regularizers
                 fitter_saturated.tau.assign(saved_tau)
 
@@ -516,10 +495,9 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 # results[...]["saturated_fit"]["parms"], silently unblinding
                 # any analysis that asked for this test.
                 #
-                # The bin scales are unaffected either way: SaturatedProjectModel
-                # declares them blind_exempt, so they are never offset and open
-                # at the 1.0 the warm start below requires. Pinned by
-                # tests/test_saturated_blinding.py.
+                # The bin scales are unaffected either way: they are POUs, which
+                # are never offset, so they open at the 1.0 the warm start below
+                # requires. Pinned by tests/test_saturated_blinding.py.
                 if fitter_saturated.do_blinding:
                     fitter_saturated.set_blinding_offsets(blind=blind)
 
@@ -537,10 +515,8 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 # construction, so q >= 0 is guaranteed and the statistic reads
                 # as "what do these free bin scales buy from HERE".
                 #
-                # The permutation is the one used for x0 just above:
-                #   main      [poi_o | pou_o | theta]
-                #   composite [poi_o | poi_sat | pou_o | theta]
-                # x is the internal (blinded) coordinate on both sides, so the
+                # The layout is the one used for x0 just above. x is the
+                # internal (blinded) coordinate on both sides, so the
                 # entries copy verbatim without a frame conversion. That rests
                 # on the two fitters offsetting each shared parameter name
                 # IDENTICALLY: the draw is seeded by name, and
@@ -550,23 +526,17 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 # x would land at a different PHYSICAL point and the loss
                 # equality below would quietly stop holding.
                 x_main = fitter.x.numpy()
-                if orig_model.npoi > 0:
-                    fitter_saturated.x[: orig_model.npoi].assign(
-                        x_main[: orig_model.npoi]
-                    )
-                if orig_model.npou > 0:
-                    fitter_saturated.x[
-                        composite_model.npoi : composite_model.npoi + orig_model.npou
-                    ].assign(x_main[orig_model.npoi : orig_model.nparams])
+                fitter_saturated.x[: orig_model.nparams].assign(
+                    x_main[: orig_model.nparams]
+                )
                 fitter_saturated.x[composite_model.nparams :].assign(
                     x_main[orig_model.nparams :]
                 )
 
-                # The composite re-init reordered and resized the parameter
-                # vector (one POI per projected bin, appended AFTER the
-                # original model's POIs -- see the layout diagram above), so
-                # regularizers must be re-armed or they read the wrong
-                # entries. xdefaultassign() above is deliberate but does not
+                # The composite re-init resized the parameter vector (one POU
+                # per projected bin, inserted before the thetas -- see the
+                # layout diagram above), so regularizers must be re-armed or
+                # they read the wrong entries. xdefaultassign() above is deliberate but does not
                 # arm them.
                 fitter_saturated.arm_regularizers()
                 cb = fitter_saturated.minimize()
@@ -588,7 +558,7 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
 
                 nllvalreduced = fitter_saturated.reduced_nll().numpy()
 
-                ndf = saturated_model.npoi
+                ndf = saturated_model.npou
                 chi2val = 2.0 * (ws.results["nllvalreduced"] - nllvalreduced)
                 p_val = chi2.sf(chi2val, ndf)
 

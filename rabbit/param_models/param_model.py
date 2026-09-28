@@ -38,10 +38,8 @@ class ParamModel:
         # # optional: declare that this model's POIs are NOT results and must
         # # never be blinded -- auxiliary parameters that absorb something
         # # rather than quantities anyone is keeping from the analyst.
-        # # SaturatedProjectModel's per-bin scales are the case this exists
-        # # for: they would be blinded only as a side effect of sharing a POI
-        # # block with the analysis model, and a blinded bin scale does not
-        # # open at the 1.0 the saturated test requires of it.
+        # # (Parameters that are not results are usually better declared as
+        # # POUs, which are never blinded, as SaturatedProjectModel does.)
         # #
         # # CompositeParamModel turns the declarations of its submodels into
         # # `blind_exempt_params`, the NAMES of the exempt parameters, because
@@ -184,7 +182,8 @@ class CompositeParamModel(ParamModel):
                 f"{names.get(False)}). A submodel that needs positivity "
                 "inside a permissive composite must declare "
                 "allowNegativeParam=True and enforce it in its own compute(), "
-                "as AxisNormModel and SaturatedProjectModel do."
+                "as AxisNormModel does, or declare its parameters as POUs, "
+                "as SaturatedProjectModel does."
             )
         derived = next(iter(poi_flags)) if poi_flags else None
         if allowNegativeParam is None:
@@ -474,6 +473,17 @@ class SaturatedProjectModel(ParamModel):
     Add one free parameter for each bin of the mapping output, applied to all bins of the
     input data contributing to it. Bins that do not enter the mapping are left at one.
 
+    The bin scales are auxiliary free parameters, not results, so they are
+    declared as POUs (``npoi = 0``). That keeps them out of everything the
+    Fitter does to the POI block: they are never blinded, and they never take
+    part in its squaring transform, so ``CompositeParamModel`` does not ask
+    them to agree with the analysis model on ``allowNegativeParam``.
+
+    The scales multiply YIELDS, so a negative one sends the expected yield
+    negative and the Poisson log() to NaN. Positivity is therefore enforced
+    here rather than borrowed from the Fitter: the parameters are stored as
+    sqrt(scale) and squared in compute().
+
     Parameters
     ----------
     channel_info : dict
@@ -482,29 +492,6 @@ class SaturatedProjectModel(ParamModel):
         For each channel of the input data that enters the mapping, the flat index of the
         output bin each of its bins contributes to, and -1 for bins that are not used,
         as returned by 'Mapping.output_indices()'.
-    allowNegativeParam : bool
-        WHO enforces positivity of the bin scales, not whether it is enforced.
-        The scales multiply YIELDS, so a negative one sends the expected yield
-        negative and the Poisson log() to NaN; the parameters are therefore
-        always stored as sqrt(scale) and the physical space is always
-        [0, inf).
-
-        ``False`` (the default, and the historical behaviour) asks the Fitter
-        to do the squaring, via its transform of the POI block. ``True`` means
-        "pass my slice through raw, I square it myself in compute()" -- the
-        same contract :class:`AxisNormModel` documents.
-
-        The distinction exists because the Fitter applies ONE transform to the
-        WHOLE POI block, so ``False`` is unavailable as soon as this model is
-        composited (by ``--computeSaturatedProjectionTests``) with an analysis
-        model that needs ``allowNegativeParam=True`` -- a POI that is a
-        physical parameter, e.g. alpha_s, and/or one blinded additively.
-        ``CompositeParamModel`` rejects such a mix. Self-squaring also
-        composes correctly with ADDITIVE POI blinding, which the Fitter's
-        transform does not: blinding is applied to the value handed to
-        compute(), so squaring afterwards keeps the scale positive for any
-        offset, whereas squaring first leaves ``x**2 + offset`` free to go
-        negative.
     """
 
     def __init__(
@@ -513,7 +500,6 @@ class SaturatedProjectModel(ParamModel):
         channel_info,
         indices,
         expectSignal=None,
-        allowNegativeParam=False,
         **kwargs,
     ):
         self.indata = indata
@@ -531,8 +517,8 @@ class SaturatedProjectModel(ParamModel):
                     "unconstrained and the number of degrees of freedom is overestimated"
                 )
 
-        self.npoi = int(sum(self.nbins_channel.values()))
-        self.npou = 0
+        self.npoi = 0
+        self.npou = int(sum(self.nbins_channel.values()))
 
         # bins of the input data that are not used by the mapping point to one extra
         #   parameter that is kept at one
@@ -556,30 +542,17 @@ class SaturatedProjectModel(ParamModel):
 
         self.params = np.array(names)
 
-        self.allowNegativeParam = allowNegativeParam
+        # no POIs, so there is nothing for the Fitter to transform
+        self.allowNegativeParam = True
 
-        # allowNegativeParam=True => the Fitter does not transform this slice,
-        # so compute() squares it here instead. See the class docstring: the
-        # bin scales are positive in BOTH branches, only the owner of the
-        # transform differs.
-        # The bin scales are the saturated test's own machinery, not a
-        # measurement: there is nothing in them to hide. Say so, because
-        # compositing them with a blinded analysis model would otherwise blind
-        # them too, and a blinded bin scale does not open at 1.0 -- which is
-        # exactly what the warm start in rabbit_fit.py requires of it.
-        self.blind_exempt = True
-
-        self._square_internally = bool(allowNegativeParam)
-
-        # x -> x**2 in either branch, so the model is never linear in its
-        # stored parameters. (Identical to the previous expression for the
-        # default allowNegativeParam=False.)
+        # x -> x**2 in compute(), so the model is never linear in its stored
+        # parameters
         self.is_linear = self.nparams == 0
 
-        # Store sqrt(default) regardless of which branch squares, so both open
-        # at the same physical point. allowNegativeParam=False selects the
-        # sqrt in set_param_default; it is passed literally, not forwarded.
-        self.set_param_default(expectSignal, allowNegativeParam=False)
+        # set_param_default only takes the sqrt of the POI block, so take it
+        # here for the POUs: compute() squares them back
+        self.set_param_default(expectSignal)
+        self.xparamdefault = tf.sqrt(self.xparamdefault)
 
     def compute(self, param, full=False):
         start = 0
@@ -590,12 +563,9 @@ class SaturatedProjectModel(ParamModel):
 
             if k in self.indices.keys():
                 nbins = self.nbins_channel[k]
-                iscale = param[start : start + nbins]
-                if self._square_internally:
-                    iscale = tf.square(iscale)
                 iparam = tf.concat(
                     [
-                        iscale,
+                        tf.square(param[start : start + nbins]),
                         # the trailing entry is the scale of the input bins the
                         # mapping does not use: a physical 1, never squared
                         tf.ones([1], dtype=self.indata.dtype),

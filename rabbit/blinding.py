@@ -281,9 +281,8 @@ class Blinding(_OffsetApplication):
         )
 
         # Parameters the MODEL declares exempt, on top of whatever --unblind
-        # asked for. These are auxiliary quantities that are not results (the
-        # saturated test's per-bin scales), so blinding them buys nothing and
-        # costs them their declared start point.
+        # asked for. These are auxiliary quantities that are not results, so
+        # blinding them buys nothing and costs them their declared start point.
         exempt = getattr(self.param_model, "blind_exempt_params", None)
         if exempt is None and getattr(self.param_model, "blind_exempt", False):
             exempt = self.param_model.params[: self.param_model.npoi]

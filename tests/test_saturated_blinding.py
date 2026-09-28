@@ -11,10 +11,9 @@ silently before the commits this file ships with.
    test on data was unblinding itself in its own output file.
 
 2. THE WARM START MUST ACTUALLY LAND ON THE MAIN FIT'S LOSS. The saturated
-   bin scales are POIs of the composite and are not among the three blocks the
-   warm start copies, so they keep ``x0default``. They come out of
-   ``get_poi()`` as 1 only because ``SaturatedProjectModel`` declares them
-   ``blind_exempt`` -- they are the test's own machinery, not a result, so they
+   bin scales are not among the blocks the warm start copies, so they keep
+   ``x0default``. They come out at 1 because ``SaturatedProjectModel`` declares
+   them as POUs -- they are the test's own machinery, not a result -- and POUs
    are never offset. Blind them and the composite opens far above the main fit
    and ``q = 2*(NLL_main - NLL_sat)`` starts NEGATIVE, which is not a deviance.
 
@@ -59,8 +58,8 @@ class OneParamPenalty(Regularizer):
     need is only that ``len(fitter.regularizers)`` is nonzero, so that
     ``_compute_nll_components`` takes its armed branch. Name resolution (rather
     than positional indexing) is also what a real regularizer must do to
-    survive this path at all -- the composite prepends a second model's POIs,
-    so a cached index points at the wrong parameter.
+    survive this path at all -- the composite inserts a second model's
+    parameters, so a cached index points at the wrong parameter.
     """
 
     needs_observables = False
@@ -180,12 +179,7 @@ def build_saturated(f, blind, rearm=True, arm_regularizers_early=True):
         fs.set_blinding_offsets(blind=blind)
 
     x_main = f.x.numpy()
-    if orig.npoi > 0:
-        fs.x[: orig.npoi].assign(x_main[: orig.npoi])
-    if orig.npou > 0:
-        fs.x[composite.npoi : composite.npoi + orig.npou].assign(
-            x_main[orig.npoi : orig.nparams]
-        )
+    fs.x[: orig.nparams].assign(x_main[: orig.nparams])
     fs.x[composite.nparams :].assign(x_main[orig.nparams :])
     # The driver arms again here, at the warm-started point, which is where the
     # expectations a regularizer records should come from.
@@ -251,13 +245,14 @@ def test_original_poi_is_written_blinded(path):
 
 def test_bin_scales_are_one_after_the_warm_start(path):
     """The warm start never copies the saturated slots, so this holds only
-    because they are never offset -- SaturatedProjectModel declares them
-    blind_exempt, so they keep the 1.0 their default stores."""
+    because they are never offset -- SaturatedProjectModel declares them as
+    POUs, so they keep the 1.0 their default stores."""
     _, orig, f = build_main(path)
-    _, _, composite, fs = build_saturated(f, blind=True)
+    _, sat, composite, fs = build_saturated(f, blind=True)
     assert _armed(fs), "vacuous: nothing is blinded at all in this fitter"
+    assert composite.npoi == orig.npoi and sat.npoi == 0
 
-    scales = fs.get_poi().numpy()[orig.npoi : composite.npoi]
+    scales = np.square(fs.get_model_nui().numpy()[orig.npou :])
     assert scales.shape == (NBINS,)
     np.testing.assert_allclose(scales, 1.0, rtol=0, atol=1e-9)
 
@@ -387,8 +382,8 @@ def test_blinded_regularized_saturated_reinit_can_evaluate_its_loss(path):
 def test_the_penalty_follows_the_parameter_through_the_composite(path):
     """Arming after the re-init must re-resolve by NAME, not reuse an index.
 
-    The composite prepends the saturated model's POIs, so the penalized
-    parameter sits at a different position than it did in the main fit. If the
+    The composite inserts the saturated model's POUs before the thetas, so the
+    penalized parameter sits at a different position than it did in the main fit. If the
     index were cached the penalty would silently apply to another parameter.
     """
     _, _, f = build_main(path, regularize=True)
