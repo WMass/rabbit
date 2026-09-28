@@ -510,9 +510,14 @@ def test_reference_matrix_honours_precondition_from(how):
         np.testing.assert_allclose(mats[1], mats[0], rtol=1e-9, atol=1e-9)
 
 
-@pytest.mark.parametrize("mode", ["lite", "full"])
-def test_bin_by_bin_stat_modes_match_single_device(mode):
+@pytest.mark.parametrize(
+    "mode, dynamic", [("lite", False), ("lite", True), ("full", False)]
+)
+def test_bin_by_bin_stat_modes_match_single_device(mode, dynamic):
     """Both BBB modes must run sharded and agree with the single-device loss.
+
+    Dynamic lite reads the per-process sumw/sumw2, which each shard has to
+    slice to its own bins.
 
     'full' exercises the branch of bbstat.profile_and_apply that reads
     indata.betavar, which the shard view has to expose even in lite mode
@@ -532,7 +537,11 @@ def test_bin_by_bin_stat_modes_match_single_device(mode):
         vals, hessians = [], []
         for ndevices in (1, 2):
             f = _make_fitter(
-                fname, ndevices, noBinByBinStat=False, binByBinStatMode=mode
+                fname,
+                ndevices,
+                noBinByBinStat=False,
+                binByBinStatMode=mode,
+                binByBinStatDynamic=dynamic,
             )
             f.defaultassign()
             f.set_nobs(f.indata.data_obs)

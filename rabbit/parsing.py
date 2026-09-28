@@ -642,6 +642,16 @@ def common_parser():
         help="Barlow-Beeston mode bin-by-bin statistical uncertainties",
     )
     parser.add_argument(
+        "--binByBinStatDynamic",
+        default=False,
+        action="store_true",
+        help="In lite mode, recompute the per-bin MC-stat variance from the current "
+        "per-process yields, sum_p sumw2_p * (n_p / sumw_p)**2, at every evaluation, "
+        "instead of fixing it at the nominal process composition (as done in Combine). "
+        "The constraint on beta keeps its nominal width; the variance enters through "
+        "how beta scales the yields. Requires per-process sumw2 in the input.",
+    )
+    parser.add_argument(
         "--minBBKstat",
         default=0.0,
         type=float,

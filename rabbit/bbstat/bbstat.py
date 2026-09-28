@@ -72,6 +72,19 @@ class BinByBinStat:
         self.enabled = not options.noBinByBinStat
         self.binByBinStatMode = options.binByBinStatMode
         self.minBBKstat = getattr(options, "minBBKstat", 0.0)
+        self.dynamic = self.enabled and getattr(options, "binByBinStatDynamic", False)
+
+        if self.dynamic:
+            if self.binByBinStatMode != "lite":
+                raise ValueError(
+                    "--binByBinStatDynamic only applies to --binByBinStatMode "
+                    "lite; full mode already scales each process's variance "
+                    "with its yield"
+                )
+            if indata.sumw2.ndim < 2:
+                raise ValueError(
+                    "--binByBinStatDynamic needs per-process sumw2 in the input"
+                )
 
         if options.binByBinStatType == "automatic":
             if covarianceFit:
@@ -203,7 +216,9 @@ class BinByBinStat:
                 if covarianceFit:
                     sbeta = tf.math.sqrt(self.varbeta[: self.indata.nbins])
 
-                    if self.binByBinStatMode == "lite":
+                    # with --binByBinStatDynamic sbeta changes with the
+                    # yields, so the composite matrix is solved per evaluation
+                    if self.binByBinStatMode == "lite" and not self.dynamic:
                         sbeta = tf.linalg.LinearOperatorDiag(sbeta)
                         self.betaauxlu = tf.linalg.lu(
                             sbeta @ data_cov_inv @ sbeta
@@ -430,9 +445,72 @@ class BinByBinStat:
         """
         if not self.enabled:
             return False
-        if self.binByBinStatMode == "full":
+        if self.binByBinStatMode == "full" or self.dynamic:
             return True
         return self.proc_zero_var_mask is not None
+
+    def _dynamic_variance(self, norm):
+        """Per-bin MC-stat variance at the current per-process yields.
+
+        Each process keeps its nominal relative variance
+        ``sumw2 / sumw²``, so ``V = Σ_p sumw2_p · (n_p / sumw_p)²``. An
+        entry with ``sumw == 0`` but ``sumw2 > 0`` keeps its nominal
+        absolute variance. Zero-variance processes contribute nothing.
+        """
+        nrows = norm.shape[0]
+        sumw = self.indata.sumw[:nrows]
+        sumw2 = self.indata.sumw2[:nrows]
+        nonzero = sumw != 0.0
+        ratio = tf.where(
+            nonzero, norm / tf.where(nonzero, sumw, tf.ones_like(sumw)), 1.0
+        )
+        return tf.reduce_sum(sumw2 * tf.square(ratio), axis=-1)
+
+    def _dynamic_scales(self, norm):
+        """θ-dependent factors that rescale the effect of β on the yields.
+
+        The constraint on β stays the nominal one; the dependence on the
+        current yields enters only through how β moves them, as in
+        Combine's CMSHistErrorPropagator. Returns ``(sbeta, s)`` per row of
+        ``norm``:
+
+        - ``sbeta = sqrt(V)`` is the absolute uncertainty used by the
+          normal-additive type in place of ``sqrt(varbeta)``.
+        - ``s`` is used by the multiplicative types: the finite-variance
+          yield becomes ``n_active · (1 + s·(β - 1))``, so that with the
+          nominal constraint width ``1/sqrt(kstat)`` its variance is ``V``.
+          ``s == 1`` at the nominal yields.
+
+        Where ``V`` or ``n_active`` is not positive, or the bin is masked,
+        the factors fall back to the static ones (``s = 1``,
+        ``sbeta = sqrt(varbeta)``).
+        """
+        nrows = norm.shape[0]
+        var = self._dynamic_variance(norm)
+        varbeta = self.varbeta[:nrows]
+        kstat = self.kstat[:nrows]
+        betamask = self.betamask[:nrows]
+
+        var_ok = var > 0.0
+        var_safe = tf.where(var_ok, var, tf.ones_like(var))
+        sbeta = tf.where(var_ok, tf.sqrt(var_safe), tf.sqrt(varbeta))
+
+        if self.proc_zero_var_mask is not None:
+            zv_mask = self.proc_zero_var_mask[:nrows]
+            n_active = tf.reduce_sum(
+                tf.where(zv_mask, tf.zeros_like(norm), norm), axis=-1
+            )
+        else:
+            n_active = tf.reduce_sum(norm, axis=-1)
+        s_ok = var_ok & (n_active > 0.0) & ~betamask
+        n_active_safe = tf.where(s_ok, n_active, tf.ones_like(n_active))
+        s = tf.where(
+            s_ok,
+            tf.sqrt(kstat * tf.where(s_ok, var_safe, tf.ones_like(var)))
+            / n_active_safe,
+            tf.ones_like(n_active),
+        )
+        return sbeta, s
 
     def profile_and_apply(
         self,
@@ -454,6 +532,9 @@ class BinByBinStat:
         """
         if not self.enabled:
             return nexp, norm, None
+
+        if self.dynamic:
+            sbeta_dyn, s_dyn = self._dynamic_scales(norm)
 
         if profile:
             # analytic solution for profiled barlow-beeston lite parameters for each combination
@@ -481,6 +562,15 @@ class BinByBinStat:
                 n_active = nexp_profile
                 n_zero_var = tf.zeros_like(nexp_profile)
 
+            if self.dynamic and self.binByBinStatType != "normal-additive":
+                # The finite-variance yield n_active·(1 + s·(β - 1)) is
+                # affine in β, so it is written in the same form as above:
+                # a β-independent part plus a part scaled by β. The lite
+                # formulas below then apply unchanged.
+                s = s_dyn[: self.indata.nbins]
+                n_zero_var = n_zero_var + n_active * (1.0 - s)
+                n_active = n_active * s
+
             # Safe denominator for formulas that divide by n_active; bins with
             # n_active == 0 will be overridden by betamask afterwards.
             n_active_safe = tf.where(n_active > 0, n_active, tf.ones_like(n_active))
@@ -489,6 +579,11 @@ class BinByBinStat:
             kstat = self.kstat[: self.indata.nbins]
             betamask = self.betamask[: self.indata.nbins]
             varbeta = self.varbeta[: self.indata.nbins]
+            if self.dynamic:
+                sbeta_profile = sbeta_dyn[: self.indata.nbins]
+                varbeta = tf.square(sbeta_profile)
+            else:
+                sbeta_profile = tf.math.sqrt(varbeta)
 
             if self.chisqFit:
                 if self.binByBinStatType == "gamma":
@@ -594,7 +689,7 @@ class BinByBinStat:
                         )
                         beta = tf.where(betamask, beta0, beta)
                 elif self.binByBinStatType == "normal-additive":
-                    sbeta = tf.math.sqrt(varbeta)
+                    sbeta = sbeta_profile
                     if self.binByBinStatMode == "lite":
                         beta = (sbeta * (nobs - nexp_profile) + varnobs * beta0) / (
                             varnobs + varbeta
@@ -663,16 +758,23 @@ class BinByBinStat:
                         )
                         beta = tf.where(betamask, beta0, beta)
                 elif self.binByBinStatType == "normal-additive":
-                    sbeta = tf.math.sqrt(varbeta)
+                    sbeta = sbeta_profile
                     if self.binByBinStatMode == "lite":
                         sbeta_m = tf.linalg.LinearOperatorDiag(sbeta)
-                        beta = tf.linalg.lu_solve(
-                            *self.betaauxlu,
+                        rhs = (
                             sbeta_m
                             @ self.data_cov_inv
                             @ ((nobs - nexp_profile)[:, None])
-                            + beta0[:, None],
+                            + beta0[:, None]
                         )
+                        if self.dynamic:
+                            A = sbeta_m @ self.data_cov_inv @ sbeta_m + tf.eye(
+                                self.data_cov_inv.shape[0],
+                                dtype=self.data_cov_inv.dtype,
+                            )
+                            beta = tf.linalg.solve(A, rhs)
+                        else:
+                            beta = tf.linalg.lu_solve(*self.betaauxlu, rhs)
                         beta = tf.squeeze(beta, axis=-1)
                     elif self.binByBinStatMode == "full":
                         # first solve for sum of processes
@@ -808,7 +910,7 @@ class BinByBinStat:
                         )
                         beta = tf.where(betamask, beta0, beta)
                 elif self.binByBinStatType == "normal-additive":
-                    sbeta = tf.math.sqrt(varbeta)
+                    sbeta = sbeta_profile
                     if self.binByBinStatMode == "lite":
                         abeta = sbeta
                         abeta = tf.where(
@@ -839,6 +941,9 @@ class BinByBinStat:
         beta = beta + self.ubeta
 
         betasel = beta[: nexp.shape[0]]
+        if self.dynamic and self.binByBinStatType != "normal-additive":
+            # the constraint acts on β; the yields see 1 + s·(β - 1)
+            betasel = 1.0 + s_dyn * (betasel - 1.0)
 
         if self.binByBinStatType in ["gamma", "normal-multiplicative"]:
             betamask = self.betamask[: nexp.shape[0]]
@@ -876,8 +981,10 @@ class BinByBinStat:
                         betamask[..., None], norm, betasel[..., None] * norm
                     )
         elif self.binByBinStatType == "normal-additive":
-            varbeta = self.varbeta[: nexp.shape[0]]
-            sbeta = tf.math.sqrt(varbeta)
+            if self.dynamic:
+                sbeta = sbeta_dyn
+            else:
+                sbeta = tf.math.sqrt(self.varbeta[: nexp.shape[0]])
             if self.binByBinStatMode == "full":
                 norm = norm + sbeta * betasel
                 nexp = tf.reduce_sum(norm, -1)

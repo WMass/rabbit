@@ -136,6 +136,7 @@ rabbit_fit.py test_tensor.hdf5 -o results/fitresult.hdf5 -t 0 --doImpacts --glob
 Bin-by-bin statistical uncertainties on the templates are added by default and can be disabled at runtime using the `--noBinByBinStat` option. 
 The Barlow-Beeston method is used to add implicit nuisance parameters for each template bin.
 By default, the lite variant is used where one parameter is introduced per template bin, for the sum of all processes. 
+Its variance is fixed at the nominal process composition. With `--binByBinStatDynamic` it is instead recomputed from the current per-process yields, $V = \sum_p \sigma_p^2 (n_p/w_p)^2$, so that a process scaled by a POI or a systematic carries its own MC statistical uncertainty along with it (as in Combine). The constraint keeps its nominal width and the variance enters through how the parameter scales the yields; for `normal-multiplicative` this gives exactly the same profiled likelihood as `--binByBinStatMode full`. It requires per-process `sumw2` in the input and costs one `[nbins, nproc]` reduction per evaluation.
 The Barlow-Beeston-full method can be used by specifying `--binByBinStatMode full` which introduces implicit nuisance parameters for each process and each template bin.
 By default these nuisance parameters are multiplied to the expected events and follow a gamma distribution for the probability density.
 Gaussian uncertainties can also be used with `--binByBinStatType normal-additive` for an additive scaling or `--binByBinStatType normal-multiplicative` for a multiplicative scaling.
