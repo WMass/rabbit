@@ -103,6 +103,18 @@ def make_parser():
         help="use prefit uncertainty to define scan range",
     )
     parser.add_argument(
+        "--scanSaveDetail",
+        default=False,
+        action="store_true",
+        help="store the full parameter vector and per-point convergence "
+        "diagnostics (edmval, gradient sup-norm, minimiser status, iterations, "
+        "wall time) at every likelihood scan point. Costs one gradient "
+        "evaluation and one CG solve per point, and ~8 bytes x nparams x "
+        "nscanpoints of output; without it a scan records only its dnll curve, "
+        "and neither the points it visited nor whether they converged can be "
+        "recovered afterwards.",
+    )
+    parser.add_argument(
         "--prefitOnly",
         default=False,
         action="store_true",
@@ -1092,14 +1104,30 @@ def fit(args, fitter, ws, dofit=True):
 
         for param in parms:
             logger.info(f"-delta log(L) scan for {param}")
-            x_scan, dnll_values = fitter.nll_scan(
-                param, args.scanRange, args.scanPoints, args.scanRangeUsePrefit
+            scan_result = fitter.nll_scan(
+                param,
+                args.scanRange,
+                args.scanPoints,
+                args.scanRangeUsePrefit,
+                save_detail=args.scanSaveDetail,
             )
+            if args.scanSaveDetail:
+                x_scan, dnll_values, scan_detail = scan_result
+            else:
+                x_scan, dnll_values = scan_result
+                scan_detail = None
             ws.add_nll_scan_hist(
                 param,
                 x_scan,
                 dnll_values,
             )
+            if scan_detail is not None:
+                ws.add_nll_scan_detail_hists(
+                    param,
+                    x_scan,
+                    scan_detail,
+                    fitter.SCAN_DETAIL_FIELDS,
+                )
 
     if args.scan2D is not None:
         for param_tuple in args.scan2D:

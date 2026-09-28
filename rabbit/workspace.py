@@ -405,6 +405,54 @@ class Workspace:
             label=f"Likelihood scan for parameter {param}",
         )
 
+    def add_nll_scan_detail_hists(
+        self,
+        param,
+        scan_values,
+        detail,
+        fields,
+        base_name="nll_scan",
+    ):
+        """Per-scan-point parameter vectors and convergence diagnostics.
+
+        Written only under ``--scanSaveDetail``. Two hists:
+
+        ``<base_name>_params_<param>``  [scan, parms]
+            the full parameter vector at every scan point. ``nll_scan`` restores
+            the starting vector when it finishes, so without this the points it
+            visited are gone -- and reconstructing one costs a whole extra
+            constrained fit.
+
+        ``<base_name>_diag_<param>``    [scan, diagnostic]
+            ``edmval`` (floating-subspace, see
+            :meth:`Fitter.edmval_hessfree_floating`), ``grad_max_abs``,
+            ``success``, ``status``, ``nit``, ``nfev``, ``wall_s``. Stored as
+            floats because a hist holds one dtype; ``success`` is 0.0/1.0 and the
+            counts are exact in float64 at these magnitudes.
+
+        The minimiser ``message`` strings are NOT stored: a hist cannot hold
+        them, they are redundant with ``status``, and ``status`` is the field
+        worth trending. They stay in the log.
+        """
+        axis_scan = hist.axis.StrCategory(
+            np.array(scan_values).astype(str), name="scan"
+        )
+        axis_parms = hist.axis.StrCategory(list(self.parms.astype(str)), name="parms")
+        self.add_hist(
+            f"{base_name}_params_{param}",
+            [axis_scan, axis_parms],
+            detail["x"],
+            label=f"Parameter values along the likelihood scan for {param}",
+        )
+
+        axis_diag = hist.axis.StrCategory(list(fields), name="diagnostic")
+        self.add_hist(
+            f"{base_name}_diag_{param}",
+            [axis_scan, axis_diag],
+            detail["diagnostics"],
+            label=f"Per-point minimiser diagnostics for the likelihood scan of {param}",
+        )
+
     def add_nll_scan2D_hist(
         self, param_tuple, scan_x, scan_y, nll_values, base_name="nll_scan2D"
     ):
