@@ -349,7 +349,7 @@ jobs:
           - name: bb_full_gamma
             tensor: test_tensor.hdf5
             fit_args: >-
-              --binByBinStatType gamma --binByBinStatMode full --globalImpactsDisableJVP
+              --binByBinStatType gamma --binByBinStatMode full
 
     steps:
       - env:

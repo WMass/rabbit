@@ -46,14 +46,12 @@ def _make_options(**kwargs):
 def _make_bbstat(sumw, sumw2, **opts):
     indata = _make_indata(sumw, sumw2)
     options = _make_options(**opts)
-    nobs_template = tf.zeros((indata.nbins,), dtype=tf.float64)
     return BinByBinStat(
         indata,
         options,
         chisqFit=False,
         covarianceFit=False,
         data_cov_inv=None,
-        nobs_template=nobs_template,
     )
 
 

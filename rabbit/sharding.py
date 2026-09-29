@@ -467,7 +467,6 @@ class MultiDeviceFitter(Fitter):
                     chisqFit=self.chisqFit,
                     covarianceFit=False,
                     data_cov_inv=None,
-                    nobs_template=shard.nobs,
                 )
             # seed from the current observation state: init_fit_parms (and
             # thus shard construction) can re-run after set_nobs

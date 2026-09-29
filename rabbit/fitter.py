@@ -226,7 +226,6 @@ class Fitter:
             chisqFit=self.chisqFit,
             covarianceFit=self.covarianceFit,
             data_cov_inv=self.data_cov_inv,
-            nobs_template=self.nobs,
         )
 
         # --- fit params
