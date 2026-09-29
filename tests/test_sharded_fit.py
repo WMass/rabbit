@@ -520,12 +520,11 @@ def test_bin_by_bin_stat_modes_match_single_device(mode):
 
     The Hessian is checked as well as the loss, because that is where the
     modes differ in kind rather than degree. 'full' profiles beta with a
-    stateful Newton loop -- nbeta.assign_sub inside a tf.while_loop -- and
-    _loss_val_grad_hessp_batch runs k directions of it inside a single
-    tf.vectorized_map against that one shared variable. It is safe because the
-    Newton state depends only on x, which is identical across the k
-    directions, so the solves cannot disagree; comparing only loss_val leaves
-    that unpinned, since the batching happens on the Hessian path alone.
+    Newton loop -- a tf.while_loop -- and _loss_val_grad_hessp_batch runs k
+    directions of it inside a single tf.vectorized_map. The Newton state
+    depends only on x, which is identical across the k directions, so the
+    solves cannot disagree; comparing only loss_val leaves that unpinned,
+    since the batching happens on the Hessian path alone.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         fname = make_test_tensor(tmpdir)

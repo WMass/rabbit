@@ -216,8 +216,10 @@ def make_parser():
         default=False,
         action="store_true",
         help="""
-        Compute global impacts on parameters and observables in the traditional 'backward mode' 
-        and not using the more memory efficient 'forward mode' implementation using jacobian vector products (JVP)
+        Compute global impacts on parameters and observables in the traditional 'backward mode'
+        instead of the 'forward mode' implementation using jacobian vector products (JVP).
+        Forward mode is much faster and leaner with --binByBinStatMode full and for impacts on parameters;
+        backward mode can use less memory for impacts on many observable bins with --binByBinStatMode lite.
         """,
     )
     parser.add_argument(

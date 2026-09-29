@@ -42,7 +42,6 @@ class BinByBinStat:
         chisqFit,
         covarianceFit,
         data_cov_inv,
-        nobs_template,
     ):
         """
         Parameters
@@ -58,10 +57,6 @@ class BinByBinStat:
         data_cov_inv : tf.Tensor or None
             Inverse data covariance matrix (only used by covarianceFit +
             normal-additive to precompute the auxiliary LU decomposition).
-        nobs_template : tf.Tensor
-            Template tensor with the same shape and dtype as
-            ``Fitter.nobs``; used to size the per-bin ``nbeta`` Variable
-            in the gamma + full mode.
         """
         self.indata = indata
         self.dtype = indata.dtype
@@ -133,8 +128,6 @@ class BinByBinStat:
         # and from the β scaling. Defaults to None (no per-process axis).
         self.proc_zero_var_mask = None
 
-        # Optional: gamma+full uses a per-bin Newton iterate variable.
-        self.nbeta = None
         # Optional: covarianceFit + normal-additive precomputes an LU.
         self.betaauxlu = None
 
@@ -192,9 +185,6 @@ class BinByBinStat:
                         "Running with '--binByBinStatType gamma "
                         "--binByBinStatMode full' is experimental and "
                         "results should be taken with care"
-                    )
-                    self.nbeta = tf.Variable(
-                        tf.ones_like(nobs_template), trainable=True, name="nbeta"
                     )
 
             elif self.binByBinStatType == "normal-additive":
@@ -459,6 +449,14 @@ class BinByBinStat:
             # analytic solution for profiled barlow-beeston lite parameters for each combination
             # of likelihood and uncertainty form
 
+            # Read the observation Variables once: the gamma + full Newton
+            # loop must not capture resource handles, which
+            # tf.vectorized_map cannot vectorise under a ForwardAccumulator.
+            nobs = tf.convert_to_tensor(nobs)
+            lognobs = tf.convert_to_tensor(lognobs)
+            if varnobs is not None:
+                varnobs = tf.convert_to_tensor(varnobs)
+
             nexp_profile = nexp[: self.indata.nbins]
             beta0 = self.beta0[: self.indata.nbins]
 
@@ -525,42 +523,42 @@ class BinByBinStat:
                         )
                         threshold = nobs - varnobs * tf.reduce_min(f_thresh, axis=1)
 
-                        # Initialise nbeta in log-space.
-                        self.nbeta.assign(tf.zeros_like(nobs))
-
                         # solving nbeta numerically using newtons method
-                        # (does not work with forward differentiation i.e.
-                        # use --globalImpacts with --globalImpactsDisableJVP)
-                        def fnll_nbeta(u):
-                            x = threshold + tf.exp(u)
+                        def fnll_nbeta(u, t):
+                            x = t["threshold"] + tf.exp(u)
                             den = (
-                                kstat + ((x - nobs) / varnobs)[..., None] * norm_profile
+                                t["kstat"]
+                                + ((x - t["nobs"]) / t["varnobs"])[..., None]
+                                * t["norm_profile"]
                             )
-                            beta = kstat * beta0 / den
-                            beta = tf.where(betamask, beta0, beta)
+                            beta = t["kstat"] * t["beta0"] / den
+                            beta = tf.where(betamask, t["beta0"], beta)
                             betasafe = tf.where(
-                                beta0 == 0.0,
+                                t["beta0"] == 0.0,
                                 tf.constant(1.0, dtype=beta.dtype),
                                 beta,
                             )
                             logbeta = tf.math.log(betasafe)
-                            new_nexp = tf.reduce_sum(beta * norm_profile, axis=-1)
-                            ln = 0.5 * (new_nexp - nobs) ** 2 / varnobs
+                            new_nexp = tf.reduce_sum(beta * t["norm_profile"], axis=-1)
+                            ln = 0.5 * (new_nexp - t["nobs"]) ** 2 / t["varnobs"]
                             lbeta = tf.reduce_sum(
-                                kstat * (beta - beta0)
-                                - kstat * beta0 * (logbeta - logbeta0),
+                                t["kstat"] * (beta - t["beta0"])
+                                - t["kstat"] * t["beta0"] * (logbeta - t["logbeta0"]),
                                 axis=-1,
                             )
                             return ln + lbeta
 
                         beta = self._newton_solve_nbeta(
                             fnll_nbeta=fnll_nbeta,
-                            kstat=kstat,
-                            beta0=beta0,
-                            norm_profile=norm_profile,
-                            nobs=nobs,
-                            varnobs=varnobs,
-                            threshold=threshold,
+                            inputs=dict(
+                                threshold=threshold,
+                                kstat=kstat,
+                                beta0=beta0,
+                                logbeta0=logbeta0,
+                                norm_profile=norm_profile,
+                                nobs=nobs,
+                                varnobs=varnobs,
+                            ),
                             chisq_fit=True,
                         )
 
@@ -732,44 +730,49 @@ class BinByBinStat:
                         )
                         threshold = nobs / tf.reduce_min(f_thresh, axis=1)
 
-                        # Initialise nbeta in log-space from the current
-                        # nexp_profile.
-                        self.nbeta.assign(tf.zeros_like(nobs))
-
-                        def fnll_nbeta(u):
-                            x = threshold + tf.exp(u)
-                            den = (1 - nobs / x)[..., None] * norm_profile + kstat
-                            beta = kstat * beta0 / den
-                            beta = tf.where(betamask, beta0, beta)
+                        def fnll_nbeta(u, t):
+                            x = t["threshold"] + tf.exp(u)
+                            den = (1 - t["nobs"] / x)[..., None] * t[
+                                "norm_profile"
+                            ] + t["kstat"]
+                            beta = t["kstat"] * t["beta0"] / den
+                            beta = tf.where(betamask, t["beta0"], beta)
                             betasafe = tf.where(
-                                beta0 == 0.0,
+                                t["beta0"] == 0.0,
                                 tf.constant(1.0, dtype=beta.dtype),
                                 beta,
                             )
                             logbeta = tf.math.log(betasafe)
-                            new_nexp = tf.reduce_sum(beta * norm_profile, axis=-1)
+                            new_nexp = tf.reduce_sum(beta * t["norm_profile"], axis=-1)
                             nexpsafe = tf.where(
-                                nobs == 0.0,
+                                t["nobs"] == 0.0,
                                 tf.constant(1.0, dtype=new_nexp.dtype),
                                 new_nexp,
                             )
                             lognexp = tf.math.log(nexpsafe)
-                            ln = new_nexp - nobs - nobs * (lognexp - lognobs)
+                            ln = (
+                                new_nexp
+                                - t["nobs"]
+                                - t["nobs"] * (lognexp - t["lognobs"])
+                            )
                             lbeta = tf.reduce_sum(
-                                kstat * (beta - beta0)
-                                - kstat * beta0 * (logbeta - logbeta0),
+                                t["kstat"] * (beta - t["beta0"])
+                                - t["kstat"] * t["beta0"] * (logbeta - t["logbeta0"]),
                                 axis=-1,
                             )
                             return ln + lbeta
 
                         beta = self._newton_solve_nbeta(
                             fnll_nbeta=fnll_nbeta,
-                            kstat=kstat,
-                            beta0=beta0,
-                            norm_profile=norm_profile,
-                            nobs=nobs,
-                            varnobs=None,
-                            threshold=threshold,
+                            inputs=dict(
+                                threshold=threshold,
+                                kstat=kstat,
+                                beta0=beta0,
+                                logbeta0=logbeta0,
+                                norm_profile=norm_profile,
+                                nobs=nobs,
+                                lognobs=lognobs,
+                            ),
                             chisq_fit=False,
                         )
 
@@ -912,68 +915,74 @@ class BinByBinStat:
 
     # --- gamma + full Newton helper ---------------------------------------
 
-    def _newton_solve_nbeta(
-        self,
-        *,
-        fnll_nbeta,
-        kstat,
-        beta0,
-        norm_profile,
-        nobs,
-        varnobs,
-        threshold,
-        chisq_fit,
-    ):
+    def _newton_solve_nbeta(self, *, fnll_nbeta, inputs, chisq_fit):
         """Numerical profile of β for the gamma + full mode.
 
         Uses Newton iteration on the per-bin scalar ``nbeta`` (in
         log-space ``u = log(x - threshold)``) to find the joint
         minimum of the data NLL + γ-constraint, then performs one
         differentiable Newton step at the converged value to restore
-        ``du*/dz`` gradients otherwise lost through
-        ``tf.Variable.assign_sub``.
-        """
+        the ``du*/dz`` gradients.
 
-        def val_grad_hess_nbeta():
+        ``fnll_nbeta(u, inputs)`` must take every tensor it depends on
+        through the ``inputs`` dict. The loop runs on stop-gradient copies,
+        so that no enclosing GradientTape or ForwardAccumulator records it:
+        a recorded loop would keep the intermediates of every iteration
+        for the backward pass (and across the vectorised directions of the
+        Hessian), and a captured tf.Variable cannot be vectorised by
+        tf.vectorized_map under a ForwardAccumulator (JVP global impacts).
+        """
+        inputs_stop = tf.nest.map_structure(tf.stop_gradient, inputs)
+
+        def val_grad_hess_nbeta(u):
             with tf.GradientTape() as t2:
+                t2.watch(u)
                 with tf.GradientTape() as t1:
-                    val = fnll_nbeta(self.nbeta)
-                grad = t1.gradient(val, self.nbeta)
-            hess = t2.gradient(grad, self.nbeta)
+                    t1.watch(u)
+                    val = fnll_nbeta(u, inputs_stop)
+                grad = t1.gradient(val, u)
+            hess = t2.gradient(grad, u)
             return val, grad, hess
 
-        def body(i, edm):
-            val, grad, hess = val_grad_hess_nbeta()
+        def body(i, u, edm):
+            val, grad, hess = val_grad_hess_nbeta(u)
             safe_hess = tf.maximum(hess, 1e-8)
             step = tf.clip_by_value(grad / safe_hess, -1.0, 1.0)
-            self.nbeta.assign_sub(step)
-            return i + 1, tf.reduce_max(0.5 * grad**2 / safe_hess)
+            return i + 1, u - step, tf.reduce_max(0.5 * grad**2 / safe_hess)
 
-        def cond(i, edm):
+        def cond(i, u, edm):
             return tf.logical_and(i < 50, edm > 1e-10)
 
+        nobs = inputs["nobs"]
         i0 = tf.constant(0)
-        edm0 = tf.constant(tf.float64.max)
+        u0 = tf.zeros_like(nobs)
+        edm0 = tf.constant(tf.float64.max, dtype=nobs.dtype)
         # XLA needs a static upper bound on loop iterations to allocate
         # fixed-size tensor lists when the HVP is jit_compile=True.
-        tf.while_loop(cond, body, loop_vars=(i0, edm0), maximum_iterations=50)
+        _, u, _ = tf.while_loop(
+            cond, body, loop_vars=(i0, u0, edm0), maximum_iterations=50
+        )
 
         # Implicit-function-theorem trick: one differentiable Newton step
-        # at the converged value restores du*/dz gradients otherwise lost
-        # through tf.Variable.assign_sub in the loop.
-        u_stop = tf.stop_gradient(self.nbeta)
+        # at the converged value restores the du*/dz gradients, which do
+        # not propagate through the loop.
+        u_stop = tf.stop_gradient(u)
         with tf.GradientTape() as t2_imp:
             t2_imp.watch(u_stop)
             with tf.GradientTape() as t1_imp:
                 t1_imp.watch(u_stop)
-                val_imp = fnll_nbeta(u_stop)
+                val_imp = fnll_nbeta(u_stop, inputs)
             grad_imp = t1_imp.gradient(val_imp, u_stop)
         hess_imp = t2_imp.gradient(grad_imp, u_stop)
         safe_hess_imp = tf.maximum(hess_imp, 1e-8)
         u_diff = u_stop - grad_imp / safe_hess_imp
 
-        x = threshold + tf.exp(u_diff)
+        kstat = inputs["kstat"]
+        beta0 = inputs["beta0"]
+        norm_profile = inputs["norm_profile"]
+        x = inputs["threshold"] + tf.exp(u_diff)
         if chisq_fit:
+            varnobs = inputs["varnobs"]
             beta = (
                 kstat
                 * beta0

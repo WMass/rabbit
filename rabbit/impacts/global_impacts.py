@@ -41,8 +41,12 @@ def _compute_global_impacts_beta0_jvp(
 ):
     """
     Computes global impacts from beta parameters via JVP in forward accumulator mode.
-    This is fast in case of more beta parameters than explicit parameters (x) and 'cov_dexpdx' has only a few columns.
-    It should always be more memory efficient.
+    Runs one forward pass per column of 'cov_dexpdx', all at once in tf.vectorized_map,
+    and never forms dbeta/dx. This wins when 'cov_dexpdx' has few columns (impacts on
+    parameters) or there are many more beta parameters than explicit parameters (x),
+    e.g. --binByBinStatMode full. With many columns and few beta parameters (impacts
+    on many observable bins in lite mode) the backward mode is as fast and uses less
+    memory.
     """
     with tf.GradientTape() as t2:
         t2.watch(ubeta)
@@ -99,7 +103,10 @@ def _compute_global_impacts_beta0(
 ):
     """
     Computes global impacts from beta parameters in the traditional mode.
-    This is fast in case of less beta parameters than explicit parameters (x) or 'cov_dexpdx' has many columns.
+    Forms the full jacobian dbeta/dx, so its cost scales with the number of beta
+    parameters rather than with the columns of 'cov_dexpdx'. This wins when there are
+    few beta parameters and 'cov_dexpdx' has many columns (impacts on many observable
+    bins in lite mode), and is much slower and more memory hungry in full mode.
     """
     with tf.GradientTape(persistent=True) as t2:
         t2.watch([x, ubeta])
