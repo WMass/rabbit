@@ -416,21 +416,26 @@ def common_parser():
     )
     parser.add_argument(
         "--hvpBatch",
-        default=256,
+        default=None,
         type=int,
         help="Number of Hessian-vector products evaluated together when the "
-        "dense Hessian is assembled from HVPs. Only the multi-device path "
-        "(--nDevices > 1) assembles it this way today, for both the "
-        "preconditioner reference matrix and the postfit Hessian; the "
-        "single-device path uses tape.jacobian and ignores this. NB the "
+        "dense Hessian is assembled from HVPs, for both the preconditioner "
+        "reference matrix and the postfit Hessian. The multi-device path "
+        "(--nDevices > 1) always assembles it this way, with 256 by default. "
+        "The single-device path uses tape.jacobian unless this is given; "
+        "tape.jacobian vectorises over all parameters at once, so its memory "
+        "scales with the parameter count, while here it scales with this "
+        "batch (a batch at least the parameter count behaves like the "
+        "jacobian). NB the "
         "assembly is O(nparams) graph evaluations where the jacobian is a "
         "single pass, so the postfit covariance scales linearly in parameter "
         "count there. Memory scales with this and "
         "the number of graph calls scales inversely: on a 4-way shard of a "
         "92144-bin model 256 costs a few GB and turns 6538 sequential HVPs into "
-        "26 batched ones. The batch is halved automatically if the device "
-        "cannot hold it, so this is an upper bound rather than a value that "
-        "has to be right. Set 1 for the sequential loop.",
+        "26 batched ones. The batch is halved automatically if a GPU cannot "
+        "hold it, so there this is an upper bound rather than a value that "
+        "has to be right; on CPU an out-of-memory kill cannot be caught, so "
+        "it has to fit. Set 1 for the sequential loop.",
     )
     parser.add_argument(
         "--hvpMethod",

@@ -516,7 +516,9 @@ class MultiDeviceFitter(Fitter):
             setattr(gview, name, getattr(Fitter, name).__get__(gview))
         self._global_view = gview
 
-    def _hessp_batch_dispatch(self, P):
+    def _hessp_batch_dispatch(self, P, profile=True):
+        # the sharded loss_val_grad_hess refuses profile=False before this
+        assert profile, "sharded HVPs support profile=True only"
         return self._hessp_batch_sharded(P)
 
     def arm_regularizers(self):

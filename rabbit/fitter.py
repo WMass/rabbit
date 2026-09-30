@@ -77,6 +77,7 @@ class Fitter:
             "loss_val_grad_hessp",
             "loss_val_grad_hessp_fwdrev",
             "loss_val_grad_hessp_revrev",
+            "_hessp_batch_graph",
         }
     )
     valid_systematic_types = ["log_normal", "normal"]
@@ -107,7 +108,12 @@ class Fitter:
         # outcome can be written to the output. None if the minimizer raised.
         self.minimizer_result = None
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
-        hvp_batch = getattr(options, "hvpBatch", 256)
+        hvp_batch = getattr(options, "hvpBatch", None)
+        # Only an explicit --hvpBatch makes the single-device fit assemble its
+        # dense Hessian from HVPs; by default it keeps the one-pass
+        # tape.jacobian. The multi-device fit always uses HVPs, 256 at a time
+        # unless told otherwise.
+        self.hessian_from_hvp = hvp_batch is not None
         # `or 256` would turn an explicit 0 into the default; test None
         self.hvp_batch = 256 if hvp_batch is None else int(hvp_batch)
         # Optional parameter preconditioning (see rabbit/preconditioner.py).
@@ -1113,8 +1119,16 @@ class Fitter:
             tf.constant([nstat, nstat], dtype=tf.int64),
         )
 
-    @tf.function
     def impacts_parms(self, hess):
+        # The profile=False Hessian is taken here, outside the graph, because
+        # assembling it from HVPs (--hvpBatch) runs a Python loop.
+        hess_no_bbb = None
+        if self.bbstat.enabled:
+            _, _, hess_no_bbb = self.loss_val_grad_hess(profile=False)
+        return self._impacts_parms(hess, hess_no_bbb)
+
+    @tf.function
+    def _impacts_parms(self, hess, hess_no_bbb):
 
         nstat = (
             self.param_model.npoi
@@ -1123,10 +1137,7 @@ class Fitter:
         )
         cov_stat = self._cov_stat_floating(hess, nstat)
 
-        if self.bbstat.enabled:
-            val_no_bbb, grad_no_bbb, hess_no_bbb = self.loss_val_grad_hess(
-                profile=False
-            )
+        if hess_no_bbb is not None:
             cov_stat_no_bbb = self._cov_stat_floating(hess_no_bbb, nstat)
         else:
             cov_stat_no_bbb = None
@@ -2307,6 +2318,10 @@ class Fitter:
         self.loss_val_grad_hessp_revrev = tf.function(jit_compile=jit)(
             _loss_val_grad_hessp_revrev.__get__(self, type(self))
         )
+        # Called eagerly, vectorized_map retraces its pfor graph on every
+        # batch, which on a large model costs more than the HVPs themselves.
+        # In a tf.function it is traced once per batch width (and profile).
+        self._hessp_batch_graph = tf.function(self._hessp_batch)
         # tf.autodiff.ForwardAccumulator does not support tangent
         # propagation through SparseMatrixMatMul (no JVP rule for the
         # CSR variant), so the fwdrev HVP cannot be used in sparse mode.
@@ -2323,14 +2338,36 @@ class Fitter:
         else:
             self.loss_val_grad_hessp = self.loss_val_grad_hessp_revrev
 
-    @tf.function
     def loss_val_grad_hess(self, profile=True):
+        """Value, gradient and dense Hessian.
+
+        With --hvpBatch the Hessian is assembled from batches of that many
+        HVPs (see hessian_from_hvps), which bounds the memory by the batch
+        instead of the parameter count; otherwise it is one tape.jacobian.
+        """
+        if not self.hessian_from_hvp:
+            return self._loss_val_grad_hess_jacobian(profile=profile)
+        val, grad = self._loss_val_grad_profile(profile=profile)
+        hess = tf.constant(
+            self.hessian_from_hvps(profile=profile), dtype=self.indata.dtype
+        )
+        return val, grad, hess
+
+    @tf.function
+    def _loss_val_grad_hess_jacobian(self, profile=True):
         with tf.GradientTape() as t2:
             with tf.GradientTape() as t1:
                 val = self._compute_loss(profile=profile)
             grad = t1.gradient(val, self.x)
         hess = t2.jacobian(grad, self.x)
         return val, grad, hess
+
+    @tf.function
+    def _loss_val_grad_profile(self, profile=True):
+        with tf.GradientTape() as t:
+            val = self._compute_loss(profile=profile)
+        grad = t.gradient(val, self.x)
+        return val, grad
 
     @tf.function
     def loss_val_valfull_grad_hess(self, profile=True):
@@ -2408,7 +2445,7 @@ class Fitter:
         _, _, hess = self.loss_val_grad_hess()
         return hess.__array__()
 
-    def _hessp_batch(self, P):
+    def _hessp_batch(self, P, profile=True):
         """Hessian-vector products for a batch of directions P: [k, npar].
 
         vectorized_map is a pfor of width k, not the while_loop that
@@ -2422,13 +2459,13 @@ class Fitter:
             p = tf.stop_gradient(p)
             with tf.GradientTape() as t2:
                 with tf.GradientTape() as t1:
-                    val = self._compute_loss()
+                    val = self._compute_loss(profile=profile)
                 grad = t1.gradient(val, self.x)
             return t2.gradient(grad, self.x, output_gradients=p)
 
         return tf.vectorized_map(one, P)
 
-    def hessian_from_hvps(self, block=None, batch=None):
+    def hessian_from_hvps(self, block=None, batch=None, profile=True):
         """Dense Hessian assembled column by column from Hessian-vector products.
 
         tape.jacobian vectorises over every parameter at once, holding one
@@ -2447,10 +2484,13 @@ class Fitter:
         """
         n = int(self.x.shape[0])
         idx = np.arange(n) if block is None else np.asarray(block, dtype=np.int64)
-        k = self.hvp_batch if batch is None else int(batch)
+        # an explicit --hvpBatch 0 means the sequential loop, like 1
+        k = max(1, self.hvp_batch if batch is None else int(batch))
         out = np.empty((n, idx.size), dtype=np.float64)
 
-        if k > 1:
+        # the sequential loop below goes through loss_val_grad_hessp, which
+        # only knows the profiled loss
+        if k > 1 or not profile:
             s0 = 0
             while s0 < idx.size:
                 cols = idx[s0 : s0 + k]
@@ -2458,7 +2498,7 @@ class Fitter:
                 basis[np.arange(cols.size), cols] = 1.0
                 try:
                     hp = self._hessp_batch_dispatch(
-                        tf.constant(basis, dtype=self.indata.dtype)
+                        tf.constant(basis, dtype=self.indata.dtype), profile=profile
                     )
                 except tf.errors.ResourceExhaustedError:
                     # The per-batch memory is k * nbins * 9 * 8 in principle,
@@ -2495,9 +2535,9 @@ class Fitter:
             v[j] = 0.0
         return out
 
-    def _hessp_batch_dispatch(self, P):
+    def _hessp_batch_dispatch(self, P, profile=True):
         """Batched HVP; subclasses override to keep the work distributed."""
-        return self._hessp_batch(P)
+        return self._hessp_batch_graph(P, profile=profile)
 
     def _build_preconditioner(self):
         """Preconditioner for the upcoming :meth:`fit`, or an exact no-op.
@@ -2536,9 +2576,9 @@ class Fitter:
         except Exception as ex:
             logger.warning(
                 f"Could not compute the reference Hessian for preconditioning ({ex}); "
-                "running unpreconditioned. On the multi-device path the "
-                "Hessian is assembled from batched HVPs; lower --hvpBatch if "
-                "this is an out-of-memory error."
+                "running unpreconditioned. If this is an out-of-memory error, "
+                "assemble the Hessian from batched HVPs with a (lower) "
+                "--hvpBatch."
             )
             return precond.Preconditioner.identity(theta_ref)
 
