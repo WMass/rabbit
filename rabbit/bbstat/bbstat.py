@@ -635,11 +635,7 @@ class BinByBinStat:
                             )
                             logbeta = tf.math.log(betasafe)
                             new_nexp = tf.reduce_sum(beta * t["norm_profile"], axis=-1)
-                            # tf.square, not **2: the Hessian differentiates
-                            # this three times (through the implicit Newton
-                            # step), and the third derivative of r**2 is NaN
-                            # at r == 0, i.e. a bin the profile fits exactly.
-                            ln = 0.5 * tf.square(new_nexp - t["nobs"]) / t["varnobs"]
+                            ln = 0.5 * (new_nexp - t["nobs"]) ** 2 / t["varnobs"]
                             lbeta = tf.reduce_sum(
                                 t["kstat"] * (beta - t["beta0"])
                                 - t["kstat"] * t["beta0"] * (logbeta - t["logbeta0"]),
