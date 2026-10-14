@@ -77,7 +77,6 @@ def _bbstat(fit, stat_type, mode, dynamic, sumw=SUMW, sumw2=SUMW2):
         chisqFit=fit == "chisq",
         covarianceFit=fit == "cov",
         data_cov_inv=_data_cov_inv(ind.nbins) if fit == "cov" else None,
-        nobs_template=tf.zeros((ind.nbins,), dtype=tf.float64),
     )
 
 
