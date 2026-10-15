@@ -173,7 +173,7 @@ def global_asym_impacts_parms(
             fitter.x.assign(x_shifted)
 
             try:
-                fitter.minimize()
+                fitter.minimize(warm_start=True)
                 if fitter.bbstat.enabled:
                     fitter._profile_beta()
                 impacts[k, j] = (fitter.x.value() - x_nom).numpy()

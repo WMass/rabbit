@@ -555,7 +555,8 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 # they read the wrong entries. xdefaultassign() above is deliberate but does not
                 # arm them.
                 fitter_saturated.arm_regularizers()
-                cb = fitter_saturated.minimize()
+                # the start is the main fit's minimum: warm (trust-constr only)
+                cb = fitter_saturated.minimize(warm_start=True)
                 cov_saturated = None
                 edmval = None
                 if not args.noHessian:
@@ -785,7 +786,9 @@ def fit(args, fitter, ws, dofit=True):
 
     if dofit:
         _t_min = time.perf_counter()
-        cb = fitter.minimize()
+        # an --externalPostfit start is a previous fit's minimum: warm
+        # (trust-constr with --constraints only, see --minimizerWarmStart)
+        cb = fitter.minimize(warm_start=args.externalPostfit is not None)
         logger.debug(
             f"[timing] fitter.minimize(): {time.perf_counter() - _t_min:.1f} s"
         )

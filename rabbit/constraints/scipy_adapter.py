@@ -15,7 +15,7 @@ logger = logging.child_logger(__name__)
 
 
 def build_nonlinear_constraints(
-    val_jac, hvp, xstart, lower, upper, labels, to_physical=None
+    val_jac, hvp, xstart, lower, upper, labels, to_physical=None, hold_feasible=True
 ):
     """Build the scipy constraint for the rows ``lower <= c(x) <= upper``.
 
@@ -36,6 +36,9 @@ def build_nonlinear_constraints(
         preconditioning off) and rebuilds the shift on every restart, so the
         map is looked up at call time. Only pure shifts are supported
         (Jacobian dx/dy = 1, so neither J nor the Hessian needs a transform).
+    hold_feasible : bool
+        False: no row is held feasible (``keep_feasible`` all False), the
+        warm-start rule, see :mod:`rabbit.constraints.warm_start`.
 
     Returns
     -------
@@ -98,7 +101,13 @@ def build_nonlinear_constraints(
     )
     atol = 64.0 * np.finfo(np.float64).eps * np.maximum(1.0, finite_abs)
     viol = np.maximum(lb - c0, c0 - ub)
-    if np.any(viol > atol):
+    if not hold_feasible:
+        keep = np.zeros(len(lb), dtype=bool)
+        logger.info(
+            "[minimize] warm start: no constraint is held feasible, so a slack "
+            "pinned at ~0 on a face of the previous minimum cannot freeze the fit"
+        )
+    elif np.any(viol > atol):
         keep = np.zeros(len(lb), dtype=bool)
         logger.warning(
             f"[minimize] starting point violates {int(np.sum(viol > atol))}/"
