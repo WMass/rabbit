@@ -603,6 +603,19 @@ def common_parser():
         """,
     )
     parser.add_argument(
+        "--blindingFrame",
+        type=str,
+        default="auto",
+        choices=["auto", "data", "mc"],
+        help="""
+        Which frame the blinding offsets are drawn in. 'auto' (default): the
+        real-data frame if every data_obs bin of the card is integral, else the
+        MC/Asimov frame. 'data' / 'mc' force it, e.g. '--blindingFrame data' for
+        a fit to an unfolded (non-integral) data cross section, so it shares the
+        offsets of the reco data fit and blinded values can be subtracted.
+        """,
+    )
+    parser.add_argument(
         "--setConstraintMinimum",
         default=[],
         nargs=2,

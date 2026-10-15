@@ -289,3 +289,29 @@ def test_a_sigma_that_was_not_computed_is_skipped(caplog):
     with caplog.at_level("WARNING"):
         b.warn_if_weak(np.array([np.nan]))
     assert not any(MSG in r.message for r in caplog.records)
+
+
+def test_a_forced_frame_overrides_the_card():
+    """--blindingFrame data puts a non-integral card (an unfolded data cross
+    section) in the real-data frame, so its blinded POI can be subtracted from
+    the reco data fit's; 'mc' does the reverse, and 'auto' is the card's own
+    verdict."""
+    data = Blinding(FakeIndata(integer_data=True), FakeModel(), enabled=True)
+    toy = Blinding(FakeIndata(integer_data=False), FakeModel(), enabled=True)
+    forced_data = Blinding(
+        FakeIndata(integer_data=False), FakeModel(), enabled=True, frame="data"
+    )
+    forced_mc = Blinding(
+        FakeIndata(integer_data=True), FakeModel(), enabled=True, frame="mc"
+    )
+    assert forced_data.values_poi_add[0] == data.values_poi_add[0]
+    assert forced_mc.values_poi_add[0] == toy.values_poi_add[0]
+    auto = Blinding(
+        FakeIndata(integer_data=False), FakeModel(), enabled=True, frame="auto"
+    )
+    assert auto.values_poi_add[0] == toy.values_poi_add[0]
+
+
+def test_an_unknown_frame_is_refused():
+    with pytest.raises(ValueError):
+        Blinding(FakeIndata(), FakeModel(), enabled=True, frame="unblinded")

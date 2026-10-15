@@ -104,6 +104,12 @@ class Blinding(_OffsetApplication):
         ``--unblind`` expressions: parameters that keep their true frame.
     blinding_group : list of str
         ``--blindingGroup`` expressions: parameters sharing one offset.
+    frame : {"auto", "data", "mc"}
+        ``--blindingFrame``: which offset frame to draw in. ``auto`` decides
+        from the card (real-data frame iff every ``data_obs`` bin is
+        integral); ``data`` / ``mc`` force it. Forcing ``data`` is for a card
+        that holds real data but is not integral, e.g. an unfolded cross
+        section, so that its fit shares the reco data fit's offsets.
     """
 
     def __init__(
@@ -114,7 +120,13 @@ class Blinding(_OffsetApplication):
         enabled=False,
         unblind=[],
         blinding_group=[],
+        frame="auto",
     ):
+        if frame not in ("auto", "data", "mc"):
+            raise ValueError(
+                f"blinding frame must be 'auto', 'data' or 'mc', got {frame!r}"
+            )
+        self.frame = frame
         self.indata = indata
         self.param_model = param_model
         self.enabled = enabled
@@ -305,9 +317,18 @@ class Blinding(_OffsetApplication):
         # against known truth would then read them off as blinded - truth.
         # This looks at the card's data_obs, not the dataset being fitted: a
         # --pseudoData fit on a real-data card shares the data fit's frame.
-        is_dataobs_int = np.all(
-            np.equal(self.indata.data_obs, np.floor(self.indata.data_obs))
-        )
+        # --blindingFrame overrides the card's verdict. Forcing "data" is for a
+        # card that holds real data but is not integral (an unfolded cross
+        # section), so its fit shares the reco data fit's offsets and the
+        # blinded values of the two can be subtracted.
+        if self.frame == "auto":
+            is_dataobs_int = np.all(
+                np.equal(self.indata.data_obs, np.floor(self.indata.data_obs))
+            )
+        else:
+            is_dataobs_int = self.frame == "data"
+        if self.frame != "auto":
+            logger.info(f"Blinding frame forced to '{self.frame}' (--blindingFrame)")
 
         def deterministic_random_from_string(s, mean=0.0, std=BLINDING_DRAW_STD):
             # random value with seed taken based on string of parameter name
