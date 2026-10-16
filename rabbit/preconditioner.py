@@ -812,6 +812,24 @@ class Preconditioner:
         """H_y p = T^T H_theta (T p); ``hvp`` maps a physical-space vector."""
         return self._apply_TT(hvp(self._apply_T(p)))
 
+    def jac_to_internal(self, jac):
+        """J_y = J_theta T, for a constraint Jacobian [m, n].
+
+        theta is affine in y, so a constraint c(theta) keeps its type in y
+        (linear stays linear) and only its derivatives pick up the chain rule:
+        each row transforms like a gradient, i.e. the column index gets T.
+        That is the right-hand half of :meth:`hess_to_internal`.
+        """
+        out = np.array(jac, dtype=np.float64, copy=True)
+        for b in self.blocks:
+            if b.linv is not None:
+                out[:, b.idx] = out[:, b.idx] @ b.linv.T
+            else:
+                out[:, b.idx] = scipy.linalg.solve_triangular(
+                    b.chol, out[:, b.idx].T, lower=True, trans="N"
+                ).T
+        return out
+
     def hess_to_internal(self, hess):
         """H_y = T^T H_theta T, for the dense-Hessian minimizers.
 

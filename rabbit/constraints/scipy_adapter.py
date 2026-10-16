@@ -9,13 +9,22 @@ touches the fitter's state.
 
 import numpy as np
 import scipy
+import scipy.sparse.linalg
 from wums import logging
 
 logger = logging.child_logger(__name__)
 
 
 def build_nonlinear_constraints(
-    val_jac, hvp, xstart, lower, upper, labels, to_physical=None
+    val_jac,
+    hvp,
+    xstart,
+    lower,
+    upper,
+    labels,
+    to_physical=None,
+    jac_to_internal=None,
+    hessp_to_internal=None,
 ):
     """Build the scipy constraint for the rows ``lower <= c(x) <= upper``.
 
@@ -31,11 +40,24 @@ def build_nonlinear_constraints(
         The starting point, in the fitter coordinate.
     lower, upper, labels : arrays / list, length m.
     to_physical : callable, optional
-        Maps the minimizer's iterate to the fitter coordinate. fit() works in
-        coordinates SHIFTED from it (y = x - x_start, even with
-        preconditioning off) and rebuilds the shift on every restart, so the
-        map is looked up at call time. Only pure shifts are supported
-        (Jacobian dx/dy = 1, so neither J nor the Hessian needs a transform).
+        Maps the minimizer's iterate y to the fitter coordinate x. fit() works
+        in coordinates shifted from it (y = x - x_start with preconditioning
+        off) or, with --precondition, linearly transformed as well
+        (x = x_ref + T y), and rebuilds the map on every restart, so every map
+        here must look the CURRENT transform up at call time.
+    jac_to_internal : callable, optional
+        ``J -> J T``: the chain rule for the Jacobian, J_y = J_x dx/dy.
+        Default: identity (pure shift).
+    hessp_to_internal : callable, optional
+        ``(p, matvec) -> T^T matvec(T p)``: the chain rule for the constraint
+        Hessian-vector products (x is affine in y, so there is no
+        second-derivative term of the map). Default: identity.
+
+        Values, bounds, multipliers and feasibility do not depend on the
+        frame: c_y(y) = c(x(y)) row by row, and T is invertible, so
+        T^T (grad f + J^T v) = 0 has the same multipliers v. What does depend
+        on it is every NORM scipy takes over the variables: its trust radius,
+        xtol and the KKT residual ``optimality`` compared with gtol are in y.
 
     Returns
     -------
@@ -53,6 +75,11 @@ def build_nonlinear_constraints(
 
         def to_physical(v):
             return v
+
+    if jac_to_internal is None:
+
+        def jac_to_internal(j):
+            return j
 
     lower = np.reshape(np.asarray(lower, dtype=np.float64), [-1])
     upper = np.reshape(np.asarray(upper, dtype=np.float64), [-1])
@@ -134,14 +161,25 @@ def build_nonlinear_constraints(
     def hess(y, v):
         vfull = np.zeros(m)
         vfull[live] = np.asarray(v, dtype=np.float64)
-        return hvp(np.asarray(to_physical(y)), vfull)
+        op = hvp(np.asarray(to_physical(y)), vfull)
+        if hessp_to_internal is None:
+            return op
+
+        def matvec(p):
+            return hessp_to_internal(np.ravel(p), op.matvec)
+
+        return scipy.sparse.linalg.LinearOperator(
+            op.shape, matvec=matvec, rmatvec=matvec, dtype=np.float64
+        )
 
     return [
         scipy.optimize.NonlinearConstraint(
             fun=lambda y: cached(y)[0],
             lb=lb,
             ub=ub,
-            jac=lambda y: cached(y)[1],
+            # transformed per call, not cached: the cache is keyed on the
+            # physical point, and a restart rebuilds T without moving x
+            jac=lambda y: jac_to_internal(cached(y)[1]),
             hess=hess,
             keep_feasible=keep,
         )

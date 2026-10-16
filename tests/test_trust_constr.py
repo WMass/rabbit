@@ -683,9 +683,9 @@ def test_constraints_survive_a_layout_reinit():
         assert abs(_phys(fs)[i_sig] - lb) < 1e-5
 
 
-def test_saturated_test_is_constrained(tmp_path):
-    """End to end: the saturated sub-fit of --computeSaturatedProjectionTests
-    honours --constraints like the nominal fit (it used to run unconstrained)."""
+def _run_saturated(tmp_path, extra=()):
+    """rabbit_fit.py with --computeSaturatedProjectionTests and a binding
+    upper bound on bkg_norm; returns (fitresult, the mapping's results, ub)."""
     import os
     import subprocess
     import sys
@@ -728,14 +728,66 @@ def test_saturated_test_is_constrained(tmp_path):
             "--constraints",
             "Bounds",
             f"bkg_norm<={ub!r}",
+            *extra,
         ],
         check=True,
     )
     res = io_tools.get_fitresult(str(out / "fitresults.hdf5"))
     (sat,) = res["mappings"].values()
+    return res, sat, ub
+
+
+def test_saturated_test_is_constrained(tmp_path):
+    """End to end: the saturated sub-fit of --computeSaturatedProjectionTests
+    honours --constraints like the nominal fit (it used to run unconstrained)."""
+    _, sat, ub = _run_saturated(tmp_path)
     st = sat["saturated_fit"]["minimizer_status"]
     assert st["constraint_labels"] == [f"bkg_norm<={ub!r}"]
     assert st["constraint_values"][0] <= ub + 1e-6
+
+
+def test_saturated_test_is_unchanged_by_preconditioning(tmp_path):
+    """End to end with the production flags (fitterAD.sh's full-scope spectral
+    preconditioner next to --constraints): the nominal and the saturated
+    sub-fit land where the unpreconditioned ones do, and say which frame
+    their optimality is in."""
+    flags = [
+        "--precondition",
+        "--preconditionParams",
+        ".*",
+        "--preconditionBlocks",
+        "none",
+        "--preconditionTransform",
+        "spectral",
+    ]
+    res0, sat0, ub = _run_saturated(tmp_path / "plain")
+    res1, sat1, _ = _run_saturated(tmp_path / "pre", flags)
+    mu = {}
+    for res, sat, frame in (
+        (res0, sat0, "physical"),
+        (res1, sat1, "preconditioned"),
+    ):
+        for key, st in (
+            ("fit", res["minimizer_status"]),
+            ("sat", sat["saturated_fit"]["minimizer_status"]),
+        ):
+            assert st["optimality_frame"] == frame
+            assert st["constraint_values"][0] <= ub + 1e-6
+            mu[key] = max(mu.get(key, 0.0), st["barrier_parameter"])
+    # scipy's gtol exit does not wait for the barrier parameter, and the
+    # barrier optimum sits ~mu above the constrained minimum in the loss. gtol
+    # is tested in the iterated frame, so the two frames may exit at different
+    # mu (seen: 6.4e-6 preconditioned, the same exit test passing in y while
+    # the physical-frame residual was still 1.2e-10 > gtol).
+    for key, a, b in (
+        ("fit", res1["nllvalreduced"], res0["nllvalreduced"]),
+        (
+            "sat",
+            sat1["saturated_fit"]["nllvalreduced"],
+            sat0["saturated_fit"]["nllvalreduced"],
+        ),
+    ):
+        assert abs(float(a) - float(b)) < 2 * mu[key] + 1e-9, (key, a, b, mu)
 
 
 def _linear_chi2_fitter(tmp, method, cons=()):
@@ -806,3 +858,191 @@ def test_fun_and_jac_share_one_evaluation(monkeypatch):
         nlc.fun(y)
         nlc.jac(y)
         assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# --precondition under trust-constr (theta = theta_ref + T y, T = L^-T)
+# ---------------------------------------------------------------------------
+#
+# A change of variables: the constrained minimum, the multipliers and the
+# face-held post-fit must not move; only the path (and its cost) may. The toy
+# is the Vandermonde-like polynomial background of test_preconditioner (cond(H)
+# ~1e5 at order 8), with a linear row on two coefficients and a nonlinear one
+# on two others, both binding. The nonlinear row is a BALL: its feasible set is
+# convex. With a non-convex row there can be several constrained minima, and
+# since the two frames take different paths they may legitimately end in
+# different ones (seen with poly3^2 + poly4 >= lb at order 8: loss 4.63 vs
+# 5.33, both KKT points), which would test nothing about the transform.
+
+PRECOND_FULL_SPECTRAL = dict(
+    precondition=True,
+    preconditionParams=[".*"],
+    preconditionBlocks="none",
+    preconditionTransform="spectral",
+)
+
+
+class BallBound(Constraints):
+    """(x[a] - ca)^2 + (x[b] - cb)^2 <= ub: nonlinear, convex feasible set.
+
+    Centred AWAY from the start point: a row whose gradient vanishes at the
+    start is dropped as a constant by the adapter (see Open questions in the
+    2026-10-15 trust-constr/precondition study), which would hide it.
+    """
+
+    def __init__(self, a, b, ca, cb, ub):
+        self.dtype = tf.float64
+        self.names, self.centre = (a, b), (float(ca), float(cb))
+        self.labels = ["ball"]
+        self.lower = np.array([-np.inf])
+        self.upper = np.array([float(ub)])
+        self._idx = None
+
+    def set_layout(self, parms):
+        self._idx = self.resolve_indices(parms, list(self.names), "BallBound")
+
+    def parameter_indices(self):
+        return list(self._idx.values())
+
+    def values(self, x):
+        (a, b), (ca, cb) = self.names, self.centre
+        return tf.reshape(
+            tf.square(x[self._idx[a]] - ca) + tf.square(x[self._idx[b]] - cb), [1]
+        )
+
+
+def _poly_constraints(filename):
+    """A binding linear row and a binding ball row, placed from the free fit."""
+    free = _fitter(filename, "trust-krylov")
+    free.minimize()
+    names, p = _names(free), _phys(free)
+    _, _, hess = free.loss_val_grad_hess()
+    cov = np.linalg.inv(np.asarray(hess))
+    i1, i2, i3, i4 = (names.index(f"poly{k}") for k in (1, 2, 3, 4))
+    # poly1 + poly2 <= its free value - 1 sigma
+    lin_ub = p[i1] + p[i2] - np.sqrt(cov[i1, i1] + cov[i2, i2] + 2 * cov[i1, i2])
+    # a ball containing the start (all zero) but not the free minimum
+    ca, cb = 0.25 * p[i3], 0.25 * p[i4]
+    radius = 0.5 * np.hypot(p[i3], p[i4])
+
+    def make():
+        return [
+            LinearBound({"poly1": 1.0, "poly2": 1.0}, ub=lin_ub),
+            BallBound("poly3", "poly4", ca, cb, radius**2),
+        ]
+
+    return make, np.sqrt(np.diag(cov))
+
+
+def _counted_fit(filename, make_cons, **kw):
+    """trust-constr fit, counting the loss HVPs the minimizer asks for."""
+    f = _fitter(filename, "trust-constr", cons=make_cons(), **kw)
+    count = [0]
+    real = f.loss_val_grad_hessp
+
+    def counting(v):
+        count[0] += 1
+        return real(v)
+
+    f.loss_val_grad_hessp = counting
+    f.minimize()
+    f.loss_val_grad_hessp = real
+    return f, count[0]
+
+
+def test_preconditioned_constraint_jacobian_and_hvp_follow_the_chain_rule():
+    """What scipy sees in y: c(theta(y)), J T and T^T d2c T -- checked against
+    the dense transform and against finite differences in y."""
+    from .test_preconditioner import make_polynomial_tensor
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = make_polynomial_tensor(tmp, order=8)
+        make_cons, _ = _poly_constraints(fn)
+        f = _fitter(fn, "trust-constr", cons=make_cons(), **PRECOND_FULL_SPECTRAL)
+        pc = f._build_preconditioner()
+        assert pc.enabled and pc.cond_before > 1e4
+        n = int(f.x.shape[0])
+        T = np.stack([pc._apply_T(e) for e in np.eye(n)], axis=1)
+
+        # the transform is looked up per call (fit() rebuilds it on restarts)
+        cell = [pc]
+        (nlc,) = f.build_scipy_constraints(f.x.numpy(), transform=lambda: cell[0])
+        rng = np.random.default_rng(3)
+        y = rng.normal(size=n)
+        x = pc.to_physical(y)
+
+        cx, jx = f.eval_physical(f._constraints_fn, x, jacobian=True)
+        np.testing.assert_allclose(nlc.fun(y), cx, rtol=1e-13)
+        np.testing.assert_allclose(nlc.jac(y), jx @ T, rtol=1e-10, atol=1e-12)
+
+        v = np.array([0.7, -1.3])
+        p = rng.normal(size=n)
+        hp = nlc.hess(y, v).matvec(p)
+        dense = T.T @ f.hess_physical(f._constraints_fn, x, v) @ T
+        np.testing.assert_allclose(hp, dense @ p, rtol=1e-9, atol=1e-12)
+        # and the y-space derivatives are those of the y-space function
+        h = 1e-6
+        jfd = np.stack(
+            [(nlc.fun(y + h * e) - nlc.fun(y - h * e)) / (2 * h) for e in np.eye(n)],
+            axis=1,
+        )
+        np.testing.assert_allclose(nlc.jac(y), jfd, rtol=1e-6, atol=1e-6)
+        hfd = (nlc.jac(y + h * p) - nlc.jac(y - h * p)).T @ v / (2 * h)
+        np.testing.assert_allclose(hp, hfd, rtol=1e-5, atol=1e-6)
+
+        # swap in a rebuilt (here: identity) transform: the SAME constraint
+        # object must follow it, although its cache holds this physical point
+        from rabbit.preconditioner import Preconditioner
+
+        cell[0] = Preconditioner.identity(x)
+        np.testing.assert_allclose(nlc.fun(np.zeros(n)), cx, rtol=1e-13)
+        np.testing.assert_allclose(nlc.jac(np.zeros(n)), jx, rtol=1e-13)
+
+
+def test_preconditioning_does_not_move_the_constrained_fit():
+    """Same minimum, multipliers and face-held covariance with and without the
+    full-scope spectral preconditioner; the preconditioned fit is cheaper."""
+    from .test_preconditioner import make_polynomial_tensor
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fn = make_polynomial_tensor(tmp, order=8)
+        make_cons, sigma = _poly_constraints(fn)
+        plain, n_plain = _counted_fit(fn, make_cons)
+        pre, n_pre = _counted_fit(fn, make_cons, **PRECOND_FULL_SPECTRAL)
+
+        st_plain, st_pre = plain.minimizer_status(), pre.minimizer_status()
+        for st in (st_plain, st_pre):
+            assert st["status"] == 1, st["message"]  # gtol exit
+            assert st["constr_violation"] < 1e-8
+        assert st_plain["optimality_frame"] == "physical"
+        assert "optimality_physical" not in st_plain
+        assert st_pre["optimality_frame"] == "preconditioned"
+        assert st_pre["optimality_physical"] < 1e-6
+
+        # the minimum, in units of its own uncertainty, and the loss
+        np.testing.assert_allclose(_phys(pre) / sigma, _phys(plain) / sigma, atol=1e-4)
+        # up to the barrier offset (see test_saturated_test_is_unchanged_...)
+        mu = max(st_plain["barrier_parameter"], st_pre["barrier_parameter"])
+        assert abs(float(pre.loss_val()) - float(plain.loss_val())) < 2 * mu + 1e-9
+        # both rows bind, with the same multipliers (frame-independent)
+        np.testing.assert_allclose(
+            st_pre["multipliers"], st_plain["multipliers"], rtol=1e-3
+        )
+        assert min(abs(m) for m in st_plain["multipliers"]) > 1e-3
+
+        cp_plain, cp_pre = _postfit(plain), _postfit(pre)
+        assert [a["label"] for a in cp_plain["active"]] == ["linear", "ball"]
+        assert [a["label"] for a in cp_pre["active"]] == ["linear", "ball"]
+        scale = np.max(np.abs(cp_plain["cov_held"]))
+        np.testing.assert_allclose(
+            cp_pre["cov_held"], cp_plain["cov_held"], rtol=0, atol=1e-4 * scale
+        )
+
+        # the point of it: fewer Hessian-vector products (the reference Hessian
+        # the transform is built from is not counted; it costs one dense
+        # Hessian, i.e. n HVPs at most, n = 9 here)
+        print(
+            f"trust-constr HVPs: plain {n_plain} (nit {st_plain['nit']}), "
+            f"preconditioned {n_pre} (nit {st_pre['nit']})"
+        )
+        assert n_pre < n_plain

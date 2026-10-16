@@ -125,6 +125,9 @@ class Fitter:
         # scipy's OptimizeResult from the last fit(), so the convergence
         # outcome can be written to the output. None if the minimizer raised.
         self.minimizer_result = None
+        # whether the last fit() ended under a non-identity preconditioner:
+        # scipy's norms (trust-constr's optimality) are then in its frame
+        self._fit_preconditioned = False
         self.hvp_method = getattr(options, "hvpMethod", "revrev")
         hvp_batch = getattr(options, "hvpBatch", None)
         # Only an explicit --hvpBatch makes the single-device fit assemble its
@@ -1083,13 +1086,30 @@ class Fitter:
             cols.extend(int(i) for i in idx)
         return np.unique(np.asarray(cols, dtype=int))
 
-    def build_scipy_constraints(self, xstart, to_physical=None):
+    def build_scipy_constraints(self, xstart, to_physical=None, transform=None):
         """The --constraints rows as scipy NonlinearConstraints, see
-        :func:`rabbit.constraints.scipy_adapter.build_nonlinear_constraints`."""
+        :func:`rabbit.constraints.scipy_adapter.build_nonlinear_constraints`.
+
+        ``transform``, if given, is a callable returning the CURRENT
+        :class:`rabbit.preconditioner.Preconditioner` (looked up per call: it
+        is rebuilt on restarts); the Jacobian and the constraint HVPs are then
+        mapped to its internal coordinates by the chain rule, and
+        ``to_physical`` defaults to its map."""
         if not len(self.constraints):
             self._constraint_info = None
             return []
         lower, upper, labels = self._constraint_bounds()
+        pc_kw = {}
+        if transform is not None:
+            if to_physical is None:
+
+                def to_physical(y):
+                    return transform().to_physical(y)
+
+            pc_kw = dict(
+                jac_to_internal=lambda j: transform().jac_to_internal(j),
+                hessp_to_internal=lambda p, mv: transform().hessp_to_internal(p, mv),
+            )
         cons, info = scipy_adapter.build_nonlinear_constraints(
             lambda x: self.eval_physical(self._constraints_fn, x, jacobian=True),
             lambda x, v: self.hvp_physical(self._constraints_fn, x, v),
@@ -1098,6 +1118,7 @@ class Fitter:
             upper,
             labels,
             to_physical=to_physical,
+            **pc_kw,
         )
         self._constraint_info = info
         return cons
@@ -2990,19 +3011,17 @@ class Fitter:
         if self.minimizer_method in CONSTRAINED_METHODS:
             # Constrained trust region: the same hessp structure as
             # trust-krylov (so 3700 parameters stay tractable), plus the
-            # --constraints rows as a NonlinearConstraint. The constraint
-            # callables map scipy's iterate back by a pure shift, so the
-            # preconditioner (a general linear transform) must be off.
-            if pc_cell[0].enabled:
-                raise ValueError(
-                    f"--minimizerMethod {self.minimizer_method} does not support "
-                    "--precondition (the constraint Jacobian is not transformed "
-                    "to internal coordinates)."
-                )
+            # --constraints rows as a NonlinearConstraint. Under
+            # --precondition scipy iterates in y (theta = theta_ref + T y):
+            # the constraint values only need the map, their Jacobian and
+            # HVPs the chain rule (J T, T^T d2c T). scipy's trust-constr has
+            # no preconditioner of its own -- its projected-CG subproblem sees
+            # whatever Hessian it is given -- so this change of variables is
+            # the only way to give it one.
             info_minimize = dict(hessp=scipy_hessp)
             cons = self.build_scipy_constraints(
                 pc_cell[0].to_physical(xval),
-                to_physical=lambda yv: pc_cell[0].to_physical(yv),
+                transform=lambda: pc_cell[0],
             )
             if cons:
                 info_minimize["constraints"] = cons
@@ -3227,6 +3246,7 @@ class Fitter:
         # xval (and callback.xval) are internal coordinates; everything outside
         # fit() expects physical parameters.
         self.x.assign(pc_cell[0].to_physical(xval))
+        self._fit_preconditioned = bool(pc_cell[0].enabled)
 
         # The minimum itself. Writing it costs nothing next to the fit and
         # covers the stretch that is otherwise unprotected: everything between
@@ -3271,6 +3291,28 @@ class Fitter:
             except Exception:
                 pass
         info = self._constraint_info
+        if "optimality" in out:
+            # scipy measures the KKT residual in the coordinates it iterated:
+            # under --precondition that is T^T (grad f + J^T v), a different
+            # norm (whitened: roughly per-sigma) from the fitter's own units.
+            # The multipliers v are the same in both frames, so the residual is
+            # recomputed in the fitter coordinate for a frame-free figure.
+            preconditioned = getattr(self, "_fit_preconditioned", False)
+            out["optimality_frame"] = "preconditioned" if preconditioned else "physical"
+            if (
+                preconditioned
+                and "multipliers" in out
+                and info is not None
+                and "labels" in info
+            ):
+                _, grad = self.loss_val_grad()
+                _, jac = self.eval_physical(
+                    self._constraints_fn, self.x.numpy(), jacobian=True
+                )
+                lag = np.asarray(grad, dtype=np.float64) + jac[info["live"]].T @ (
+                    np.asarray(out["multipliers"], dtype=np.float64)
+                )
+                out["optimality_physical"] = float(np.max(np.abs(lag)))
         if len(self.constraints) and info is not None and "labels" in info:
             vals = self.eval_physical(self._constraints_fn, self.x.numpy())
             out["constraint_values"] = [float(c) for c in vals[info["live"]]]

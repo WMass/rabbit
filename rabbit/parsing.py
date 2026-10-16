@@ -305,7 +305,16 @@ def common_parser():
         "trust-region subproblem obtained as a change of variables, so the minimizer "
         "itself is untouched. Helps where many unconstrained, strongly correlated "
         "parameters make the Krylov inner solve struggle and outer steps get rejected. "
-        "Off by default; a pure reparameterisation, so results are unchanged.",
+        "Off by default; a pure reparameterisation, so results are unchanged. "
+        "Also works with --minimizerMethod trust-constr and --constraints (the "
+        "constraint Jacobian and Hessian are mapped by the chain rule); scipy's "
+        "gtol, xtol and trust radius are then measured in the preconditioned "
+        "coordinates (minimizer_status reports optimality_frame, and "
+        "optimality_physical in the fitter's own units). The transform is built "
+        "from the Hessian at the starting point, so precondition WARM fits (e.g. "
+        "the saturated sub-fit, which starts at the nominal minimum), not cold "
+        "ones: far from the minimum the whitened trust region allows steps the "
+        "local quadratic model does not support, and a cold fit gets slower.",
     )
     parser.add_argument(
         "--preconditionParams",
