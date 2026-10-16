@@ -282,7 +282,11 @@ def global_impacts_parms(
     global_impacts_from_jvp,
     cov,
     param_groupidxs=None,
+    var_face=None,
 ):
+    """var_face: per-row diag(C Hc C) at active constraint faces (see
+    Fitter._face_curvature_variance), added back to the data-stat remainder;
+    None (no active face) leaves the computation untouched."""
     idxs_poi = tf.range(nsignal_params, dtype=tf.int64)
     idxs_noi = tf.constant(nmodel_params + noiidxs, dtype=tf.int64)
     idxsout = tf.concat([idxs_poi, idxs_noi], axis=0)
@@ -321,6 +325,11 @@ def global_impacts_parms(
     var_nobs = var_total - var_x0
     if bin_by_bin_stat:
         var_nobs -= var_beta0
+    if var_face is not None:
+        # at a curved constraint face the sources add up to diag(C H C) =
+        # var_total + var_face (C W C = C, W = H - Hc), so the remainder alone
+        # would charge the face curvature to the data
+        var_nobs += var_face
 
     impacts_grouped = _compute_grouped_impacts(
         bin_by_bin_stat,
