@@ -763,8 +763,9 @@ def external_postfit_variances(args, fitter):
 def fit(args, fitter, ws, dofit=True):
 
     edmval = None
-    # set when the post-fit sits on an active --constraints face; see there
-    skip_hessian_impacts = False
+    # the faces held by the impacts: set below by the constrained post-fit,
+    # never carried over from a previous fit (toys)
+    fitter.postfit_faces = None
 
     if args.externalPostfit is not None:
         fitter.load_fitresult(
@@ -871,13 +872,9 @@ def fit(args, fitter, ws, dofit=True):
                 cpf = fitter.constrained_postfit(
                     grad, hess, active_tol=args.constraintActiveTol
                 )
-                skip_hessian_impacts = cpostfit.report_constrained_postfit(
-                    cpf,
-                    ws,
-                    args.constraintActiveTol,
-                    global_impacts=args.globalImpacts,
-                    hessian_impacts=args.doImpacts or args.gaussianGlobalImpacts,
-                )
+                # also records the active faces on the fitter, so the
+                # impacts below are taken with them held
+                cpostfit.report_constrained_postfit(cpf, ws, args.constraintActiveTol)
                 edmval = cpf["edm_tangent"]
                 cov = tf.constant(cpf["cov_held"], dtype=fitter.indata.dtype)
                 del cpf
@@ -900,7 +897,7 @@ def fit(args, fitter, ws, dofit=True):
                 edmvalbeta = edmval_cov(gradbeta, hessbeta)
                 logger.info(f"edmvalbeta: {edmvalbeta}")
 
-            if args.doImpacts and not skip_hessian_impacts:
+            if args.doImpacts:
                 _t_imp = time.perf_counter()
                 ws.add_impacts_hists(*fitter.impacts_parms(hess))
                 logger.debug(
@@ -1016,7 +1013,7 @@ def fit(args, fitter, ws, dofit=True):
                 f"[timing] global_impacts_parms(): "
                 f"{time.perf_counter() - _t_gimp:.1f} s"
             )
-        if args.gaussianGlobalImpacts and not skip_hessian_impacts:
+        if args.gaussianGlobalImpacts:
             ws.add_impacts_hists(
                 *fitter.gaussian_global_impacts_parms(),
                 base_name="gaussian_global_impacts",

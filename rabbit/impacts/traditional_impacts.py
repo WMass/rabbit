@@ -4,6 +4,7 @@ impacts from individual nuisance parameters are extracted using the "nuisance pa
 impacts from groups of nuisance parameters are extracted using the "conditional uncertainty" method
 """
 
+import numpy as np
 import tensorflow as tf
 
 
@@ -43,9 +44,17 @@ def impacts_parms(
     systgroupidxs=[],
     nmodel_params=None,
     param_groupidxs=None,
+    group_impact_fn=None,
 ):
     """
     Gaussian approximation.
+
+    group_impact_fn(cov, v, idxs) -> [n_rows], optional: the grouped impact of
+    the full-x parameter indices idxs, replacing the conditional-uncertainty
+    formula _compute_impact_group (used at active constraint faces, where the
+    face-held covariance restricted to a group can be singular; see
+    rabbit.constraints.postfit.face_held_group_impact). Called eagerly, once
+    per group.
 
     Impacts are computed FOR the POIs and NOIs only (the rows of the
     returned tensors). nmodel_params = npoi + npou is needed to locate the
@@ -91,14 +100,25 @@ def impacts_parms(
     if len(systgroupidxs):
         # systgroupidxs are syst-relative -> shift into full-x by nmodel_params
         # and gather from the full covariance (nsignal_params=0 path).
-        impacts_grouped_syst = tf.map_fn(
-            lambda idxs: _compute_impact_group(cov, v, nmodel_params + idxs, 0),
-            tf.ragged.constant(systgroupidxs, dtype=tf.int32),
-            fn_output_signature=tf.TensorSpec(
-                shape=(impacts.shape[0],), dtype=tf.float64
-            ),
-        )
-        impacts_grouped_syst = tf.transpose(impacts_grouped_syst)
+        if group_impact_fn is None:
+            impacts_grouped_syst = tf.map_fn(
+                lambda idxs: _compute_impact_group(cov, v, nmodel_params + idxs, 0),
+                tf.ragged.constant(systgroupidxs, dtype=tf.int32),
+                fn_output_signature=tf.TensorSpec(
+                    shape=(impacts.shape[0],), dtype=tf.float64
+                ),
+            )
+            impacts_grouped_syst = tf.transpose(impacts_grouped_syst)
+        else:
+            impacts_grouped_syst = tf.stack(
+                [
+                    group_impact_fn(
+                        cov, v, nmodel_params + np.asarray(idxs, dtype=np.int64)
+                    )
+                    for idxs in systgroupidxs
+                ],
+                axis=1,
+            )
         impacts_grouped = tf.concat([impacts_grouped_syst, impacts_grouped], axis=1)
 
     if param_groupidxs:
@@ -107,7 +127,11 @@ def impacts_parms(
         # [syst groups, stat, (binByBinStat), param groups].
         param_cols = [
             tf.reshape(
-                _compute_impact_group(cov, v, tf.constant(g, dtype=tf.int32), 0),
+                (
+                    _compute_impact_group(cov, v, tf.constant(g, dtype=tf.int32), 0)
+                    if group_impact_fn is None
+                    else group_impact_fn(cov, v, np.asarray(g, dtype=np.int64))
+                ),
                 (-1, 1),
             )
             for g in param_groupidxs

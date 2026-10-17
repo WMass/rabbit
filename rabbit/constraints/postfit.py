@@ -31,6 +31,152 @@ def _chol_inv(M):
     return Li.T @ Li
 
 
+def face_tangent_basis(A):
+    """Orthonormal basis Z [n, k] of the directions along the faces, A d = 0.
+
+    A coordinate pinned by a row with a single non-zero entry -- a bound on one
+    parameter, possibly only once other pinned coordinates are removed -- gets
+    an EXACTLY zero row in Z, so a parameter held on a bound has exactly zero
+    variance and covariance, as a frozen one does (an SVD null space leaves
+    O(1e-17) there, and impacts divide by that standard deviation). The
+    remaining rows go through ``scipy.linalg.null_space``, which also drops a
+    row that is linearly dependent on the others.
+    """
+    A = np.atleast_2d(np.asarray(A, dtype=np.float64))
+    m, n = A.shape
+    free = np.ones(n, dtype=bool)
+    rows = np.ones(m, dtype=bool)
+    changed = True
+    while changed:
+        changed = False
+        for i in np.flatnonzero(rows):
+            support = np.flatnonzero((A[i] != 0) & free)
+            if len(support) <= 1:
+                rows[i] = False
+                if len(support) == 1:
+                    free[support[0]] = False
+                    changed = True
+    idx = np.flatnonzero(free)
+    if rows.any():
+        Zf = scipy.linalg.null_space(A[np.ix_(rows, idx)])
+    else:
+        Zf = np.eye(len(idx))
+    Z = np.zeros((n, Zf.shape[1]))
+    Z[idx] = Zf
+    return Z
+
+
+def face_held_inverse(W, A, idx, n=None):
+    """``Z (Z^T W Z)^-1 Z^T`` on the coordinates ``idx``, embedded in [n, n].
+
+    The inverse of the Hessian of the Lagrangian ``W`` restricted to the
+    directions along the faces (rows of ``A``, full width) that keep every
+    coordinate outside ``idx`` fixed: the covariance of the fit with the
+    faces held and everything outside ``idx`` frozen. A face whose normal has
+    no component on ``idx`` holds nothing there and drops out. Zero outside
+    ``idx``. Raises if ``Z^T W Z`` is not positive definite.
+    """
+    W = np.asarray(W, dtype=np.float64)
+    n = W.shape[0] if n is None else n
+    idx = np.asarray(idx, dtype=int)
+    Z = face_tangent_basis(np.asarray(A, dtype=np.float64)[:, idx])
+    T = _chol_inv(Z.T @ W[np.ix_(idx, idx)] @ Z)
+    if T is None:
+        raise ValueError(
+            "face_held_inverse: the Hessian of the Lagrangian is not positive "
+            "definite along the held faces on this block."
+        )
+    out = np.zeros((n, n))
+    CI = Z @ T @ Z.T
+    out[np.ix_(idx, idx)] = 0.5 * (CI + CI.T)
+    return out
+
+
+def held_directions_in_group(A, floating, group):
+    """Basis [len(group), r] of the held directions that lie inside ``group``.
+
+    The combinations ``u`` of the group's parameters that the active faces
+    fix, i.e. ``range(A^T)`` intersected with the group's coordinates (with
+    the other floating parameters free): ``u = A[:, group]^T w`` for ``w`` with
+    ``A[:, others]^T w = 0``. The face-held covariance restricted to the
+    group is singular exactly along these, and holding the faces has already
+    fixed them, so the group's conditional uncertainty is taken on their
+    complement. Empty (r = 0) when no face lies entirely inside the group.
+    """
+    A = np.atleast_2d(np.asarray(A, dtype=np.float64))
+    group = np.asarray(group, dtype=int)
+    others = np.setdiff1d(np.asarray(floating, dtype=int), group)
+    Nw = scipy.linalg.null_space(A[:, others].T) if len(others) else np.eye(A.shape[0])
+    if Nw.shape[1] == 0:
+        return np.zeros((len(group), 0))
+    U = A[:, group].T @ Nw
+    if not np.any(U):
+        return np.zeros((len(group), 0))
+    return scipy.linalg.orth(U)
+
+
+def face_held_group_impact(cov, v, group, A, floating):
+    """Grouped (conditional-uncertainty) impact with the active faces held.
+
+    ``sqrt(v C_gg^-1 v^T)`` with ``C`` the face-held covariance and ``v`` its
+    rows for the parameters the impacts are FOR, as in
+    :func:`rabbit.impacts.traditional_impacts._compute_impact_group`, but with
+    ``C_gg`` reduced to the complement of :func:`held_directions_in_group`:
+    there ``C_gg`` is singular (those combinations are fixed by the faces, not
+    by the data) and ``v`` vanishes on them, so the reduction is exact. It is
+    the impact of the group in the fit with the faces held: the quadrature
+    difference of the total and the uncertainty with the group frozen.
+    """
+    C = np.asarray(cov, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    group = np.asarray(group, dtype=int)
+    vg = v[:, group]
+    Cgg = C[np.ix_(group, group)]
+    U = held_directions_in_group(A, floating, group)
+    if U.shape[1]:
+        Q = scipy.linalg.null_space(U.T)
+        vg = vg @ Q
+        Cgg = Q.T @ Cgg @ Q
+    if Cgg.shape[0] == 0:
+        return np.zeros(v.shape[0])
+    return np.sqrt(np.einsum("ij,ji->i", vg, np.linalg.solve(Cgg, vg.T)))
+
+
+def active_faces(grad, cval, jac, lower, upper, floating, active_tol):
+    """The active rows at a point, their multipliers and their sides.
+
+    A row is active when it is within ``active_tol`` of a bound, a floating
+    parameter can move it, and its multiplier has the binding sign (lower:
+    mu > 0, upper: mu < 0; equality rows always), with ``grad = A^T mu`` on
+    the floating parameters. Rows whose multiplier says the loss pulls INTO
+    the allowed region are not binding and are dropped, and the rest refitted.
+
+    Returns ``(active, mu, side)``: row indices, their multipliers, and the
+    side of every row (1 lower, -1 upper, 0 both).
+    """
+    g = np.asarray(grad, dtype=np.float64).reshape(-1)
+    J = np.asarray(jac, dtype=np.float64)
+    cval = np.asarray(cval, dtype=np.float64).reshape(-1)
+    lb = np.asarray(lower, dtype=np.float64).reshape(-1)
+    ub = np.asarray(upper, dtype=np.float64).reshape(-1)
+    F = np.asarray(floating, dtype=int)
+    live = np.abs(J[:, F]).sum(axis=1) > 0
+    near_lo = np.isfinite(lb) & (np.abs(cval - lb) <= active_tol)
+    near_up = np.isfinite(ub) & (np.abs(cval - ub) <= active_tol)
+    side = np.where(near_lo & near_up, 0, np.where(near_lo, 1, -1))
+    active = np.flatnonzero((near_lo | near_up) & live)
+    mu = np.zeros(0)
+    while len(active):
+        mu = np.linalg.lstsq(J[np.ix_(active, F)].T, g[F], rcond=None)[0]
+        wrong = ((side[active] == 1) & (mu < 0)) | ((side[active] == -1) & (mu > 0))
+        if not wrong.any():
+            break
+        active = active[~wrong]
+    if not len(active):
+        mu = np.zeros(0)
+    return active, mu, side
+
+
 def face_held_covariance(
     grad,
     hess,
@@ -83,6 +229,9 @@ def face_held_covariance(
       * ``edm_tangent`` -- 1/2 g^T C g, the distance to the minimum ON the
         faces (C annihilates the face normals).
       * ``hess_lagrangian`` -- W.
+      * ``jacobian_active`` -- A over all n columns ([0, n] with no active
+        face), and ``hess_constraints`` -- ``sum_i mu_i d2c_i`` = H - W (None
+        with no active face): what the face-held impacts need.
       * ``active`` -- per active row: label, value, bound, distance,
         multiplier, ``release_dnll`` (the NLL gained, to second order, by
         releasing it alone with the other faces held; inf if that leaves no
@@ -106,24 +255,7 @@ def face_held_covariance(
         C[np.ix_(F, F)] = CF
         return C
 
-    # active rows: near a bound, a free parameter can move them, and a
-    # multiplier of the binding sign (lower: mu > 0, upper: mu < 0; equality
-    # rows always). Rows whose multiplier says the loss pulls INTO the allowed
-    # region are not binding and are dropped, and the rest refitted.
-    live = np.abs(J[:, F]).sum(axis=1) > 0
-    near_lo = np.isfinite(lb) & (np.abs(cval - lb) <= active_tol)
-    near_up = np.isfinite(ub) & (np.abs(cval - ub) <= active_tol)
-    side = np.where(near_lo & near_up, 0, np.where(near_lo, 1, -1))
-    active = np.flatnonzero((near_lo | near_up) & live)
-    mu = np.zeros(0)
-    while len(active):
-        mu = np.linalg.lstsq(J[np.ix_(active, F)].T, g[F], rcond=None)[0]
-        wrong = ((side[active] == 1) & (mu < 0)) | ((side[active] == -1) & (mu > 0))
-        if not wrong.any():
-            break
-        active = active[~wrong]
-    if not len(active):
-        mu = np.zeros(0)
+    active, mu, side = active_faces(g, cval, J, lb, ub, F, active_tol)
 
     gF = g[F]
     Hi = _chol_inv(H[np.ix_(F, F)])
@@ -143,6 +275,8 @@ def face_held_covariance(
             cov_held=out["cov_released"],
             edm_tangent=out["edm_released"],
             hess_lagrangian=H,
+            jacobian_active=np.zeros((0, n)),
+            hess_constraints=None,
             active=[],
             release_dnll_joint=0.0,
         )
@@ -155,7 +289,7 @@ def face_held_covariance(
     WF = W[np.ix_(F, F)]
     A = J[np.ix_(active, F)]
 
-    Z = scipy.linalg.null_space(A)
+    Z = face_tangent_basis(A)
     T = _chol_inv(Z.T @ WF @ Z)
     if T is None:
         raise ValueError(
@@ -193,6 +327,8 @@ def face_held_covariance(
         cov_held=embed(Chel),
         edm_tangent=edm_tangent,
         hess_lagrangian=W,
+        jacobian_active=J[active],
+        hess_constraints=Hc,
         active=[
             {
                 "label": labels[i],
@@ -210,24 +346,24 @@ def face_held_covariance(
     return out
 
 
-def report_constrained_postfit(
-    result,
-    ws,
-    active_tol,
-    global_impacts=False,
-    hessian_impacts=False,
-):
+def report_constrained_postfit(result, ws, active_tol):
     """Log a :func:`face_held_covariance` result and write it to ``ws``.
 
     Writes ``cov_released`` / ``edmval_released`` (when defined) and the
     ``constraints_postfit`` summary; the caller stores ``cov_held`` as the
     fit's ``cov`` and ``edm_tangent`` as its ``edmval``.
 
-    Returns True when the Hessian-based impacts (``--doImpacts``,
-    ``--gaussianGlobalImpacts``, requested via ``hessian_impacts``) must be
-    skipped because a face is active.
+    The impacts at an active face are taken with the faces held (see
+    ``Fitter.constrained_postfit``): the traditional ones from the Hessian of
+    the Lagrangian on the face directions (:func:`face_held_inverse`,
+    :func:`face_held_group_impact`), the global ones from the face-held
+    covariance, which is the response of the constrained minimum to the
+    global observables (implicit-function theorem on the KKT system, the
+    constraints not depending on them). All of them equal those of the fit
+    with the faces eliminated; the global data-stat remainder keeps its usual
+    definition, the face curvature term sum mu d2c counting as data (in the
+    eliminated coordinates it is part of the data Hessian).
     """
-    faces_active = len(result["active"]) > 0
     released = result["edm_released"]
     logger.info(
         f"edmval (on the active faces): {result['edm_tangent']}; released: "
@@ -249,7 +385,7 @@ def report_constrained_postfit(
                 else ""
             )
         )
-    if not faces_active:
+    if not result["active"]:
         logger.info("[constraints] no constraint is active at the minimum")
 
     if result["cov_released"] is not None:
@@ -263,37 +399,3 @@ def report_constrained_postfit(
         },
         "constraints_postfit",
     )
-
-    if faces_active and global_impacts:
-        logger.warning(
-            "--globalImpacts at an active constraint face: the per-source impacts "
-            "use the face-held covariance, but the grouped decomposition's "
-            "remainder ('stat') is not defined there and can come out NaN or the "
-            "groups can exceed the total in quadrature."
-        )
-    skip = faces_active and hessian_impacts
-    if skip:
-        # Skipped, not refused: only after the fit is it known which faces are
-        # active, and raising would throw away a converged fit. Everything else
-        # is still written.
-        #
-        # Why: impacts_parms(hess) and gaussian_global_impacts_parms (through
-        # _dxdvars) use the UNCONSTRAINED loss Hessian, which lets the fit move
-        # through the face, so they would describe the released problem, not
-        # the fit that was run.
-        #
-        # Known fix (not implemented): compute both from the face-held problem,
-        # i.e. the Hessian of the Lagrangian W restricted to the directions
-        # along the faces, Z^T W Z, as face_held_covariance does for the
-        # covariance. For the Gaussian global impacts that is replacing H^-1 by
-        # C_held in the response dx/d(data, constraints) = -C_held
-        # d(grad)/d(data, constraints); for the traditional (grouped) impacts,
-        # each group's conditional variance taken on the face (the same
-        # projection inside impacts_parms). Validate against a fit with the
-        # active face frozen, as the covariance was.
-        logger.warning(
-            "Skipping --doImpacts/--gaussianGlobalImpacts: they are computed from "
-            "the unconstrained Hessian, which is wrong at an active constraint "
-            "face. --globalImpacts uses the face-held covariance."
-        )
-    return skip

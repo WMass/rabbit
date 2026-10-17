@@ -542,9 +542,11 @@ def test_rabbit_fit_stores_the_constrained_postfit(tmp_path):
     assert res["edmval"] < 1e-8 < res["edmval_released"]
 
 
-def test_hessian_impacts_are_skipped_at_an_active_face(tmp_path):
-    """--doImpacts at an active face: skipped with a warning, and the fit and
-    the rest of the post-fit are still written (not a crash after the fit)."""
+def test_impacts_are_written_at_an_active_face(tmp_path):
+    """--doImpacts/--globalImpacts/--gaussianGlobalImpacts at an active face:
+    all written, with the faces held (tests/test_face_held_impacts.py checks
+    the numbers), the held parameter's own impacts exactly zero and the
+    grouped data-stat finite."""
     import os
     import subprocess
     import sys
@@ -570,6 +572,8 @@ def test_hessian_impacts_are_skipped_at_an_active_face(tmp_path):
             "-t",
             "0",
             "--doImpacts",
+            "--globalImpacts",
+            "--gaussianGlobalImpacts",
             "--minimizerMethod",
             "trust-constr",
             "--minimizerGtol",
@@ -588,10 +592,15 @@ def test_hessian_impacts_are_skipped_at_an_active_face(tmp_path):
         text=True,
     )
     assert r.returncode == 0, r.stderr[-2000:]
-    assert "Skipping --doImpacts" in r.stdout + r.stderr
+    assert "Skipping" not in r.stdout + r.stderr
     res = io_tools.get_fitresult(str(out / "fitresults.hdf5"))
-    assert "cov" in res and "constraints_postfit" in res
-    assert not any(k.startswith("impacts") for k in res)
+    assert len(res["constraints_postfit"]["active"]) == 1
+    for base in ("impacts", "global_impacts", "gaussian_global_impacts"):
+        imp, grp = res[base].get(), res[f"{base}_grouped"].get()
+        assert np.all(np.isfinite(imp.values())), base
+        assert np.all(np.isfinite(grp.values())), base
+        i = list(imp.axes["impacts"]).index("bkg_norm")
+        assert np.all(imp.values()[:, i] == 0), base
 
 
 def test_constraints_refuse_multi_device():
