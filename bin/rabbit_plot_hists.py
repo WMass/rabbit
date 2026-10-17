@@ -1107,16 +1107,19 @@ def make_plot(
         text_pieces.extend(selection)
 
     if chi2[0] is not None and data and not args.noExtraText:
-        p_val = int(np.round(scipy.stats.chi2.sf(chi2[0], chi2[1]) * 100))
+        if len(chi2) > 2 and chi2[2] is not None:
+            # a stored p-value (MC-stat de-biased fit); NaN = not available
+            p_val = int(np.round(chi2[2] * 100)) if np.isfinite(chi2[2]) else None
+        else:
+            p_val = int(np.round(scipy.stats.chi2.sf(chi2[0], chi2[1]) * 100))
         if saturated_chi2:
             chi2_name = r"$\mathit{\chi}_{\mathrm{sat.}}^2/\mathit{ndf}$"
         else:
             chi2_name = r"$\mathit{\chi}^2/\mathit{ndf}$"
 
-        chi2_text = [
-            rf"{chi2_name} = ${np.round(chi2[0],1)}/{chi2[1]}$",
-            rf"$(\mathit{{p}}={p_val}\%)$",
-        ]
+        chi2_text = [rf"{chi2_name} = ${np.round(chi2[0],1)}/{chi2[1]}$"]
+        if p_val is not None:
+            chi2_text.append(rf"$(\mathit{{p}}={p_val}\%)$")
 
         if args.extraTextLoc is None or len(args.extraTextLoc) <= 2:
             text_pieces.extend(chi2_text)
@@ -1487,7 +1490,7 @@ def make_plots(
 
 def get_chi2(result, no_chi2=True, fittype="postfit", chi2type="automatic"):
     if no_chi2:
-        return None, None, False
+        return None, None, False, None
 
     if fittype == "prefit":
         if chi2type in [
@@ -1510,7 +1513,9 @@ def get_chi2(result, no_chi2=True, fittype="postfit", chi2type="automatic"):
                 # use saturated likelihood test from actual fit
                 chi2 = 2.0 * result["nllvalreduced"]
                 ndf = result["ndfsat"]
-                return chi2, ndf, True
+                # an MC-stat de-biased fit's statistic is not chi2(ndf): use the
+                # p-value from its own reference (Fitter.mcstat_gof)
+                return chi2, ndf, True, result.get("mcstat_gof_pvalue")
             elif f"{chi2_key}_saturated" in result.keys():
                 # use saturated likelihood test from mapping
                 chi2_key += "_saturated"
@@ -1523,7 +1528,10 @@ def get_chi2(result, no_chi2=True, fittype="postfit", chi2type="automatic"):
         else:
             saturated = False
 
-    return result.get(chi2_key, None), result.get(ndf_key, None), saturated
+    # an MC-stat de-biased fit's saturated projection test is not chi2(ndf): use
+    # the p-value from its own reference
+    pvalue = result.get("mcstat_pvalue_saturated") if saturated else None
+    return result.get(chi2_key, None), result.get(ndf_key, None), saturated, pvalue
 
 
 def main():
@@ -1625,7 +1633,7 @@ def main():
 
             instance = results[instance_key]
 
-            chi2, ndf, saturated_chi2 = get_chi2(
+            chi2, ndf, saturated_chi2, chi2_pvalue = get_chi2(
                 (
                     fitresult
                     if fittype == "postfit"
@@ -1713,7 +1721,7 @@ def main():
                     outdir,
                     config,
                     channel=suffix,
-                    chi2=[chi2, ndf],
+                    chi2=[chi2, ndf, chi2_pvalue],
                     saturated_chi2=saturated_chi2,
                     lumi=lumi,
                     is_normalized=is_normalized,

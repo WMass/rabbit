@@ -513,12 +513,19 @@ class BinByBinStat:
         profile=True,
         compute_norm=False,
         full=True,
+        fixed_beta=None,
+        add_ubeta=True,
     ):
         """Profile β (when ``profile=True``) and apply it to ``nexp`` / ``norm``.
 
         Returns ``(nexp, norm, beta)`` where ``beta`` is the (possibly
         profiled) β tensor. When BBB is disabled, returns the inputs
         untouched and ``beta=None``.
+
+        ``fixed_beta``: the β applied when not profiling (default the stored
+        ``self.beta``). ``add_ubeta``: add the dummy ``ubeta`` through which
+        callers differentiate by β; off for predictions whose β is not the
+        fit's (the MC-stat de-biasing's half terms).
         """
         if not self.enabled:
             return nexp, norm, None
@@ -941,11 +948,12 @@ class BinByBinStat:
             if self.indata.nbinsmasked:
                 beta = tf.concat([beta, self.beta0[self.indata.nbins :]], axis=0)
         else:
-            beta = self.beta
+            beta = self.beta if fixed_beta is None else fixed_beta
 
         # Add dummy tensor to allow convenient differentiation by beta even
         # when profiling
-        beta = beta + self.ubeta
+        if add_ubeta:
+            beta = beta + self.ubeta
 
         betasel = beta[: nexp.shape[0]]
         if self.dynamic and self.binByBinStatType != "normal-additive":

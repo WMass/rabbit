@@ -14,7 +14,6 @@ from scipy.stats import norm
 from rabbit import asymptotic_limits, fitter, inputdata, parsing, workspace
 from rabbit.mappings import helpers as mh
 from rabbit.param_models import helpers as ph
-from rabbit.tfhelpers import edmval_cov
 
 from wums import output_tools, logging  # isort: skip
 
@@ -50,6 +49,51 @@ def make_parser():
     return parser
 
 
+def _postfit_cov(fitter):
+    """Postfit covariance at the current point, as rabbit_fit.py reports it: for
+    an MC-stat de-biased fit the sandwich, with the curvature covariance kept
+    for the adjusted likelihood contours (Fitter.mcstat_scan_adjustment)."""
+    val, grad, hess = fitter.loss_val_grad_hess()
+    edmval, _, cov_curv, cov = fitter.mcstat_postfit_covariances(grad, hess)
+    fitter.cov.assign(cov)
+    if fitter.mcstat_debias_active:
+        fitter.mcstat_cov_curv.assign(cov_curv)
+        fitter.set_mcstat_scan_covariances(
+            np.arange(int(fitter.x.shape[0])), cov_curv, cov
+        )
+    return edmval
+
+
+def _mcstat_contour_factor(fitter, idx=None, fun=None):
+    """Adjustment of the likelihood-contour level for an MC-stat de-biased fit:
+    the profile of the de-biased objective reaches q at q / factor, factor =
+    curvature / reported variance of the parameter (idx) or of the mapping
+    output (fun). 1 for an ordinary fit."""
+    if not fitter.mcstat_scan_needs_adjustment():
+        return 1.0
+    if fun is None:
+        return float(fitter.mcstat_scan_adjustment([idx], [[1.0]])[0])
+
+    def variance():
+        return fitter.expected_with_variance(
+            fun,
+            profile=True,
+            compute_cov=False,
+            compute_global_impacts=False,
+            need_observables=True,
+            inclusive=True,
+        )[1].numpy()[0]
+
+    var_reported = variance()
+    cov = fitter.cov.numpy()
+    fitter.cov.assign(fitter.mcstat_cov_curv)
+    try:
+        var_curv = variance()
+    finally:
+        fitter.cov.assign(cov)
+    return float(var_curv / var_reported)
+
+
 def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=False):
     if fit_data:
         logger.info("Perform background only fit")
@@ -64,23 +108,23 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
         # defreeze process again to evaluate it's dependencies
         fitter.defreeze_params(args.asymptoticLimits)
 
+        # a de-biased objective on Asimov data is recentred at the generating
+        # point, and its covariance is the expected one
+        fitter.set_mcstat_asimov(True)
+
     if not args.noHessian:
         # compute the covariance matrix and estimated distance to minimum
 
-        val, grad, hess = fitter.loss_val_grad_hess()
-        edmval, cov = edmval_cov(grad, hess)
+        edmval = _postfit_cov(fitter)
 
         logger.info(f"edmval: {edmval}")
-
-        fitter.cov.assign(cov)
-
-        del cov
 
     # Clone fitter to simultaneously minimize on asimov dataset
     fitter_asimov = copy.deepcopy(fitter)
 
     if fit_data:
         logger.info("Unconditional fit to real data")
+        fitter.set_mcstat_asimov(False)
         fitter.set_nobs(data_values)
         fitter.minimize()
 
@@ -153,9 +197,7 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
             xerr = xerr.numpy()
 
             # for observed limit
-            val, grad, hess = fitter.loss_val_grad_hess()
-            edmval, cov = edmval_cov(grad, hess)
-            fitter.cov.assign(cov)
+            _postfit_cov(fitter)
             xobs_err = fitter.cov[idx, idx] ** 0.5
 
             if is_poi and not args.allowNegativeParam:
@@ -166,6 +208,14 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
 
         # this is the denominator of q for likelihood based limits
         nllvalreduced_asimov = fitter_asimov.reduced_nll().numpy()
+        contour_factor = (
+            _mcstat_contour_factor(
+                fitter_asimov, idx=None if fun is not None else idx, fun=fun
+            )
+            if "likelihood" in args.modes
+            else 1.0
+        )
+        logger.debug(f"MC-stat contour adjustment factor for {key}: {contour_factor}")
 
         for j, cl_s in enumerate(args.levels):
             logger.info(f" -- AsymptoticLimits ( CLs={round(cl_s*100,1):4.1f}% ) -- ")
@@ -185,9 +235,15 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
                     limits[i, j, k] = r
 
                 if "likelihood" in args.modes:
-                    # Likelihood approximation
+                    # Likelihood approximation; a de-biased objective's profile
+                    # is calibrated to its curvature, so the level is adjusted
+                    # to the reported (sandwich) uncertainty
                     r, _ = fitter_asimov.contour_scan(
-                        key, nllvalreduced_asimov, qmuA, signs=[1], fun=fun
+                        key,
+                        nllvalreduced_asimov,
+                        qmuA / contour_factor,
+                        signs=[1],
+                        fun=fun,
                     )
                     logger.info(
                         f"Expected (Likelihood) {round((cl_b)*100,1):4.1f}%: {key} < {r}"
@@ -376,6 +432,7 @@ def main():
                 prefit_time.append(time.time())
 
                 observations = data_values if ifit >= 0 else ifitter.expected_yield()
+                ifitter.set_mcstat_asimov(ifit == -1)
 
                 do_asymptotic_limits(
                     args,

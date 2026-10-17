@@ -182,6 +182,37 @@ class FitInputData:
 
                 self.sumw2 = tf.where(kstat == 0.0, self.sumw, self.sumw2)
 
+            # MC-stat cross-fit fold templates (optional; present only when a
+            # process was written with a fold_axis), used by the two-half /
+            # k-fold de-biasing in the fitter: [k, nbinsfull, nproc] dense, or in
+            # sparse mode [k, nnz] values on the sparsity pattern of self.norm.
+            if "hnorm_folds" in f.keys():
+                self.norm_folds = maketensor(f["hnorm_folds"])
+                self.mcstat_fold_k = int(
+                    f.attrs.get("mcstat_fold_k", self.norm_folds.shape[0])
+                )
+            else:
+                self.norm_folds = None
+                self.mcstat_fold_k = None
+
+            # Split-logk fold tensor [k, nbinsfull, nproc, nsyst] (optional;
+            # present only when a systematic was written with a fold_axis). When
+            # absent, two-half de-biasing shares one logk across folds.
+            if "hlogk_folds" in f.keys():
+                self.logk_folds = maketensor(f["hlogk_folds"])
+            else:
+                self.logk_folds = None
+
+            # Sparse split-logk: per-fold logk delta for the folded systs,
+            # [k, nnz, nfolded] on the sparsity pattern of self.norm, + the
+            # folded global syst indices.
+            if "hlogk_folds_delta" in f.keys():
+                self.logk_folds_delta = maketensor(f["hlogk_folds_delta"])
+                self.mcstat_folded_syst_idx = maketensor(f["hmcstat_folded_syst_idx"])
+            else:
+                self.logk_folds_delta = None
+                self.mcstat_folded_syst_idx = None
+
             # compute indices for channels
             ibin = 0
             for channel, info in self.channel_info.items():
@@ -208,6 +239,17 @@ class FitInputData:
             from rabbit.external_likelihood import read_external_terms_from_h5
 
             self.external_terms = read_external_terms_from_h5(f.get("external_terms"))
+            # per-bin variance convention of the continuous-M moment terms
+            # (TensorWriter.add_mc_stat_moment), checked against the fit's
+            # bin-by-bin stat setting in the Fitter
+            self.mcstat_moment_variance = {}
+            if "external_terms" in f:
+                for tname, tg in f["external_terms"].items():
+                    if "mcstat_variance" in tg.attrs:
+                        v = tg.attrs["mcstat_variance"]
+                        self.mcstat_moment_variance[tname] = (
+                            v.decode() if isinstance(v, bytes) else str(v)
+                        )
 
             # Load generic auxiliary array bundles (optional). See rabbit.auxiliary.
             from rabbit.auxiliary import read_auxiliary_from_h5

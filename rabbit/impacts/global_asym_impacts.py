@@ -173,7 +173,9 @@ def global_asym_impacts_parms(
             fitter.x.assign(x_shifted)
 
             try:
-                fitter.minimize()
+                # starts at the (shifted) postfit point, already in the basin of
+                # the de-biased minimum: no ordinary-likelihood warm start
+                fitter.minimize(mcstat_warm_start=False)
                 if fitter.bbstat.enabled:
                     fitter._profile_beta()
                 impacts[k, j] = (fitter.x.value() - x_nom).numpy()

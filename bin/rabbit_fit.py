@@ -555,59 +555,119 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                 # they read the wrong entries. xdefaultassign() above is deliberate but does not
                 # arm them.
                 fitter_saturated.arm_regularizers()
-                cb = fitter_saturated.minimize()
-                cov_saturated = None
-                edmval = None
-                if not args.noHessian:
-                    _, grad, hess = fitter_saturated.loss_val_grad_hess()
-                    try:
-                        edmval, cov_saturated = fitter_saturated.edmval_cov(grad, hess)
-                        logger.info(f"edmval: {edmval}")
-                    except (ValueError, np.linalg.LinAlgError) as e:
-                        # the saturated parameters can be degenerate with parameters of the
-                        #   original model, e.g. if a parameter only affects bins that are
-                        #   made free by the saturated model. The test statistic itself does
-                        #   not need the hessian and stays valid.
+                saturated_ok = True
+                if fitter_saturated.mcstat_debias_active:
+                    # bread and meat of the composite at the null point (the
+                    # main fit's minimum, bin scales at 1), for the reference
+                    # of the de-biased test (Fitter.mcstat_projection_test)
+                    if args.noHessian:
+                        raise RuntimeError(
+                            "--computeSaturatedProjectionTests of an MC-stat "
+                            "de-biased fit needs the dense curvature of the "
+                            "saturated model; drop --noHessian."
+                        )
+                    null_bread, null_meat = fitter_saturated.mcstat_curvature_and_meat()
+                    ok, worst = fitter_saturated.mcstat_projection_check(
+                        np.arange(orig_model.nparams, composite_model.nparams)
+                    )
+                    if not ok:
                         logger.warning(
-                            f"Could not compute the covariance of the saturated fit for '{mapping.key}': {e}"
+                            f"Skipping the saturated projection test of "
+                            f"'{mapping.key}': the bin scales have directions the "
+                            "data cannot constrain but the de-biased objective "
+                            f"is not flat along (relative curvature {worst:.2g}), "
+                            "so a saturated de-biased fit would follow template "
+                            "noise. This happens when the projection integrates "
+                            "out what separates the processes the analysis "
+                            "parameters normalize."
+                        )
+                        ws.add_value(
+                            float("nan"), "mcstat_pvalue_saturated", mapping.key
+                        )
+                        saturated_ok = False
+                if saturated_ok:
+                    # mcstat_warm_start=False: the start above is already the main
+                    # (de-biased) fit's minimum, which q >= 0 relies on
+                    cb = fitter_saturated.minimize(mcstat_warm_start=False)
+                    cov_saturated = None
+                    edmval = None
+                    if not args.noHessian:
+                        _, grad, hess = fitter_saturated.loss_val_grad_hess()
+                        try:
+                            edmval, _, _, cov_saturated = (
+                                fitter_saturated.mcstat_postfit_covariances(grad, hess)
+                            )
+                            logger.info(f"edmval: {edmval}")
+                        except (ValueError, np.linalg.LinAlgError) as e:
+                            # the saturated parameters can be degenerate with parameters of the
+                            #   original model, e.g. if a parameter only affects bins that are
+                            #   made free by the saturated model. The test statistic itself does
+                            #   not need the hessian and stays valid.
+                            logger.warning(
+                                f"Could not compute the covariance of the saturated fit for '{mapping.key}': {e}"
+                            )
+
+                    nllvalreduced = fitter_saturated.reduced_nll().numpy()
+
+                    ndf = saturated_model.npou
+                    chi2val = 2.0 * (ws.results["nllvalreduced"] - nllvalreduced)
+                    p_val = chi2.sf(chi2val, ndf)
+                    mcstat_p_val = None
+                    if fitter_saturated.mcstat_debias_active:
+                        # composite-likelihood ratio of two nested de-biased fits:
+                        # sum_j mu_j chi2_1 (Fitter.mcstat_projection_test)
+                        psi = np.arange(orig_model.nparams, composite_model.nparams)
+                        mcstat_p_val, mu = fitter_saturated.mcstat_projection_test(
+                            chi2val, psi, null_bread, null_meat
+                        )
+                        p_val = mcstat_p_val
+
+                    logger.info("Saturated chi2:")
+                    logger.info(f"    ndof: {ndf}")
+                    logger.info(f"    2*deltaNLL: {round(chi2val, 2)}")
+                    if mcstat_p_val is not None:
+                        logger.info(
+                            "    MC-stat de-biased fit: reference sum_j mu_j chi2_1, "
+                            f"sum mu = {np.sum(mu):.2f} (expected 2*deltaNLL), "
+                            f"mu in [{mu.min():.3f}, {mu.max():.3f}]"
+                        )
+                    logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
+
+                    ws.add_chi2(
+                        chi2val, ndf, prefit, mapping, saturated=True, edmval=edmval
+                    )
+                    if mcstat_p_val is not None:
+                        # 2*deltaNLL is not chi2(ndf) here: consumers must take the
+                        # p-value from this
+                        ws.add_value(
+                            float(mcstat_p_val), "mcstat_pvalue_saturated", mapping.key
                         )
 
-                nllvalreduced = fitter_saturated.reduced_nll().numpy()
-
-                ndf = saturated_model.npou
-                chi2val = 2.0 * (ws.results["nllvalreduced"] - nllvalreduced)
-                p_val = chi2.sf(chi2val, ndf)
-
-                logger.info("Saturated chi2:")
-                logger.info(f"    ndof: {ndf}")
-                logger.info(f"    2*deltaNLL: {round(chi2val, 2)}")
-                logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
-
-                ws.add_chi2(
-                    chi2val, ndf, prefit, mapping, saturated=True, edmval=edmval
-                )
-
-                # Persist the saturated fit itself, not just its chi2, under
-                # results["mappings"][<mapping>]["saturated_fit"], using the same
-                # key names the primary fit uses at top level.
-                SAT = dict(mapping_key=mapping.key, group="saturated_fit")
-                ws.add_value(float(nllvalreduced), "nllvalreduced", **SAT)
-                ws.add_named_parms_hist(
-                    fitter_saturated.x.numpy(),
-                    fitter_saturated.parms,
-                    variances=(
-                        np.diag(cov_saturated) if cov_saturated is not None else None
-                    ),
-                    **SAT,
-                )
-                ws.add_minimizer_status(fitter_saturated.minimizer_status(), **SAT)
-                if edmval is not None:
-                    ws.add_value(float(edmval), "edmval", **SAT)
-                if cov_saturated is not None:
-                    ws.add_named_cov_hist(cov_saturated, fitter_saturated.parms, **SAT)
-                if cb is not None and getattr(cb, "loss_history", None) is not None:
-                    ws.add_1D_integer_hist(cb.loss_history, "epoch", "loss", **SAT)
-                    ws.add_1D_integer_hist(cb.time_history, "epoch", "time", **SAT)
+                    # Persist the saturated fit itself, not just its chi2, under
+                    # results["mappings"][<mapping>]["saturated_fit"], using the same
+                    # key names the primary fit uses at top level.
+                    SAT = dict(mapping_key=mapping.key, group="saturated_fit")
+                    ws.add_value(float(nllvalreduced), "nllvalreduced", **SAT)
+                    ws.add_named_parms_hist(
+                        fitter_saturated.x.numpy(),
+                        fitter_saturated.parms,
+                        variances=(
+                            np.diag(cov_saturated)
+                            if cov_saturated is not None
+                            else None
+                        ),
+                        **SAT,
+                    )
+                    ws.add_minimizer_status(fitter_saturated.minimizer_status(), **SAT)
+                    if edmval is not None:
+                        ws.add_value(float(edmval), "edmval", **SAT)
+                    if cov_saturated is not None:
+                        ws.add_named_cov_hist(
+                            cov_saturated, fitter_saturated.parms, **SAT
+                        )
+                    if cb is not None and getattr(cb, "loss_history", None) is not None:
+                        ws.add_1D_integer_hist(cb.loss_history, "epoch", "loss", **SAT)
+                        ws.add_1D_integer_hist(cb.time_history, "epoch", "time", **SAT)
 
         if args.saveHistsPerProcess and not mapping.skip_per_process:
             logger.info(f"Save processes histogram for {mapping.key}")
@@ -841,6 +901,15 @@ def fit(args, fitter, ws, dofit=True):
     # "--externalPostfit <result with a covariance> --globalImpacts" skipped
     # the whole block and wrote no impacts at all, while still exiting 0.
     cov_available = False
+    # covariance for the global impacts to decompose (None = fitter.cov); a
+    # de-biased fit sets it to the de-biased curvature covariance below.
+    global_impacts_cov = None
+    # for a de-biased fit, the variance the reported covariance adds to the
+    # curvature one, for the mcStatDebias / mcStat impact groups
+    mcstat_extra_var = None
+    # tr(A^-1 H) of a de-biased fit, for the goodness-of-fit reference below
+    mcstat_gof_trace = None
+    _covmode = getattr(fitter, "covMode", "observed")
 
     if recompute_cov:
         if args.noEDM and fitter.do_blinding:
@@ -861,6 +930,13 @@ def fit(args, fitter, ws, dofit=True):
                 f"[timing] loss_val_grad_hess() (postfit cov): "
                 f"{time.perf_counter() - _t_hess:.1f} s"
             )
+
+            # --covMode fisher: replace the observed-Hessian curvature with the
+            # Gauss-Newton expected information (J^T D J + nondata), used as the
+            # bread for the (de-biased) covariance everywhere. Applies to the
+            # standard cov and the sandwich bread consistently.
+            bread = fitter.fisher_curvature(hess) if _covmode == "fisher" else hess
+
             _t_edm = time.perf_counter()
             if len(fitter.constraints):
                 # Hard constraints: at an active face the plain EDM and H^-1
@@ -869,7 +945,7 @@ def fit(args, fitter, ws, dofit=True):
                 # impacts and the histogram errors then use) and the released
                 # one alongside; see rabbit.constraints.postfit.
                 cpf = fitter.constrained_postfit(
-                    grad, hess, active_tol=args.constraintActiveTol
+                    grad, bread, active_tol=args.constraintActiveTol
                 )
                 skip_hessian_impacts = cpostfit.report_constrained_postfit(
                     cpf,
@@ -882,13 +958,60 @@ def fit(args, fitter, ws, dofit=True):
                 cov = tf.constant(cpf["cov_held"], dtype=fitter.indata.dtype)
                 del cpf
             else:
-                edmval, cov = fitter.edmval_cov(grad, hess)
+                edmval, cov = fitter.edmval_cov(grad, bread)
                 logger.info(f"edmval: {edmval}")
             logger.debug(f"[timing] edmval_cov(): {time.perf_counter() - _t_edm:.1f} s")
+            # the de-biased CURVATURE covariance, kept for the impacts below
+            cov_curv = cov
+
+            # Robust (sandwich) covariance for the de-biased fit. Bread = the
+            # (fisher- or observed-) curvature `bread`; continuous-M uses the
+            # analytic meat H = A + M (Sigma = A^-1 + A^-1 M A^-1), two-half uses
+            # the full-sample meat (both in --covMode). cov_curv is kept so the
+            # impacts can decompose the de-biased CURVATURE consistently and the
+            # sandwich's extra term is reported as the `mcStatDebias` group.
+            _debias = getattr(fitter, "mcStatDebias", "none")
+            _debiascov = getattr(fitter, "mcStatDebiasCov", "sandwich")
+            _is_debiased = getattr(fitter, "mcstat_debias_active", False)
+            if _is_debiased:
+                cov = fitter.mcstat_reported_cov(bread, cov_curv, covMode=_covmode)
+                logger.info(
+                    {
+                        "dataPropagated": "Reporting data-propagated Var(score) "
+                        "sandwich (Huber-White, conservative/over-covers; "
+                        "docs/mcstat/RESULTS.md §7d)",
+                        "sandwich": f"Reporting {_debias} sandwich covariance "
+                        f"(covMode={_covmode})",
+                        "curvature": "Reporting the de-biased curvature covariance",
+                    }[_debiascov]
+                )
+
+            if _is_debiased:
+                mcstat_extra_var = tf.linalg.diag_part(cov) - tf.linalg.diag_part(
+                    cov_curv
+                )
+                # adjusted likelihood scans need both the curvature and the
+                # reported covariance (Fitter.mcstat_scan_adjustment)
+                fitter.set_mcstat_scan_covariances(
+                    np.arange(int(fitter.x.shape[0])), cov_curv, cov
+                )
+                if fitter.mcStatDebias != "continuousM":
+                    # effective number of fitted parameters tr(A^-1 H) over the
+                    # floating parameters, for the goodness of fit (mcstat_gof)
+                    fl = fitter.floating_indices
+                    if _debiascov == "sandwich":
+                        AinvH = np.asarray(cov) @ np.asarray(bread)
+                    else:
+                        AinvH = np.asarray(cov_curv) @ np.asarray(
+                            fitter.mcstat_meat(_covmode)
+                        )
+                    mcstat_gof_trace = float(np.trace(AinvH[np.ix_(fl, fl)]))
 
             ws.add_cov_hist(cov)
 
             fitter.cov.assign(cov)
+            if _is_debiased:
+                fitter.mcstat_cov_curv.assign(cov_curv)
             del cov
 
             if fitter.bbstat.enabled and fitter.diagnostics:
@@ -902,12 +1025,24 @@ def fit(args, fitter, ws, dofit=True):
 
             if args.doImpacts and not skip_hessian_impacts:
                 _t_imp = time.perf_counter()
-                ws.add_impacts_hists(*fitter.impacts_parms(hess))
+                # Decompose the de-biased CURVATURE (cov_curv) with the matching
+                # curvature `bread`, so total/syst/stat are consistent, and append
+                # diag(reported - curvature) as the `mcStatDebias` group and the
+                # combined `mcStat` group (bin-by-bin stat and de-biasing).
+                ws.add_impacts_hists(
+                    *fitter.impacts_parms(
+                        bread, cov=cov_curv, mcstat_extra_var=mcstat_extra_var
+                    )
+                )
                 logger.debug(
                     f"[timing] impacts_parms(): {time.perf_counter() - _t_imp:.1f} s"
                 )
 
             del hess
+
+            if _is_debiased:
+                # de-biased fit: global impacts decompose the de-biased curvature
+                global_impacts_cov = cov_curv
 
             parms_variances = tf.linalg.diag_part(fitter.cov)
             cov_available = True
@@ -941,9 +1076,28 @@ def fit(args, fitter, ws, dofit=True):
             )
 
             _t_edm = time.perf_counter()
-            edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)
+            if fitter.mcstat_debias_active or _covmode == "fisher":
+                # same curvature as the dense path (de-biased; Gauss-Newton
+                # under --covMode fisher) and, for a de-biased fit, the
+                # sandwich c_i^T H c_j with c_i = A^-1 e_i -- all from
+                # Hessian-vector products
+                edmval, curv_block, cov_block = fitter.cov_block_hessfree(
+                    grad, poi_noi_idx, covMode=_covmode
+                )
+                if fitter.mcstat_debias_active:
+                    fitter.set_mcstat_scan_covariances(
+                        poi_noi_idx, curv_block, cov_block
+                    )
+                    if fitter.mcStatDebiasCov == "sandwich":
+                        logger.info(
+                            "Reporting the Hessian-free sandwich variances of the "
+                            "POIs and NOIs"
+                        )
+            else:
+                edmval, cov_rows = fitter.edmval_cov_rows_hessfree(grad, poi_noi_idx)
+                cov_block = cov_rows[:, poi_noi_idx]
             logger.debug(
-                f"[timing] edmval_cov_rows_hessfree(): {time.perf_counter() - _t_edm:.1f} s"
+                f"[timing] Hessian-free covariance: {time.perf_counter() - _t_edm:.1f} s"
             )
             logger.info(f"edmval: {edmval}")
 
@@ -954,7 +1108,7 @@ def fit(args, fitter, ws, dofit=True):
             n = int(fitter.x.shape[0])
             parms_variances_np = np.full(n, np.nan, dtype=np.float64)
             for k, i in enumerate(poi_noi_idx):
-                parms_variances_np[int(i)] = cov_rows[k, int(i)]
+                parms_variances_np[int(i)] = cov_block[k, k]
             parms_variances = tf.constant(parms_variances_np, dtype=fitter.indata.dtype)
     else:
         # The covariance came from --externalPostfit, so no Hessian was
@@ -970,6 +1124,17 @@ def fit(args, fitter, ws, dofit=True):
                 "--externalPostfit at the fit result from before the Hessian "
                 "pass (the one without a covariance) so it is recomputed here, "
                 "or use --globalImpacts, which needs only the covariance."
+            )
+        if fitter.mcstat_debias_active and (
+            args.globalImpacts or args.computeHistImpacts
+        ):
+            # their mcStatDebias / mcStat groups decompose the curvature
+            # covariance, which an external result does not carry
+            raise Exception(
+                "--globalImpacts / --computeHistImpacts of an MC-stat de-biased fit "
+                "need its curvature covariance, which is not read from "
+                "--externalPostfit. Point --externalPostfit at a result without a "
+                "covariance (e.g. from --noHessian) so it is recomputed here."
             )
         # Only the parameters the external result actually covered have a
         # postfit variance here; the rest come back NaN, and partial coverage
@@ -1008,7 +1173,9 @@ def fit(args, fitter, ws, dofit=True):
         if args.globalImpacts:
             _t_gimp = time.perf_counter()
             ws.add_impacts_hists(
-                *fitter.global_impacts_parms(),
+                *fitter.global_impacts_parms(
+                    cov=global_impacts_cov, mcstat_extra_var=mcstat_extra_var
+                ),
                 base_name="global_impacts",
                 global_impacts=True,
             )
@@ -1021,6 +1188,7 @@ def fit(args, fitter, ws, dofit=True):
                 *fitter.gaussian_global_impacts_parms(),
                 base_name="gaussian_global_impacts",
                 global_impacts=True,
+                gaussian=True,
             )
 
     # Whether the blinding actually hid anything can only be judged against the
@@ -1048,6 +1216,21 @@ def fit(args, fitter, ws, dofit=True):
 
     chi2_val = 2.0 * nllvalreduced
     p_val = chi2.sf(chi2_val, ndfsat)
+    mcstat_gof = None
+    if fitter.mcstat_debias_active and fitter.mcStatDebias != "continuousM":
+        # Same statistic as for an ordinary fit (the de-biased objective, with
+        # bin-by-bin stat, at its minimum), but its reference distribution is not
+        # chi2(ndfsat): see Fitter.mcstat_gof. The bin-by-bin stat compensator,
+        # an offset of order sum_b rho_b, is not part of the statistic.
+        chi2_val = 2.0 * (nllvalreduced - fitter.mcstat_bb_compensator_value())
+        if mcstat_gof_trace is None:
+            logger.warning(
+                "No Hessian: the goodness-of-fit reference uses the ordinary "
+                "parameter count for the effective number of fitted parameters "
+                "tr(A^-1 H)."
+            )
+        mcstat_gof = fitter.mcstat_gof(chi2_val, mcstat_gof_trace)
+        p_val = mcstat_gof["pvalue"]
 
     logger.info("Saturated chi2:")
     logger.info(f"    ndof: {ndfsat}")
@@ -1057,7 +1240,25 @@ def fit(args, fitter, ws, dofit=True):
         f" - {nfree_systs} free of {fitter.indata.nsyst} systematics"
     )
     logger.info(f"    2*deltaNLL: {round(chi2_val, 2)}")
-    logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
+    if mcstat_gof is not None:
+        logger.info(
+            "    MC-stat de-biased fit: expected 2*deltaNLL "
+            f"{mcstat_gof['mean']:.2f} +- {np.sqrt(mcstat_gof['var']):.2f}; "
+            f"reference {mcstat_gof['c']:.3f} * chi2({mcstat_gof['nu']:.2f}) + "
+            f"N({mcstat_gof['g_mean']:.2f}, {mcstat_gof['g_sigma']:.2f}) "
+            "(large-count approximation)"
+        )
+    if fitter.mcstat_debias_active and fitter.mcStatDebias == "continuousM":
+        p_val = float("nan")
+        # persisted, so consumers do not fall back to chi2(ndfsat)
+        ws.results["mcstat_gof_pvalue"] = p_val
+        logger.warning(
+            "    p-value: not available for --mcStatDebias continuousM (the "
+            "objective contains -1/2 theta^T M theta, which is not a "
+            "goodness-of-fit measure)"
+        )
+    else:
+        logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
 
     ws.results.update(
         {
@@ -1067,6 +1268,16 @@ def fit(args, fitter, ws, dofit=True):
             "postfit_profile": not args.noPostfitProfileBB,
         }
     )
+    if mcstat_gof is not None:
+        # 2*nllvalreduced is not chi2(ndfsat)-distributed for a de-biased fit;
+        # consumers must take the p-value and expectation from here
+        ws.results.update(
+            {
+                "mcstat_gof_pvalue": mcstat_gof["pvalue"],
+                "mcstat_gof_mean": mcstat_gof["mean"],
+                "mcstat_gof_var": mcstat_gof["var"],
+            }
+        )
 
     if args.fullNll:
         nllvalfull = fitter.full_nll().numpy()
@@ -1122,6 +1333,16 @@ def fit(args, fitter, ws, dofit=True):
                 args.scanRangeUsePrefit,
                 save_detail=args.scanSaveDetail,
             )
+            if fitter.mcstat_scan_needs_adjustment():
+                # adjusted profile statistic of the de-biased objective; the raw
+                # profile is kept as nll_scan_unadjusted_<param>
+                idx = int(np.where(fitter.parms.astype(str) == param)[0][0])
+                ws.add_nll_scan_hist(
+                    param, x_scan, dnll_values, base_name="nll_scan_unadjusted"
+                )
+                dnll_values = dnll_values * fitter.mcstat_scan_adjustment(
+                    [idx], (x_scan - fitter.x.numpy()[idx])[:, None]
+                )
             ws.add_nll_scan_hist(
                 param,
                 x_scan,
@@ -1140,6 +1361,28 @@ def fit(args, fitter, ws, dofit=True):
             x_scan, yscan, dnll_values = fitter.nll_scan2D(
                 param_tuple, args.scanRange, args.scanPoints, args.scanRangeUsePrefit
             )
+            if fitter.mcstat_scan_needs_adjustment():
+                # direction-dependent adjustment, see mcstat_scan_adjustment
+                parms_str = fitter.parms.astype(str)
+                i0 = int(np.where(parms_str == param_tuple[0])[0][0])
+                i1 = int(np.where(parms_str == param_tuple[1])[0][0])
+                ws.add_nll_scan2D_hist(
+                    param_tuple,
+                    x_scan,
+                    yscan,
+                    dnll_values,
+                    base_name="nll_scan2D_unadjusted",
+                )
+                xv = fitter.x.numpy()
+                gx, gy = np.meshgrid(
+                    np.asarray(x_scan) - xv[i0],
+                    np.asarray(yscan) - xv[i1],
+                    indexing="ij",
+                )
+                factors = fitter.mcstat_scan_adjustment(
+                    [i0, i1], np.stack([gx.ravel(), gy.ravel()], axis=-1)
+                )
+                dnll_values = dnll_values * factors.reshape(gx.shape)
             ws.add_nll_scan2D_hist(param_tuple, x_scan, yscan, dnll_values)
 
     # Likelihood contour scans
@@ -1158,8 +1401,13 @@ def fit(args, fitter, ws, dofit=True):
             for j, cl in enumerate(args.contourLevels):
                 logger.info(f"    Now at CL {cl}")
 
-                # find confidence interval
-                _, params = fitter.contour_scan(param, nllvalreduced, cl**2)
+                # find confidence interval; for a de-biased fit the adjusted
+                # statistic W * factor reaches cl^2 where W = cl^2 / factor
+                q = cl**2
+                if fitter.mcstat_scan_needs_adjustment():
+                    idx = int(np.where(fitter.parms.astype(str) == param)[0][0])
+                    q = q / float(fitter.mcstat_scan_adjustment([idx], [[1.0]])[0])
+                _, params = fitter.contour_scan(param, nllvalreduced, q)
                 contours[i, j, ...] = params
 
         ws.add_contour_scan_hist(parms, contours, args.contourLevels)
@@ -1261,6 +1509,25 @@ def main():
                 "single-device from the fit output."
             )
 
+    if args.mcStatDebias == "continuousM" and args.computeSaturatedProjectionTests:
+        # the free bin scales open directions without data curvature, along
+        # which -1/2 theta^T M theta makes the objective unbounded below
+        raise Exception(
+            "--computeSaturatedProjectionTests is not supported with "
+            "--mcStatDebias continuousM."
+        )
+
+    if args.mcStatDebias != "none" and args.asymImpacts:
+        # The contour-based asymmetric impacts trace the profile of the
+        # objective at 2 Delta L = 1, which for a de-biased fit is the
+        # curvature-calibrated (under-covering) level; unlike the scans they are
+        # not adjusted (Fitter.mcstat_scan_adjustment).
+        raise Exception(
+            "--asymImpacts is not supported with --mcStatDebias: the contour "
+            "level would not account for the de-biasing (use the impacts from "
+            "the covariance, or --globalAsymImpacts)."
+        )
+
     # --noHessian skips computing the postfit Hessian, so the dense
     # parameter covariance matrix is never available. Any feature that
     # needs the covariance is incompatible.
@@ -1268,6 +1535,8 @@ def main():
         _incompat = []
         if args.doImpacts:
             _incompat.append("--doImpacts")
+        if args.mcStatDebias != "none" and args.mcStatDebiasCov == "dataPropagated":
+            _incompat.append("--mcStatDebiasCov dataPropagated")
         if args.computeVariations:
             _incompat.append("--computeVariations")
         if args.saveHists and not args.noChi2:
@@ -1403,6 +1672,13 @@ def main():
             "--constraints is not supported (not tested) with --nDevices > 1; "
             "run the constrained fit single-device."
         )
+    if ifitter.constraints and args.mcStatDebias != "none":
+        # the de-biased (sandwich) covariance would replace the face-held
+        # covariance of the constrained postfit
+        raise ValueError(
+            "--constraints is not supported with --mcStatDebias: the de-biased "
+            "covariance does not account for active constraint faces."
+        )
 
     np.random.seed(args.seed)
     tf.random.set_seed(args.seed)
@@ -1508,6 +1784,9 @@ def main():
 
                 if not args.prefitOnly:
                     ifitter.set_blinding_offsets(blind=blinded_fits[i])
+                    # a de-biased objective on Asimov data is recentred at the
+                    # generating point, and its covariance is the expected one
+                    ifitter.set_mcstat_asimov(ifit == -1)
                     fit(args, ifitter, ws, dofit=ifit >= 0 and not args.noFit)
                     fit_time.append(time.time())
 

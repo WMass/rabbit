@@ -423,8 +423,10 @@ def common_parser():
         default=None,
         type=int,
         help="Number of Hessian-vector products evaluated together when the "
-        "dense Hessian is assembled from HVPs, for both the preconditioner "
-        "reference matrix and the postfit Hessian. The multi-device path "
+        "dense Hessian is assembled from HVPs, for the preconditioner "
+        "reference matrix, the postfit Hessian, and the other dense Hessians "
+        "of an MC-stat de-biased fit (sandwich meat, Gauss-Newton forms). The "
+        "multi-device path "
         "(--nDevices > 1) always assembles it this way, with 256 by default. "
         "The single-device path uses tape.jacobian unless this is given; "
         "tape.jacobian vectorises over all parameters at once, so its memory "
@@ -716,6 +718,56 @@ def common_parser():
         "Default 0 keeps the original behaviour. Useful for full-mode BBB to avoid "
         "ill-conditioned profiles for processes with very low effective stats per bin "
         "(e.g. mixed-sign-weight cancellations).",
+    )
+    parser.add_argument(
+        "--mcStatDebias",
+        default="none",
+        choices=["none", "continuousM", "twoHalf", "kfold"],
+        help="Limited-MC-statistics de-biasing of the POI point/curvature "
+        "(docs/mcstat/RABBIT_MCSTAT_DESIGN.md). 'continuousM' subtracts the frozen "
+        "noise-floor matrix M (supplied via TensorWriter.add_mc_stat_moment, whose "
+        "denominator convention must match --binByBinStat) from the curvature: "
+        "-1/2 theta^T M theta in the objective; M is ignored for any other choice. "
+        "NOTE: only de-biases parameters that enter the prediction LINEARLY (use "
+        "--allowNegativeParam for POIs; rabbit's default x^2 transform cancels the "
+        "correction). 'twoHalf' and 'kfold' are the same cross-fit method "
+        "(general / nonlinear-safe) on MC-stat fold templates, written with "
+        "TensorWriter.add_process(..., fold_axis=...): the number of folds k (any "
+        "k >= 2) is inferred from the size of that axis, so there is nothing to "
+        "choose here; the k-fold averaging over all fold pairs is realized in "
+        "--covMode fisher. The fold axis must assign each GENERATED event (with all "
+        "of its oversampled copies) to one fold, independently of the fitted "
+        "observables; the writer cannot check this. Fold templates cost k times "
+        "the nominal templates in the input (dense [k, nbins, nproc], or k times "
+        "the non-zero entries in sparse mode). A de-biased fit first minimizes "
+        "the ordinary likelihood and starts from its minimum (the de-biased "
+        "objectives are only locally convex). With bin-by-bin stat each jackknife "
+        "term is profiled separately, and where the bin-by-bin stat variance moves "
+        "with the parameters (full mode, --binByBinStatDynamic) a compensator "
+        "keeps the profile's own de-attenuation from being applied twice (both "
+        "methods). Default 'none'.",
+    )
+    parser.add_argument(
+        "--mcStatDebiasCov",
+        default="sandwich",
+        choices=["curvature", "sandwich", "dataPropagated"],
+        help="Covariance reported when --mcStatDebias != none. 'curvature' = inverse "
+        "de-biased Hessian A^-1 (undercovers). 'sandwich' = A^-1 H A^-1 = "
+        "A^-1 + A^-1 M A^-1 (analytic meat; calibration-free ~0.68 with BB-lite, "
+        "undercovers without). 'dataPropagated' = Huber-White delta-method sandwich "
+        "propagating the data AND template (sumw2) variances through theta_hat "
+        "(continuous-M only, dense): conservative, over-covers (~0.81; "
+        "docs/mcstat/RESULTS.md §7d, §9p). Default 'sandwich'.",
+    )
+    parser.add_argument(
+        "--covMode",
+        default="observed",
+        choices=["observed", "fisher"],
+        help="Curvature primitive used for ALL covariances (the standard inverse-Hessian "
+        "cov AND the de-biased sandwich bread+meat, consistently). 'observed' = the "
+        "autograd Hessian grad^2 L (Efron-Hinkley, data-conditional). 'fisher' = the "
+        "Gauss-Newton expected information J^T D J (lower-variance, finite-MC-cleaner, "
+        "drops the residual.d2mu term). Default 'observed' (current rabbit behaviour).",
     )
     parser.add_argument(
         "--paramModel",

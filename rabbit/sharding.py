@@ -337,6 +337,13 @@ class MultiDeviceFitter(Fitter):
         # init_fit_parms -> _make_tf_functions, which builds the shards
         self.n_devices = int(getattr(options, "nDevices", 1) or 1)
         self._options = options
+        # The MC-stat de-biasing objective and the Gauss-Newton curvature build
+        # extra fold/half yields over all bins that the shard evaluators do not
+        # carry; refuse up front rather than silently fitting the plain NLL.
+        if getattr(options, "mcStatDebias", "none") != "none":
+            self._unsharded("MC-stat de-biasing", "--mcStatDebias")
+        if getattr(options, "covMode", "observed") != "observed":
+            self._unsharded("The Gauss-Newton covariance", "--covMode fisher")
         self.shards = []
         super().__init__(indata, param_model, options, **kwargs)
 
@@ -578,6 +585,47 @@ class MultiDeviceFitter(Fitter):
 
     def gaussian_global_impacts_parms(self, *args, **kwargs):
         self._unsharded("Gaussian global impacts", "--gaussianGlobalImpacts")
+
+    # MC-stat de-biasing / Gauss-Newton curvature: refused in __init__ already
+    # (the fold and half yields are not sharded); these keep a direct call from
+    # silently running the all-bins single-device graph.
+    def fisher_curvature(self, *args, **kwargs):
+        self._unsharded("The Gauss-Newton covariance", "--covMode fisher")
+
+    def cov_twohalf_sandwich(self, *args, **kwargs):
+        self._unsharded("MC-stat de-biasing", "--mcStatDebias twoHalf/kfold")
+
+    def cov_mcstat_sandwich(self, *args, **kwargs):
+        self._unsharded("MC-stat de-biasing", "--mcStatDebias continuousM")
+
+    def mcstat_meat(self, *args, **kwargs):
+        self._unsharded("MC-stat de-biasing", "--mcStatDebias")
+
+    def mcstat_reported_cov(self, *args, **kwargs):
+        self._unsharded("MC-stat de-biasing", "--mcStatDebias")
+
+    def mcstat_postfit_covariances(self, *args, **kwargs):
+        self._unsharded("MC-stat de-biasing", "--mcStatDebias")
+
+    def mcstat_curvature_and_meat(self, *args, **kwargs):
+        self._unsharded("MC-stat de-biasing", "--mcStatDebias")
+
+    def mcstat_gof(self, *args, **kwargs):
+        self._unsharded("MC-stat de-biasing", "--mcStatDebias")
+
+    def mcstat_bb_compensator_value(self, *args, **kwargs):
+        self._unsharded("MC-stat de-biasing", "--mcStatDebias")
+
+    def cov_block_hessfree(self, *args, **kwargs):
+        self._unsharded(
+            "The de-biased or Gauss-Newton Hessian-free covariance",
+            "--mcStatDebias / --covMode fisher with --noHessian",
+        )
+
+    def cov_dataprop_sandwich(self, *args, **kwargs):
+        self._unsharded(
+            "The data-propagated sandwich", "--mcStatDebiasCov dataPropagated"
+        )
 
     def loss_val_grad_hess_beta(self, *args, **kwargs):
         """Beta-space EDM diagnostic (--diagnostics with bin-by-bin stat).

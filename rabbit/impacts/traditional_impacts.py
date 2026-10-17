@@ -43,6 +43,7 @@ def impacts_parms(
     systgroupidxs=[],
     nmodel_params=None,
     param_groupidxs=None,
+    mcstat_extra_var=None,
 ):
     """
     Gaussian approximation.
@@ -53,6 +54,12 @@ def impacts_parms(
     (model nuisance) parameters; the POUs themselves do not get impact
     rows. POUs enter only as impact *sources*: optionally grouped via
     param_groupidxs (columns appended after the syst/stat groups).
+
+    mcstat_extra_var: for an MC-stat de-biased fit, the full-x variance the
+    reported covariance adds to the decomposed (curvature) one,
+    diag(reported - curvature). Appended as two columns: "mcStatDebias" (that
+    term) and "mcStat", the whole MC-statistical contribution, i.e. the
+    bin-by-bin stat and de-biasing terms in quadrature.
     """
     if nmodel_params is None:
         nmodel_params = nsignal_params
@@ -65,6 +72,7 @@ def impacts_parms(
     safe_sigma = tf.where(sigma > 0, sigma, tf.ones_like(sigma))
     impacts = v / tf.reshape(safe_sigma, [1, -1])
 
+    impacts_bbb_sq = None
     if cov_stat_no_bbb is not None:
         # impact bin-by-bin stat
         impacts_data_stat = tf.sqrt(tf.linalg.diag_part(cov_stat_no_bbb))
@@ -113,5 +121,24 @@ def impacts_parms(
             for g in param_groupidxs
         ]
         impacts_grouped = tf.concat([impacts_grouped, *param_cols], axis=1)
+
+    if mcstat_extra_var is not None:
+        # appended LAST: [..., mcStatDebias, mcStat]
+        var_debias = tf.nn.relu(
+            _gather_poi_noi_vector(
+                mcstat_extra_var, noiidxs, nsignal_params, nmodel_params
+            )
+        )
+        var_mcstat = var_debias
+        if impacts_bbb_sq is not None:
+            var_mcstat = var_mcstat + tf.nn.relu(impacts_bbb_sq)
+        impacts_grouped = tf.concat(
+            [
+                impacts_grouped,
+                tf.reshape(tf.sqrt(var_debias), (-1, 1)),
+                tf.reshape(tf.sqrt(var_mcstat), (-1, 1)),
+            ],
+            axis=1,
+        )
 
     return impacts, impacts_grouped

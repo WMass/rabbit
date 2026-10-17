@@ -55,6 +55,25 @@ class TensorWriter:
         self.dict_pseudodata = {}  # [channel][pseudodata]
         self.dict_norm = {}  # [channel][process]
         self.dict_sumw2 = {}  # [channel][process]
+        # MC-stat cross-fit fold templates (two-half / k-fold de-biasing).
+        # dict_norm_folds[channel][process] = ndarray [k, nbinschan] (dense);
+        # fold_k[channel][process] = k (number of folds for that process).
+        # Populated only when add_process is called with fold_axis != None.
+        self.dict_norm_folds = {}  # [channel][process] -> [k, nbinschan]
+        self.fold_k = {}  # [channel][process] -> k
+        # Split-logk fold templates (only for systematics added with fold_axis):
+        # dict_logkavg_folds[channel][process][syst] = [k, nbinschan]; for
+        # asymmetric folded systematics dict_logkhalfdiff_folds holds the per-fold
+        # half-difference (same shape).
+        self.dict_logkavg_folds = {}  # [channel][process][syst] -> [k, nbinschan]
+        self.dict_logkhalfdiff_folds = {}  # [channel][process][syst] -> [k, nbinschan]
+        # Per-fold logk delta vs the FULL logk (= logkavg_fold - logkavg_full),
+        # used by the SPARSE split-logk path (multiply the shared systematic factor
+        # by exp(delta . theta)). [channel][process][syst] -> [k, nbinschan].
+        self.dict_logk_folds_delta = {}
+        # continuous-M moment terms (add_mc_stat_moment): term name -> the
+        # per-bin variance convention of M's denominator
+        self.mcstat_moment_variance = {}
         self.dict_logkavg = {}  # [channel][proc][syst]
         self.dict_logkhalfdiff = {}  # [channel][proc][syst]
         self.dict_logkavg_indices = {}
@@ -214,7 +233,13 @@ class TensorWriter:
             )
         self.dict_pseudodata[channel][name] = self.get_flat_values(h)
 
-    def add_process(self, h, name, channel="ch0", signal=False, variances=None):
+    def add_process(
+        self, h, name, channel="ch0", signal=False, variances=None, fold_axis=None
+    ):
+        if fold_axis is not None:
+            return self._add_process_folded(
+                h, name, channel, signal, variances, fold_axis
+            )
         self._check_hist_and_channel(h, channel)
 
         if name in self.dict_norm[channel].keys():
@@ -273,6 +298,222 @@ class TensorWriter:
         self.dict_norm[channel][name] = norm
         self.dict_sumw2[channel][name] = sumw2
 
+    def _add_process_folded(self, h, name, channel, signal, variances, fold_axis):
+        """Add a process whose histogram carries an extra MC-stat fold axis.
+
+        The user fills `h` with an extra categorical/integer axis (named
+        `fold_axis`) assigning each *generated* event to one of `k` folds (all
+        oversampled copies of a generated event in the SAME fold; assignment
+        independent of the fitted observables --
+        docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a). Neither condition can be
+        checked here. The writer:
+          * derives the FULL template by projecting the fold axis out
+            (`h_full = sum_f h[fold=f]`) and registers it via the ordinary
+            add_process path (so sumw / sumw2 / systematics are unchanged), and
+          * keeps the per-fold templates `[k, nbinschan]` for the cross-fit
+            (two-half / k-fold) de-biasing in the fitter.
+        `k` (any k >= 2) is inferred from the size of `fold_axis`. Storage in the
+        output is k times the nominal templates: dense `[k, nbinsfull, nproc]`
+        in dense mode; in sparse mode `[k, nnz]` values on the sparsity pattern
+        of the (sparse) nominal norm, so the folds keep its sparsity.
+        """
+        self._check_hist_and_channel(h, channel)
+        # resolve the fold axis (by name or index) and its size k
+        ax_names = [a.name for a in h.axes]
+        if isinstance(fold_axis, str):
+            if fold_axis not in ax_names:
+                raise ValueError(
+                    f"fold_axis '{fold_axis}' not found in histogram axes {ax_names}"
+                )
+            fold_idx = ax_names.index(fold_axis)
+        else:
+            fold_idx = int(fold_axis)
+        k = h.axes[fold_idx].size
+        if k < 2:
+            raise ValueError(f"fold_axis must have size >= 2, got {k}")
+
+        flow = self.channels[channel]["flow"]
+        # per-fold flat templates and the projected-out full template
+        folds = []
+        for f in range(k):
+            hf = h[{fold_idx: f}]
+            folds.append(self.get_flat_values(hf, flow))
+        norm_folds = np.stack(folds, axis=0)  # [k, nbinschan]
+        if not np.all(np.isfinite(norm_folds)):
+            raise RuntimeError(
+                f"NaN or Inf values encountered in fold templates for {name}!"
+            )
+        h_full = h[{fold_idx: sum}]
+
+        # register the full template through the ordinary (unfolded) path so
+        # sumw / sumw2 and all downstream machinery are identical to a normal
+        # process. variances default to the full hist's variances (= sum of
+        # fold variances), which is what BB-lite needs.
+        self.add_process(
+            h_full, name, channel=channel, signal=signal, variances=variances
+        )
+        self.dict_norm_folds[channel][name] = norm_folds.astype(self.dtype)
+        self.fold_k[channel][name] = k
+
+    def _common_fold_k(self):
+        """Number of MC-stat folds, or None if no process was added with a
+        fold_axis. All folded processes must share it."""
+        kset = {k for c in self.channels for k in self.fold_k[c].values()}
+        if not kset:
+            return None
+        if len(kset) != 1:
+            raise NotImplementedError(
+                f"All folded processes must share a common number of folds k; "
+                f"got {sorted(kset)}."
+            )
+        return kset.pop()
+
+    def _sparse_fold_values(self, kfold, indices, values, procs, systs):
+        """Sparse-mode fold templates on the canonical sparse norm pattern.
+
+        Returns ``norm_folds`` [k, nnz] (the fold values at each stored (bin,
+        proc) entry of the sparse norm, in the same order) and, if systematics
+        were added with a fold_axis, the split-logk deltas ``logk_folds_delta``
+        [k, nnz, nfolded] with the global indices of the folded systematics.
+        Storage is k times the sparse norm (plus k*nfolded times it for the
+        deltas), i.e. the folds inherit the sparsity of the nominal templates.
+
+        A fold entry is kept only where the full template is non-zero. Fold
+        values at a (bin, proc) whose full template is exactly zero (folds that
+        cancel, e.g. with negative weights) have no full-sample counterpart and
+        are dropped with a warning; they sum to zero, so the folds still sum to
+        the full template.
+        """
+        rows = indices[:, 0]
+        cols = indices[:, 1]
+        chans = list(self.channels.keys())
+        nprocs = len(procs)
+        starts = np.cumsum([0] + [self.nbinschan[c] for c in chans])
+        # group the entries by (channel, process)
+        key = (np.searchsorted(starts, rows, side="right") - 1) * nprocs + cols
+        order = np.argsort(key, kind="stable")
+        bounds = np.searchsorted(key[order], np.arange(len(chans) * nprocs + 1))
+
+        folded_systs = sorted(
+            {
+                s
+                for c in chans
+                for p in self.dict_logk_folds_delta[c]
+                for s in self.dict_logk_folds_delta[c][p]
+            },
+            key=systs.index,
+        )
+        norm_folds = np.empty([kfold, len(values)], self.dtype)
+        logk_folds_delta = None
+        folded_syst_idx = None
+        if folded_systs:
+            logk_folds_delta = np.zeros(
+                [kfold, len(values), len(folded_systs)], self.dtype
+            )
+            folded_syst_idx = np.array(
+                [systs.index(s) for s in folded_systs], dtype=np.int64
+            )
+
+        ndropped = 0
+        for ichan, chan in enumerate(chans):
+            for iproc, proc in enumerate(procs):
+                igroup = ichan * nprocs + iproc
+                sel = order[bounds[igroup] : bounds[igroup + 1]]
+                local = rows[sel] - starts[ichan]
+                folds = self.dict_norm_folds[chan].get(proc)
+                if folds is None:
+                    norm_folds[:, sel] = values[sel][None, :] / kfold
+                    continue
+                norm_folds[:, sel] = folds[:, local]
+                on_support = np.zeros(folds.shape[1], dtype=bool)
+                on_support[local] = True
+                ndropped += np.count_nonzero(np.any(folds != 0.0, axis=0) & ~on_support)
+                deltas = self.dict_logk_folds_delta[chan].get(proc, {})
+                for j, s in enumerate(folded_systs):
+                    if s in deltas:
+                        logk_folds_delta[:, sel, j] = deltas[s][:, local]
+        if ndropped:
+            logger.warning(
+                f"{ndropped} (bin, process) entries have non-zero MC-stat fold "
+                "templates but an exactly zero full template; their fold values "
+                "are dropped from the sparse fold storage."
+            )
+        return norm_folds, logk_folds_delta, folded_syst_idx
+
+    MCSTAT_MOMENT_VARIANCES = ("bb_inflated", "bare")
+
+    def add_mc_stat_moment(self, M, param_names, *, variance, name="mcstat_M"):
+        """Frozen MC-stat noise-floor matrix for the continuous-M de-biasing.
+
+        ``M`` is the ``nparams x nparams`` noise floor
+        ``M_ij = sum_b (sum_{e in b} w_e^2 s_i(e) s_j(e)) / V_b`` accumulated in
+        the event loop at the expansion point
+        (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §1). With ``--mcStatDebias
+        continuousM`` it is added to the NLL as the de-attenuation penalty
+        ``-1/2 theta^T M theta`` (an external quadratic term with Hessian
+        ``-M``), which de-biases the central value and gives curvature
+        ``H_data - M``; with any other ``--mcStatDebias`` the fitter ignores it.
+        ``param_names`` label the rows/cols of ``M`` and are resolved against
+        the fit parameter list at fit time.
+
+        Denominator: ``V_b`` must be the same per-bin variance the fit's per-bin
+        term uses, which depends on whether the fit runs with bin-by-bin stat.
+        With it ON (any type or mode) that is the inflated
+        ``mu_b + sum_proc sumw2_b`` (data stat + MC stat); with it OFF the bare
+        data (chisq) or expected (Poisson) variance. Using the bare variance
+        under bin-by-bin stat makes ``M`` roughly a factor ~2 too large, so
+        ``H_data - M`` goes non-positive-definite and the fit diverges
+        (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §1b). The convention is recorded
+        with the term, and the fitter refuses an ``M`` whose convention does not
+        match its bin-by-bin stat setting.
+
+        ``M`` is always the full moment of the template noise. Where the
+        bin-by-bin stat variance moves with the parameters (multiplicative types
+        in full mode, ``--binByBinStatDynamic``, and the overall yield in lite
+        mode), the profiled likelihood already removes part of it; the fitter
+        computes that part from ``sumw2`` and subtracts only the rest.
+
+        Parameters
+        ----------
+        M : (n, n) array_like
+            Symmetric frozen noise-floor matrix (the user is responsible for
+            symmetry; only the de-attenuation penalty is formed here).
+        param_names : sequence of str
+            Length-``n`` parameter names indexing ``M``.
+        variance : {"bb_inflated", "bare"}
+            The per-bin variance ``V_b`` used in the denominator of ``M``:
+            ``"bb_inflated"`` (``mu_b + sum_proc sumw2_b``, for fits with
+            bin-by-bin stat) or ``"bare"`` (for fits without it). Required.
+        name : str
+            External-term label (default ``"mcstat_M"``); must start with
+            ``"mcstat"``, which is how the fitter recognizes the term.
+        """
+        import hist as _hist
+
+        if variance not in self.MCSTAT_MOMENT_VARIANCES:
+            raise ValueError(
+                f"add_mc_stat_moment: variance must be one of "
+                f"{self.MCSTAT_MOMENT_VARIANCES}, got {variance!r}"
+            )
+        if not str(name).startswith("mcstat"):
+            raise ValueError(
+                f"add_mc_stat_moment: name must start with 'mcstat', got {name!r}"
+            )
+        M = np.asarray(M, dtype=self.dtype)
+        names = list(param_names)
+        if M.shape != (len(names), len(names)):
+            raise ValueError(
+                f"add_mc_stat_moment: M shape {M.shape} incompatible with "
+                f"{len(names)} param_names"
+            )
+        ax0 = _hist.axis.StrCategory(names, name="mcstat_params0")
+        ax1 = _hist.axis.StrCategory(names, name="mcstat_params1")
+        h = _hist.Hist(ax0, ax1, storage=_hist.storage.Double())
+        # hess = -M  ->  +1/2 x^T H x = -1/2 theta^T M theta
+        h.view(flow=False)[...] = -M
+        self.add_external_likelihood_term(hess=h, name=name)
+        self.mcstat_moment_variance[name] = variance
+
     def add_channel(self, axes, name=None, masked=False, flow=False):
         if flow and masked is False:
             raise NotImplementedError(
@@ -285,6 +526,11 @@ class TensorWriter:
         self.nbinschan[name] = ibins
         self.dict_norm[name] = {}
         self.dict_sumw2[name] = {}
+        self.dict_norm_folds[name] = {}
+        self.fold_k[name] = {}
+        self.dict_logkavg_folds[name] = {}
+        self.dict_logkhalfdiff_folds[name] = {}
+        self.dict_logk_folds_delta[name] = {}
         self.dict_beta_variations[name] = {}
 
         # add masked channels last
@@ -1149,17 +1395,43 @@ class TensorWriter:
         add_to_data_covariance=False,
         as_difference=False,
         syst_axes=None,
+        fold_axis=None,
         **kargs,
     ):
         """
         h: either a single histogram with the systematic variation if mirror=True or a list of two histograms with the up and down variation
         as_difference: if True, interpret the histogram values as the difference with respect to the nominal (i.e. the absolute variation is norm + h)
+        fold_axis: optional name of an MC-stat fold axis carried by `h` (the SAME
+                   axis used for add_process). When given, the systematic's logk is
+                   SPLIT per fold (stored as hlogk_folds) so its template noise is
+                   also de-biased by the two-half cross-fit; the full systematic is
+                   registered by projecting the fold axis out. Omit (default) to
+                   share one logk across folds (recommended; the dominant
+                   nominal-template noise is already de-biased via norm^A.norm^B).
+                   Minimal support: dense, single-hist (mirror=True), no other
+                   extra syst axes.
         syst_axes: optional list of axis names in h that represent independent systematics.
                    If None (default) and h is a hist-like object with axes beyond the channel,
                    the extra axes are auto-detected and each bin combination becomes a separate
                    systematic with name "{name}_{label_0}_{label_1}_...". Pass an empty list
                    to disable auto-detection.
         """
+
+        if fold_axis is not None:
+            return self._add_systematic_folded(
+                h,
+                name,
+                process,
+                channel,
+                kfactor,
+                mirror,
+                symmetrize,
+                add_to_data_covariance,
+                as_difference,
+                syst_axes,
+                fold_axis,
+                **kargs,
+            )
 
         # Fast batched path for SparseHist multi-systematic input. Conditions:
         #   - extra (systematic) axes are present
@@ -1282,6 +1554,179 @@ class TensorWriter:
         self.book_systematic(
             var_name_out, add_to_data_covariance=add_to_data_covariance, **kargs
         )
+
+    def _add_systematic_folded(
+        self,
+        h,
+        name,
+        process,
+        channel,
+        kfactor,
+        mirror,
+        symmetrize,
+        add_to_data_covariance,
+        as_difference,
+        syst_axes,
+        fold_axis,
+        **kargs,
+    ):
+        """Add a systematic whose variation histogram(s) carry an MC-stat fold
+        axis, SPLITTING logk per fold (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a).
+        The full systematic is registered by projecting the fold axis out;
+        per-fold logkavg (and, for an asymmetric symmetrize mode, per-fold
+        logkhalfdiff) [k, nbinschan] are stored for the cross-fit so the
+        systematic's own template noise is de-biased. In sparse mode only the
+        per-fold delta against the full logk is stored, over the folded
+        systematics and the sparse norm pattern (log_normal, symmetric only).
+
+        `h` is either a single histogram (mirror=True, symmetric) or a list
+        [up, down] of two histograms (asymmetric); both must carry the named
+        fold_axis (the only extra axis beyond the channel). The process must have
+        been added with the SAME fold_axis. The histograms must be hist.Hist (not
+        SparseHist); the 'linear'/'quadratic' symmetrize modes (which split into
+        two systematics) are not supported with folds."""
+        is_pair = isinstance(h, (list, tuple))
+        h0 = h[0] if is_pair else h
+        if self.sparse and self._issparse(h0):
+            raise NotImplementedError("fold_axis systematics: sparse not supported.")
+        if not is_pair and not mirror:
+            raise RuntimeError(
+                "Only one histogram given but mirror=False, can not construct a variation"
+            )
+        if is_pair and symmetrize in ("linear", "quadratic"):
+            raise NotImplementedError(
+                "fold_axis systematics do not support the 'linear'/'quadratic' "
+                "symmetrize modes (they split into two systematics)."
+            )
+        if process not in self.dict_norm_folds[channel]:
+            raise RuntimeError(
+                f"add_systematic(fold_axis=...): process '{process}' has no fold "
+                f"templates; add it with the same fold_axis first."
+            )
+        norm_folds = self.dict_norm_folds[channel][process]  # [k, nbinschan]
+        k = norm_folds.shape[0]
+        ax_names = [a.name for a in h0.axes]
+        if isinstance(fold_axis, str):
+            if fold_axis not in ax_names:
+                raise ValueError(
+                    f"fold_axis '{fold_axis}' not found in axes {ax_names}"
+                )
+            fold_idx = ax_names.index(fold_axis)
+        else:
+            fold_idx = int(fold_axis)
+        if h0.axes[fold_idx].size != k:
+            raise ValueError(
+                f"systematic fold axis size {h0.axes[fold_idx].size} != process k={k}"
+            )
+
+        flow = self.channels[channel]["flow"]
+        systematic_type = "normal" if add_to_data_covariance else self.systematic_type
+
+        # full logkavg (vs the full nominal) for the sparse split-logk delta
+        norm_full = self.dict_norm[channel][process]
+        if self._issparse(norm_full):
+            _dense = np.zeros([norm_folds.shape[1]], self.dtype)
+            _dense[norm_full.indices] = norm_full.data
+            norm_full = _dense
+        if is_pair:
+            up_full = self.get_flat_values(h[0][{fold_idx: sum}], flow=flow)
+            down_full = self.get_flat_values(h[1][{fold_idx: sum}], flow=flow)
+            if as_difference:
+                up_full = norm_full + up_full
+                down_full = norm_full + down_full
+            lu_full = self.get_logk(
+                up_full, norm_full, kfactor, systematic_type=systematic_type
+            )
+            ld_full = -self.get_logk(
+                down_full, norm_full, kfactor, systematic_type=systematic_type
+            )
+            if symmetrize == "conservative":
+                logkavg_full = np.where(
+                    np.abs(lu_full) > np.abs(ld_full), lu_full, ld_full
+                )
+            else:
+                logkavg_full = 0.5 * (lu_full + ld_full)
+        else:
+            syst_full = self.get_flat_values(h[{fold_idx: sum}], flow=flow)
+            if as_difference:
+                syst_full = norm_full + syst_full
+            logkavg_full = self.get_logk(
+                syst_full, norm_full, kfactor, systematic_type=systematic_type
+            )
+
+        # per-fold logkavg (+ logkhalfdiff for asymmetric) vs the per-fold nominal
+        logkavg_folds = np.zeros_like(norm_folds)
+        logkhalfdiff_folds = np.zeros_like(norm_folds)
+        is_asym = False
+        for f in range(k):
+            norm_f = norm_folds[f]
+            if is_pair:
+                up_f = self.get_flat_values(h[0][{fold_idx: f}], flow=flow)
+                down_f = self.get_flat_values(h[1][{fold_idx: f}], flow=flow)
+                if as_difference:
+                    up_f = norm_f + up_f
+                    down_f = norm_f + down_f
+                lu = self.get_logk(
+                    up_f, norm_f, kfactor, systematic_type=systematic_type
+                )
+                ld = -self.get_logk(
+                    down_f, norm_f, kfactor, systematic_type=systematic_type
+                )
+                if symmetrize == "conservative":
+                    logkavg_folds[f] = np.where(np.abs(lu) > np.abs(ld), lu, ld)
+                elif symmetrize == "average":
+                    logkavg_folds[f] = 0.5 * (lu + ld)
+                else:  # asymmetric: keep the half-difference
+                    is_asym = True
+                    logkavg_folds[f] = 0.5 * (lu + ld)
+                    logkhalfdiff_folds[f] = 0.5 * (lu - ld)
+            else:
+                syst_f = self.get_flat_values(h[{fold_idx: f}], flow=flow)
+                if as_difference:
+                    syst_f = norm_f + syst_f
+                logkavg_folds[f] = self.get_logk(
+                    syst_f, norm_f, kfactor, systematic_type=systematic_type
+                )
+
+        # register the FULL systematic by projecting the fold axis out
+        if is_pair:
+            h_full = [h[0][{fold_idx: sum}], h[1][{fold_idx: sum}]]
+        else:
+            h_full = h[{fold_idx: sum}]
+        self.add_systematic(
+            h_full,
+            name,
+            process,
+            channel,
+            kfactor=kfactor,
+            mirror=mirror,
+            symmetrize=symmetrize,
+            add_to_data_covariance=add_to_data_covariance,
+            as_difference=as_difference,
+            syst_axes=syst_axes,
+            **kargs,
+        )
+        if is_asym and self.sparse:
+            raise NotImplementedError(
+                "sparse split-logk does not support asymmetric folded systematics "
+                "(symmetric symmetrize modes only)."
+            )
+
+        # store the per-fold logk under the resolved (full) systematic name
+        self.dict_logkavg_folds[channel].setdefault(process, {})
+        self.dict_logkavg_folds[channel][process][name] = logkavg_folds.astype(
+            self.dtype
+        )
+        # per-fold delta vs the full logk (for the sparse split-logk path)
+        self.dict_logk_folds_delta[channel].setdefault(process, {})
+        self.dict_logk_folds_delta[channel][process][name] = (
+            logkavg_folds - logkavg_full[None, :]
+        ).astype(self.dtype)
+        if is_asym:
+            self.dict_logkhalfdiff_folds[channel].setdefault(process, {})
+            self.dict_logkhalfdiff_folds[channel][process][name] = (
+                logkhalfdiff_folds.astype(self.dtype)
+            )
 
     def add_beta_variations(
         self,
@@ -1857,6 +2302,36 @@ class TensorWriter:
 
             ibin += nbinschan
 
+        # --- MC-stat cross-fit fold templates (two-half / k-fold de-biasing),
+        # present only if a process was added with a fold_axis. Folded processes
+        # store their k fold templates; the others store norm_full/k in every
+        # fold, identical across folds (MC-stat-exempt: they drop out of the
+        # de-bias). Dense mode: [k, nbinsfull, nproc]. Sparse mode: [k, nnz],
+        # values on the sparsity pattern of the sparse norm, assembled together
+        # with the sparse split-logk deltas once that pattern is in canonical
+        # order (_sparse_fold_values).
+        kfold = self._common_fold_k()
+        norm_folds = None
+        logk_folds_delta = None
+        mcstat_folded_syst_idx = None
+        if kfold is not None and not self.sparse:
+            norm_folds = np.zeros([kfold, nbinsfull, nproc], self.dtype)
+            ibin = 0
+            for chan, chan_info in self.channels.items():
+                nbinschan = self.nbinschan[chan]
+                for iproc, proc in enumerate(procs):
+                    if proc not in self.dict_norm[chan]:
+                        continue
+                    if proc in self.dict_norm_folds[chan]:
+                        norm_folds[:, ibin : ibin + nbinschan, iproc] = (
+                            self.dict_norm_folds[chan][proc]
+                        )
+                    else:
+                        norm_folds[:, ibin : ibin + nbinschan, iproc] = (
+                            self.dict_norm[chan][proc][None, :] / kfold
+                        )
+                ibin += nbinschan
+
         systs = self.get_systs()
         nsyst = len(systs)
 
@@ -2069,6 +2544,13 @@ class TensorWriter:
             norm_sparse_indices = norm_sparse_indices[norm_sort_indices]
             norm_sparse_values = norm_sparse_values[norm_sort_indices]
 
+            if kfold is not None:
+                norm_folds, logk_folds_delta, mcstat_folded_syst_idx = (
+                    self._sparse_fold_values(
+                        kfold, norm_sparse_indices, norm_sparse_values, procs, systs
+                    )
+                )
+
             # now permute the indices of the first dimension of logk_sparse corresponding to the resorting of norm_sparse
 
             # compute the inverse permutation from the sorting of norm_sparse
@@ -2107,6 +2589,31 @@ class TensorWriter:
             if self.has_beta_variations:
                 beta_variations = np.zeros([nbinsfull, nbins, nproc], self.dtype)
 
+            # Split-logk fold tensor: built only when at least one systematic was
+            # added with a fold_axis. Same trailing shape as the full `logk`
+            # ([..., nsyst] symmetric or [..., 2, nsyst] asymmetric) with a leading
+            # fold axis. Folded systs get their per-fold logk; other (bin,proc,syst)
+            # entries replicate the full logk so they are identical across folds.
+            any_folded_syst = any(
+                len(self.dict_logkavg_folds[c].get(p, {}))
+                for c in self.channels
+                for p in self.dict_logkavg_folds[c]
+            )
+            logk_folds = None
+            if any_folded_syst:
+                # a variation shared across folds is replicated into each fold:
+                # unchanged for the multiplicative log_normal form; split evenly
+                # (1/k) for the additive normal form, so that the folds sum to
+                # the full variation just as the fold templates sum to the full
+                # nominal
+                shared_scale = 1.0 / kfold if self.systematic_type == "normal" else 1.0
+                if self.symmetric_tensor:
+                    logk_folds = np.zeros([kfold, nbinsfull, nproc, nsyst], self.dtype)
+                else:
+                    logk_folds = np.zeros(
+                        [kfold, nbinsfull, nproc, 2, nsyst], self.dtype
+                    )
+
             for chan in self.channels.keys():
                 nbinschan = self.nbinschan[chan]
                 dict_norm_chan = self.dict_norm[chan]
@@ -2121,9 +2628,43 @@ class TensorWriter:
 
                     dict_logkavg_proc = self.dict_logkavg[chan][proc]
                     dict_logkhalfdiff_proc = self.dict_logkhalfdiff[chan][proc]
+                    logkavg_folds_proc = (
+                        self.dict_logkavg_folds[chan].get(proc, {})
+                        if logk_folds is not None
+                        else {}
+                    )
+                    logkhalfdiff_folds_proc = (
+                        self.dict_logkhalfdiff_folds[chan].get(proc, {})
+                        if logk_folds is not None
+                        else {}
+                    )
                     for isyst, syst in enumerate(systs):
                         if syst not in dict_logkavg_proc.keys():
                             continue
+
+                        if logk_folds is not None:
+                            bs = slice(ibin, ibin + nbinschan)
+                            # per-fold avg (folded) or replicated full avg (shared)
+                            avg_f = (
+                                logkavg_folds_proc[syst]
+                                if syst in logkavg_folds_proc
+                                else shared_scale * dict_logkavg_proc[syst][None, :]
+                            )
+                            if self.symmetric_tensor:
+                                logk_folds[:, bs, iproc, isyst] = avg_f
+                            else:
+                                logk_folds[:, bs, iproc, 0, isyst] = avg_f
+                                # per-fold halfdiff (folded asymmetric) or replicated
+                                # full halfdiff (shared asymmetric); 0 if symmetric syst
+                                if syst in logkhalfdiff_folds_proc:
+                                    logk_folds[:, bs, iproc, 1, isyst] = (
+                                        logkhalfdiff_folds_proc[syst]
+                                    )
+                                elif syst in dict_logkhalfdiff_proc:
+                                    logk_folds[:, bs, iproc, 1, isyst] = (
+                                        shared_scale
+                                        * dict_logkhalfdiff_proc[syst][None, :]
+                                    )
 
                         if self.symmetric_tensor:
                             logk[ibin : ibin + nbinschan, iproc, isyst] = (
@@ -2308,6 +2849,30 @@ class TensorWriter:
             sumw2, f, "hsumw2", maxChunkBytes=self.chunkSize
         )
 
+        # MC-stat cross-fit fold templates, only written when at least one
+        # process was added with a fold_axis: [k, nbinsfull, nproc] in dense
+        # mode, [k, nnz] values on the sparse norm pattern in sparse mode.
+        if norm_folds is not None:
+            nbytes += h5pyutils_write.writeFlatInChunks(
+                norm_folds, f, "hnorm_folds", maxChunkBytes=self.chunkSize
+            )
+            f.attrs["mcstat_fold_k"] = int(norm_folds.shape[0])
+            norm_folds = None
+
+        # SPARSE split-logk: per-fold logk delta [k, nnz, nfolded] for the
+        # folded systs + their global syst indices.
+        if logk_folds_delta is not None:
+            nbytes += h5pyutils_write.writeFlatInChunks(
+                logk_folds_delta, f, "hlogk_folds_delta", maxChunkBytes=self.chunkSize
+            )
+            nbytes += h5pyutils_write.writeFlatInChunks(
+                mcstat_folded_syst_idx,
+                f,
+                "hmcstat_folded_syst_idx",
+                maxChunkBytes=self.chunkSize,
+            )
+            logk_folds_delta = None
+
         if self.sparse:
             nbytes += h5pyutils_write.writeSparse(
                 norm_sparse_indices,
@@ -2339,6 +2904,12 @@ class TensorWriter:
             )
             logk = None
 
+            if logk_folds is not None:
+                nbytes += h5pyutils_write.writeFlatInChunks(
+                    logk_folds, f, "hlogk_folds", maxChunkBytes=self.chunkSize
+                )
+                logk_folds = None
+
             if self.has_beta_variations:
                 nbytes += h5pyutils_write.writeFlatInChunks(
                     beta_variations, f, "hbetavariations", maxChunkBytes=self.chunkSize
@@ -2352,6 +2923,10 @@ class TensorWriter:
             ext_group = f.create_group("external_terms")
             for term in self.external_terms:
                 term_group = ext_group.create_group(term["name"])
+                if term["name"] in self.mcstat_moment_variance:
+                    term_group.attrs["mcstat_variance"] = self.mcstat_moment_variance[
+                        term["name"]
+                    ]
                 params_ds = term_group.create_dataset(
                     "params",
                     [len(term["params"])],

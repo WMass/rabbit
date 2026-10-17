@@ -73,13 +73,32 @@ class Workspace:
         param_impact_group_names = [
             name for name, _ in fitter._resolved_param_impact_groups()
         ]
+        # A de-biased fit's impacts decompose its CURVATURE covariance and append
+        # the variance the reported covariance adds to it as "mcStatDebias", plus
+        # the whole MC-statistical contribution "mcStat" (bin-by-bin stat and
+        # de-biasing in quadrature), so the groups add up to the reported
+        # uncertainty (the last columns from traditional_impacts.impacts_parms
+        # and global_impacts.global_impacts_parms).
+        extra_groups = list(param_impact_group_names)
+        if getattr(fitter, "mcstat_debias_active", False):
+            extra_groups += ["mcStatDebias", "mcStat"]
         self.grouped_impact_axis = getGroupedImpactsAxes(
             fitter.indata,
             bin_by_bin_stat=fitter.bbstat.enabled,
             per_process=False,
-            extra_groups=param_impact_group_names,
+            extra_groups=extra_groups,
         )
         self.grouped_global_impact_axis = getGroupedImpactsAxes(
+            fitter.indata,
+            bin_by_bin_stat=fitter.bbstat.enabled,
+            per_process=fitter.bbstat.binByBinStatMode == "full",
+            extra_groups=extra_groups,
+        )
+        # The Gaussian global impacts propagate the data, constraint and beta0
+        # variances through the (de-biased) estimator, so the de-biasing changes
+        # their data-stat term itself rather than adding a separate one: no
+        # mcStatDebias / mcStat columns.
+        self.grouped_gaussian_global_impact_axis = getGroupedImpactsAxes(
             fitter.indata,
             bin_by_bin_stat=fitter.bbstat.enabled,
             per_process=fitter.bbstat.binByBinStatMode == "full",
@@ -511,7 +530,12 @@ class Workspace:
         )
 
     def add_impacts_hists(
-        self, impacts, impacts_grouped, base_name="impacts", global_impacts=False
+        self,
+        impacts,
+        impacts_grouped,
+        base_name="impacts",
+        global_impacts=False,
+        gaussian=False,
     ):
         # store impacts for all POIs and NOIs
         parms = np.concatenate(
@@ -521,11 +545,12 @@ class Workspace:
         # write out histograms
         axis_parms = hist.axis.StrCategory(parms, name="parms")
         axis_impacts = self.global_impact_axis if global_impacts else self.impact_axis
-        axis_impacts_grouped = (
-            self.grouped_global_impact_axis
-            if global_impacts
-            else self.grouped_impact_axis
-        )
+        if gaussian:
+            axis_impacts_grouped = self.grouped_gaussian_global_impact_axis
+        elif global_impacts:
+            axis_impacts_grouped = self.grouped_global_impact_axis
+        else:
+            axis_impacts_grouped = self.grouped_impact_axis
 
         self.add_hist(base_name, [axis_parms, axis_impacts], values=impacts)
 
@@ -653,7 +678,7 @@ class Workspace:
             if gaussian_impacts_grouped is not None:
                 self.add_hist(
                     f"{name}_gaussian_global_impacts_grouped",
-                    [*hist_axes, self.grouped_global_impact_axis],
+                    [*hist_axes, self.grouped_gaussian_global_impact_axis],
                     gaussian_impacts_grouped,
                     **opts,
                 )

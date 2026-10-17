@@ -282,7 +282,16 @@ def global_impacts_parms(
     global_impacts_from_jvp,
     cov,
     param_groupidxs=None,
+    mcstat_extra_var=None,
 ):
+    """Global impacts on the POIs and NOIs, decomposing `cov`.
+
+    mcstat_extra_var: see traditional_impacts.impacts_parms. For an MC-stat
+    de-biased fit `cov` is the curvature covariance and this is the variance the
+    reported covariance adds to it; appended as "mcStatDebias" and "mcStat"
+    (bin-by-bin stat and de-biasing terms in quadrature), so that the groups
+    add up to the reported uncertainty.
+    """
     idxs_poi = tf.range(nsignal_params, dtype=tf.int64)
     idxs_noi = tf.constant(nmodel_params + noiidxs, dtype=tf.int64)
     idxsout = tf.concat([idxs_poi, idxs_noi], axis=0)
@@ -334,6 +343,20 @@ def global_impacts_parms(
         impacts_beta0_process,
     )
 
+    if mcstat_extra_var is not None:
+        var_debias = tf.nn.relu(tf.gather(mcstat_extra_var, idxsout))
+        var_mcstat = var_debias
+        if bin_by_bin_stat:
+            var_mcstat = var_mcstat + var_beta0
+        impacts_grouped = tf.concat(
+            [
+                impacts_grouped,
+                tf.sqrt(var_debias)[:, None],
+                tf.sqrt(var_mcstat)[:, None],
+            ],
+            axis=-1,
+        )
+
     return impacts_x0, impacts_grouped
 
 
@@ -358,9 +381,15 @@ def global_impacts_obs(
     pdexpdbeta=None,
     pd2ldbeta2_pdexpdbeta=None,
     prefit_unconstrained_nuisance_uncertainty=0.0,
+    mcstat_extra_var=None,
 ):
     """
     Global impacts on observable bins, used inside _expected_with_variance.
+
+    mcstat_extra_var: for an MC-stat de-biased fit, where cov_dexpdx and
+    expvar_flat are built from the curvature covariance, the variance the
+    reported covariance adds per observable bin; appended as "mcStatDebias" and
+    "mcStat" (bin-by-bin stat and de-biasing in quadrature).
 
     Unlike global_impacts_parms, this variant uses the already-computed cov_dexpdx
     and expvar_flat from the observable Jacobian, and includes the mapping contribution
@@ -426,6 +455,18 @@ def global_impacts_obs(
         impacts_beta0_total,
         impacts_beta0_process,
     )
+
+    if mcstat_extra_var is not None:
+        var_debias = tf.nn.relu(mcstat_extra_var)
+        var_mcstat = var_debias + (var_beta0 if bin_by_bin_stat else 0.0)
+        impacts_grouped = tf.concat(
+            [
+                impacts_grouped,
+                tf.sqrt(var_debias)[:, None],
+                tf.sqrt(var_mcstat)[:, None],
+            ],
+            axis=-1,
+        )
 
     impacts = tf.reshape(impacts_x0, [*expvar_shape, impacts_x0.shape[-1]])
     impacts_grouped = tf.reshape(
