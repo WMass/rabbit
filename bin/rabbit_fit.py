@@ -975,20 +975,6 @@ def fit(args, fitter, ws, dofit=True):
             external_postfit_variances(args, fitter), dtype=fitter.indata.dtype
         )
         cov_available = True
-        if len(fitter.constraints) and (
-            args.globalImpacts or args.gaussianGlobalImpacts
-        ):
-            # the loaded covariance is the face-held one if the external fit
-            # was constrained; the global impacts' data-stat remainder also
-            # needs the active faces' curvature term (see
-            # Fitter._face_curvature_variance), from the gradient alone
-            _, grad = fitter.loss_val_grad()
-            nfaces = fitter.postfit_faces_at(grad, args.constraintActiveTol)
-            logger.info(
-                f"[constraints] {nfaces} active face(s) at the --externalPostfit "
-                "point; the loaded covariance is taken to be the face-held one"
-            )
-            del grad
 
     # Global impacts need the covariance and the parameter values, not the
     # Hessian, so they run whether it was recomputed above or loaded from

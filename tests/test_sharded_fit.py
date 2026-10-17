@@ -740,9 +740,6 @@ _SHARDED_SAFE = {
     # Hessian handed in by the driver, and dense [nparams]^2 algebra; besides,
     # --constraints is refused with --nDevices > 1
     "constrained_postfit",
-    # same: the constraint functions at the loaded --externalPostfit point and
-    # the gradient handed in by the driver, [nparams]-sized algebra only
-    "postfit_faces_at",
     # postfit verdict on the blinding width, reached as fitter.blinding.*:
     # reads the variance vector the driver already has, the POI offsets and
     # the model's declared scales. All [nparams]-sized, no bin axis anywhere,

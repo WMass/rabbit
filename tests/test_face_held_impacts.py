@@ -104,11 +104,18 @@ class FacePOUs(ParamModel):
     {a}, {b}, {a, b} is the eliminated model's {b}.
     """
 
-    def __init__(self, indata, elim_lb=None, **kwargs):
+    def __init__(self, indata, elim_lb=None, disk=None, **kwargs):
         self.indata = indata
         self.elim_lb = elim_lb
+        self.disk = disk
         self.npoi = 1
-        if elim_lb is None:
+        if disk is not None:
+            # (a, b) on the boundary of Disk(*disk): the face eliminated
+            # exactly, a = a0 + r sa cos(phi), b = b0 + r sb sin(phi)
+            self.npou = 1
+            self.params = np.array(["sig", "phi"])
+            self.param_impact_groups = {"phi": ["phi"]}
+        elif elim_lb is None:
             self.npou = 2
             self.params = np.array(["sig", "a", "b"])
             self.param_impact_groups = {"a": ["a"], "b": ["b"], "ab": ["a", "b"]}
@@ -124,7 +131,12 @@ class FacePOUs(ParamModel):
 
     def compute(self, param, full=False):
         sig = param[0]
-        if self.elim_lb is None:
+        if self.disk is not None:
+            a0, b0, sa, sb, r2 = self.disk
+            r = np.sqrt(r2)
+            a = a0 + r * sa * tf.cos(param[1])
+            b = b0 + r * sb * tf.sin(param[1])
+        elif self.elim_lb is None:
             a, b = param[1], param[2]
         else:
             b = param[1]
@@ -185,9 +197,9 @@ class Disk(Constraints):
         )
 
 
-def _fitter(fn, cons=(), elim_lb=None, method="trust-krylov", **kw):
+def _fitter(fn, cons=(), elim_lb=None, disk=None, method="trust-krylov", **kw):
     indata_obj = inputdata.FitInputData(fn)
-    pm = FacePOUs(indata_obj, elim_lb=elim_lb)
+    pm = FacePOUs(indata_obj, elim_lb=elim_lb, disk=disk)
     opts = make_options(
         minimizerMethod=method, prefitUnconstrainedNuisanceUncertainty=1.0, **kw
     )
@@ -250,6 +262,15 @@ def _impacts(f, h):
         "gaussian": np.asarray(gaimp),
         "gaussian_grouped": np.asarray(gagrp),
     }
+
+
+def _newton_polish(f, iters=6):
+    """Finish an unconstrained minimisation with exact Newton steps, to |grad|
+    ~1e-13: the minimizer's own stop (|grad| 1e-8..1e-10, platform dependent)
+    is too coarse for a finite-difference reference."""
+    for _ in range(iters):
+        _, g, h = f.loss_val_grad_hess()
+        f.x.assign(f.x.numpy() - np.linalg.solve(np.asarray(h), np.asarray(g)))
 
 
 def _free_minimum(fn):
@@ -477,52 +498,111 @@ def test_curved_face_grouped_impacts_equal_frozen_group_fits():
 
 
 def test_curved_face_global_impacts():
-    """The face-held covariance is the response of the constrained minimum
-    to the global observables (finite-difference refits), and the corrected
-    remainder is the data term diag(C H_data C), not diag(C) minus the
-    sources (which differs by the face curvature term)."""
+    """At a curved face, against the fit with the face ELIMINATED: (a, b) on
+    the circle, parametrised by an angle phi. That is an unconstrained fit
+    whose Hessian carries the face curvature through the chain rule rather
+    than through the multiplier, so at its minimum the covariance and the
+    global impacts must equal the face-held ones exactly, and its
+    finite-difference refits give the response of the constrained minimum to
+    a global observable.
+
+    The eliminated fit (trust-krylov, then exact Newton steps) defines the
+    point. Neither
+    the point nor the finite differences come from trust-constr refits: those
+    converge only to the barrier tolerance, ~1e-8 in x, i.e. ~1 % of the
+    response at delta = 1e-3, and platform-dependently so (that made an
+    earlier version of this check fail in CI at 0.9 %)."""
     with tempfile.TemporaryDirectory() as tmp:
         fn = make_face_tensor(tmp)
         tc, lb = _curved_face_fit(fn, noBinByBinStat=True)
+        a0, b0, sa, sb = lb
+        spec = (a0, b0, sa, sb, 4.0)
+        names = _names(tc)
+        ia, ib, j = names.index("a"), names.index("b"), names.index("normC")
+        n = len(names)
+        keep = [0] + list(range(3, n))  # sig, card nuisances (full model)
+        keep_ref = [0] + list(range(2, n - 1))  # the same, eliminated model
+        jr = j - 1  # one parameter fewer before the card nuisances
+
+        def ref_fitter():
+            return _fitter(fn, disk=spec, noBinByBinStat=True, minimizerGtol=1e-14)
+
+        xt = tc.x.numpy()
+        phi0 = np.arctan2((xt[ib] - b0) / sb, (xt[ia] - a0) / sa)
+        xstart = np.concatenate([[xt[0], phi0], xt[3:]])
+        ref = ref_fitter()
+        ref.x.assign(xstart)
+        ref.minimize()
+        _newton_polish(ref)
+        xe = ref.x.numpy().copy()
+        _at(ref, xe)
+        want = _postfit_plain(ref)
+
+        # the same point in the full model, on the face to round-off
+        phi = xe[1]
+        xfull = np.concatenate(
+            [[xe[0], a0 + 2 * sa * np.cos(phi), b0 + 2 * sb * np.sin(phi)], xe[2:]]
+        )
+        _at(tc, xfull)
         got = _postfit_held(tc)
+        (face,) = got["cpf"]["active"]
+        assert face["multiplier"] < 0
         C = got["cov"]
         cw = tc.cw.numpy()
 
-        # data-stat remainder: diag(C H_data C) with H_data = H - diag(cw)
-        _, _, H = tc.loss_val_grad_hess()
-        Hdata = np.asarray(H) - np.diag(cw)
-        stat = got["global_grouped"][0, len(tc.indata.systgroupidxs)]
-        np.testing.assert_allclose(stat**2, C[0] @ Hdata @ C[0], rtol=1e-8)
-        var_face = tc._face_curvature_variance().numpy()[0]
-        assert abs(var_face) > 1e-3 * C[0, 0]
-        # the groups no longer add up to the face-held total, but to C H C
-        src = np.sum(got["global"][0] ** 2) + stat**2
-        np.testing.assert_allclose(src, C[0, 0] + var_face, rtol=1e-8)
-        np.testing.assert_allclose(src, C[0] @ np.asarray(H) @ C[0], rtol=1e-8)
+        np.testing.assert_allclose(
+            C[np.ix_(keep, keep)],
+            want["cov"][np.ix_(keep_ref, keep_ref)],
+            rtol=1e-8,
+            atol=1e-13,
+        )
+        np.testing.assert_allclose(
+            got["global"][:, keep], want["global"][:, keep_ref], rtol=1e-8, atol=1e-13
+        )
+        nfix = len(tc.indata.systgroupidxs) + 1  # syst groups + stat
+        np.testing.assert_allclose(
+            got["global_grouped"][:, :nfix], want["global_grouped"][:, :nfix], rtol=1e-8
+        )
 
-        # finite differences: shift one constraint centre x0_j by delta and
-        # refit; dx_poi/dx0_j = C_pj cw_j (the per-source global impact over
-        # sqrt(cw_j)), with the face held -- not H^-1
-        j = _names(tc).index("normC")
+        # The data-stat remainder is the eliminated fit's (asserted above with
+        # the grouped columns): the sources add up to diag(C), as in any fit,
+        # and the face curvature term -diag(C Hc C), Hc = sum mu d2c, counts as
+        # data -- in the eliminated coordinates it IS part of the data
+        # Hessian (data gradient x curvature of the face). So stat^2 is
+        # diag(C H_data C) minus that term, not diag(C H_data C).
+        _, _, H = tc.loss_val_grad_hess()
+        H = np.asarray(H)
+        Hc = tc.postfit_faces["hess_constraints"]
+        stat = got["global_grouped"][0, len(tc.indata.systgroupidxs)]
+        np.testing.assert_allclose(
+            np.sum(got["global"][0] ** 2) + stat**2, C[0, 0], rtol=1e-8
+        )
+        np.testing.assert_allclose(
+            stat**2, C[0] @ (H - np.diag(cw) - Hc) @ C[0], rtol=1e-8
+        )
+        assert abs(C[0] @ Hc @ C[0]) > 1e-3 * C[0, 0]  # and that term matters
+
+        # finite differences on the eliminated fit: shift x0_j by +-delta and
+        # refit from its minimum (Newton-polished); dx_poi/dx0_j = C_pj cw_j.
+        # Measured on this model: relative error -0.051 delta^2 (5e-8 at
+        # delta = 1e-3, scaling as delta^2 over 3e-4..3e-2), i.e. truncation
+        # only; refit noise ~1e-9. Without the polish the refits stop at
+        # |grad| ~1e-8 and the error is ~1e-4, erratic in delta.
         delta = 1e-3
         resp = []
-        for s in (+1, -1):
-            f = _fitter(
-                fn, cons=[Disk(*lb)], method="trust-constr", noBinByBinStat=True
-            )
+        for sgn in (+1, -1):
+            f = ref_fitter()
             x0 = f.x0.numpy().copy()
-            x0[j] += s * delta
+            x0[jr] += sgn * delta
             f.x0.assign(x0)
-            # from the same interior start, not from the minimum on the face:
-            # a trust-constr restart on a face is unreliable (scipy resets the
-            # slacks), which is not what is being tested here
-            f.x.assign(tc.start)
+            f.x.assign(xe)
             f.minimize()
+            _newton_polish(f)
             resp.append(f.x.numpy()[0])
         fd = (resp[0] - resp[1]) / (2 * delta)
-        np.testing.assert_allclose(fd, C[0, j] * cw[j], rtol=2e-3)
+        np.testing.assert_allclose(fd, C[0, j] * cw[j], rtol=1e-6)
         Crel = got["cpf"]["cov_released"]
-        assert abs(Crel[0, j] * cw[j] - fd) > 10 * abs(C[0, j] * cw[j] - fd)
+        assert abs(Crel[0, j] * cw[j] - fd) > 1e3 * abs(C[0, j] * cw[j] - fd)
 
 
 # ---------------------------------------------------------------------------

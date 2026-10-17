@@ -359,7 +359,10 @@ def report_constrained_postfit(result, ws, active_tol):
     :func:`face_held_group_impact`), the global ones from the face-held
     covariance, which is the response of the constrained minimum to the
     global observables (implicit-function theorem on the KKT system, the
-    constraints not depending on them).
+    constraints not depending on them). All of them equal those of the fit
+    with the faces eliminated; the global data-stat remainder keeps its usual
+    definition, the face curvature term sum mu d2c counting as data (in the
+    eliminated coordinates it is part of the data Hessian).
     """
     released = result["edm_released"]
     logger.info(

@@ -262,8 +262,8 @@ class Fitter:
         self.constraints = []
         # what build_scipy_constraints kept (rows, bounds, labels); None = not built
         self._constraint_info = None
-        # the faces active at the last constrained post-fit (constrained_postfit
-        # or postfit_faces_at): {"jacobian": A [m, n], "hess_constraints":
+        # the faces active at the last constrained post-fit (constrained_postfit):
+        # {"jacobian": A [m, n], "hess_constraints":
         # sum_i mu_i d2c_i [n, n]}, None when no face is active. The impacts
         # are then taken with these faces held.
         self.postfit_faces = None
@@ -1154,37 +1154,6 @@ class Fitter:
         else:
             self.postfit_faces = None
 
-    def postfit_faces_at(self, grad, active_tol=1e-5):
-        """Record the faces active at the current self.x, without a Hessian.
-
-        For a covariance taken from --externalPostfit: the global impacts need
-        only the active rows and their curvature term, which come from the
-        gradient (the multipliers), the constraint Jacobian and the
-        constraint Hessian -- never the loss Hessian. Same activity criterion
-        as :meth:`constrained_postfit`. Returns the number of active faces.
-        """
-        x = self.x.numpy()
-        cval, J = self.eval_physical(self._constraints_fn, x, jacobian=True)
-        lower, upper, _ = self._constraint_bounds()
-        active, mu, _ = constraints_postfit.active_faces(
-            np.asarray(grad),
-            cval,
-            J,
-            lower,
-            upper,
-            np.asarray(self.floating_indices, dtype=int),
-            active_tol,
-        )
-        Hc = None
-        if len(active):
-            vfull = np.zeros(len(cval))
-            vfull[active] = mu
-            Hc = self.hess_physical(
-                self._constraints_fn, x, vfull, self._constraint_columns()
-            )
-        self._set_postfit_faces(J[active], Hc)
-        return len(active)
-
     def bayesassign(self):
         # Sample the parameter values from their priors: width sqrt(1/cw)
         # around the constraint centers wherever cw > 0; free entries (cw = 0)
@@ -1524,43 +1493,8 @@ class Fitter:
 
         return impacts, impacts_grouped
 
-    def global_impacts_parms(self):
-        return self._global_impacts_parms(self._face_curvature_variance())
-
-    def _face_curvature_variance(self):
-        """diag(C Hc C) on the POI and NOI rows at the active faces, else None.
-
-        C is the face-held covariance and Hc = sum_i mu_i d2c_i the constraint
-        curvature. Since C W C = C with W = H - Hc, the per-source variances
-        (C H_s C, summing to C H C) add up to diag(C) + this term, not to
-        diag(C): at a CURVED face the sandwich and the inverse curvature
-        differ. The global impacts' remainder (data stat) is corrected by it.
-        Exactly zero at a face linear in the fit parameters (Hc = 0).
-        """
-        if self.postfit_faces is None:
-            return None
-        Hc = self.postfit_faces["hess_constraints"]
-        npoi = int(self.param_model.npoi)
-        rows = np.concatenate(
-            [
-                np.arange(npoi),
-                int(self.param_model.nparams)
-                + np.asarray(self.indata.noiidxs, dtype=np.int64),
-            ]
-        ).astype(np.int64)
-        Crows = self.cov.numpy()[rows]
-        var_face = np.einsum("in,nm,im->i", Crows, Hc, Crows)
-        if np.any(var_face != 0):
-            logger.info(
-                "[constraints] global impacts at a curved active face: the "
-                "per-source impacts add up in quadrature to sigma^2 + "
-                f"diag(C Hc C) = sigma^2 + {var_face.tolist()} (POIs, NOIs); the "
-                "data-stat remainder is corrected by this face-curvature term."
-            )
-        return tf.constant(var_face, dtype=self.indata.dtype)
-
     @tf.function
-    def _global_impacts_parms(self, var_face=None):
+    def global_impacts_parms(self):
         param_groupidxs = [idxs for _, idxs in self._resolved_param_impact_groups()]
         return global_impacts.global_impacts_parms(
             self.x,
@@ -1578,7 +1512,6 @@ class Fitter:
             self.globalImpactsFromJVP,
             self.cov,
             param_groupidxs=param_groupidxs,
-            var_face=var_face,
         )
 
     @tf.function
