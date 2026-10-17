@@ -2928,6 +2928,9 @@ class Fitter:
         g, c, J, lo, up, labels, floating = self._constraint_kkt_inputs()
         return tc_warm.releasing_rows(g, c, J, lo, up, labels, floating=floating)
 
+    #: release rounds (release step + warm leg) before the last-resort leg
+    WARM_RELEASE_ROUNDS = 3
+
     def fit(self, warm_start=False):
         """Minimise from the current self.x.
 
@@ -2939,53 +2942,125 @@ class Fitter:
         The warm leg holds no row feasible, starts the slacks at c - lb and
         the barrier on the start's central path (max multiplier * slack over
         the rows near a bound, rabbit.constraints.warm_start.centred_barrier).
-        scipy's convergence test does not check the multipliers' sign, and a
-        barrier that small can stop on a face the loss wants to leave when the
-        active set has to change. So the result is checked
-        (releasing_constraint_rows) and, if a face should have been left, the
-        fit continues from there with scipy's own interior-point start (still
-        holding no row feasible). See rabbit.constraints.warm_start.
+
+        A small barrier cannot push off a face, and scipy's convergence test
+        does not check the multipliers' sign, so a warm leg whose minimum has
+        moved off a face stops ON it. The result is therefore checked
+        (releasing_constraint_rows). If a face should be left, a release step
+        moves off the releasing face(s) along their normals, holding the
+        binding ones (a Newton step on the loss along that direction, cut back
+        until the loss decreases and no row is violated), and a new warm leg
+        starts from there. Only if that fails WARM_RELEASE_ROUNDS times does
+        the fit fall back to scipy's own interior-point start (still holding
+        no row feasible), which walks away from the point and is slow.
+        See rabbit.constraints.warm_start.
         """
         if not self._use_warm_start(warm_start):
             self._warm_start_info = None
             return self._fit_leg("cold")
-        g, c, J, lo, up, _, floating = self._constraint_kkt_inputs()
-        self._warm_barrier = tc_warm.centred_barrier(g, c, J, lo, up, floating=floating)
-        logger.info(
-            "[minimize] trust-constr warm start: barrier from "
-            f"{self._warm_barrier:.3g} (the start's central path; "
-            "--minimizerInitialBarrier* override it), slacks from the constraint "
-            "values, no row held feasible"
-        )
-        callback = self._fit_leg("warm")
-        info = {"legs": ["warm"], "releasing": [], "barrier": self._warm_barrier}
-        bad = self.releasing_constraint_rows()
-        if bad:
-            info["releasing"] = [lab for lab, _, _ in bad]
+        info = {"legs": [], "releasing": [], "barrier": None}
+        callback = None
+        for rnd in range(self.WARM_RELEASE_ROUNDS + 1):
+            g, c, J, lo, up, _, floating = self._constraint_kkt_inputs()
+            self._warm_barrier = tc_warm.centred_barrier(
+                g, c, J, lo, up, floating=floating
+            )
+            if info["barrier"] is None:
+                info["barrier"] = self._warm_barrier
+            logger.info(
+                "[minimize] trust-constr warm start: barrier from "
+                f"{self._warm_barrier:.3g} (the start's central path; "
+                "--minimizerInitialBarrier* override it), slacks from the "
+                "constraint values, no row held feasible"
+            )
+            callback = merge_callbacks(callback, self._fit_leg("warm"))
+            info["legs"].append("warm")
+            bad = self.releasing_constraint_rows()
+            if not bad:
+                break
+            info["releasing"].extend(lab for lab, _, _ in bad)
             logger.warning(
-                "[minimize] warm start stopped on face(s) the loss wants to leave "
+                "[minimize] warm leg stopped on face(s) the loss wants to leave "
                 "(multiplier of the releasing sign): "
                 + "; ".join(
                     f"{lab} (mu={m:.3g}, distance {d:.2g})" for lab, m, d in bad
                 )
-                + ". Continuing from scipy's interior-point start."
             )
-            callback = merge_callbacks(callback, self._fit_leg("release"))
-            info["legs"].append("release")
-            bad = self.releasing_constraint_rows()
-            if bad:
+            if rnd == self.WARM_RELEASE_ROUNDS or not self._release_step():
                 logger.warning(
-                    "[minimize] still on face(s) with a releasing multiplier after "
-                    "the fallback: " + "; ".join(lab for lab, _, _ in bad)
+                    "[minimize] no release step; continuing from scipy's own "
+                    "interior-point start (expect a detour)"
                 )
+                callback = merge_callbacks(callback, self._fit_leg("release"))
+                info["legs"].append("release")
+                bad = self.releasing_constraint_rows()
+                if bad:
+                    logger.warning(
+                        "[minimize] still on face(s) with a releasing multiplier: "
+                        + "; ".join(lab for lab, _, _ in bad)
+                    )
+                break
+            info["legs"].append("release-step")
         self._warm_start_info = info
         return callback
+
+    def _release_step(self, max_halvings=40):
+        """Move self.x off the --constraints faces whose multiplier says the
+        loss wants them released, holding the binding ones; True if moved.
+
+        The direction is rabbit.constraints.warm_start.release_direction; the
+        length a Newton step on the loss along it (one HVP), halved until the
+        loss decreases and no row is violated beyond what it was. This only
+        restores the slack the interior point cannot grow by itself (a slack
+        of ~1e-9 has a scaled gradient ~1e-17); the warm leg that follows
+        finishes the job.
+        """
+        x0 = self.x.numpy()
+        g, c, J, lo, up, labels, floating = self._constraint_kkt_inputs()
+        rows, side, _, _, bad = tc_warm.classify_near_rows(
+            g, c, J, lo, up, floating=floating
+        )
+        d = tc_warm.release_direction(
+            J, rows[bad], side[bad], rows[~bad], floating=floating
+        )
+        if d is None:
+            return False
+        slope = float(g @ d)
+        if not slope < 0:
+            return False
+        _, _, hd = self.loss_val_grad_hessp(tf.constant(d, dtype=self.x.dtype))
+        curv = float(np.dot(d, hd.numpy()))
+        # no positive curvature: cap the move at 1e-3 of the first face's scale
+        t = (
+            -slope / curv
+            if curv > 0
+            else 1e-3 / max(abs(float(J[rows[bad][0]] @ d)), 1e-300)
+        )
+
+        def violation(cv):
+            return float(np.max(np.maximum(np.maximum(lo - cv, cv - up), 0.0)))
+
+        f0 = float(self.loss_val())
+        v0 = violation(c)
+        for _ in range(max_halvings):
+            self.x.assign(x0 + t * d)
+            ft = float(self.loss_val())
+            ct = self.eval_physical(self._constraints_fn, self.x.numpy())
+            if ft < f0 and violation(ct) <= v0:
+                logger.info(
+                    f"[minimize] release step: {t:.3g} along the release direction, "
+                    f"loss {f0:.10f} -> {ft:.10f}"
+                )
+                return True
+            t *= 0.5
+        self.x.assign(x0)
+        return False
 
     def _fit_leg(self, tc_start="cold"):
         """One minimisation from self.x. tc_start (trust-constr + --constraints
         only): "cold" = scipy's interior-point start with rabbit's
-        keep_feasible rule; "warm" = no row held, slacks at c - lb, small
-        barrier; "release" = no row held, scipy's start."""
+        keep_feasible rule; "warm" = no row held, slacks at c - lb, centred
+        barrier; "release" = no row held, scipy's start (last resort)."""
         logger.info("Perform iterative fit")
 
         # Optional reparameterisation. Built once at the starting point, it is

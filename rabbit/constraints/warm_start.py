@@ -36,8 +36,16 @@ the trust radius collapses (measured on rabbit's saturated test).
 
 scipy's stopping test (the KKT residual with least-squares multipliers) does
 not check the multipliers' SIGN, so a small barrier on a face the loss wants
-to leave can stop there ("success"). :func:`releasing_rows` is the check for
-that; the caller continues from scipy's own start when it fires.
+to leave can stop there ("success"). It does, and not only in theory: in the
+scaled interior-point step the loss gradient along a face's slack is
+``mu_i * s_i``, ~1e-17 at a slack of 1e-9, and the barrier's push is ``mu``,
+~1e-8, so neither survives scipy's relative CG stop next to the other
+directions' residual, nor rabbit's loss noise; the trust radius then
+collapses ON the face (status 2). Only a large barrier pushes off a face,
+and scipy's own start (mu = 0.1) does that by walking the whole fit away.
+:func:`releasing_rows` detects the case; :func:`release_direction` gives the
+step that leaves the releasing faces while holding the binding ones, which
+the caller line-searches before starting the next warm leg from there.
 
 scipy exposes no ``s0``. :func:`consistent_slacks` sets it through a subclass
 of the private ``BarrierSubproblem``, relying on two details of scipy's
@@ -183,6 +191,48 @@ def centred_barrier(grad, cval, jac, lower, upper, floating=None, near_tol=1e-3)
     return float(np.clip(np.max(comp), *WARM_BARRIER_RANGE))
 
 
+def release_direction(jac, release, release_side, hold, floating=None):
+    """Unit step direction that moves the ``release`` rows into the allowed region
+    (``release_side`` +1 for a lower bound, -1 for an upper one) while holding
+    the ``hold`` rows on their faces to first order (projected out of the span
+    of their gradients). Zero on non-floating parameters; None if nothing is
+    left after the projection.
+    """
+    J = np.atleast_2d(np.asarray(jac, dtype=np.float64))
+    n = J.shape[1]
+    F = np.arange(n) if floating is None else np.asarray(floating, dtype=int)
+    JF = J[:, F]
+    d = np.zeros(len(F))
+    for i, sd in zip(release, release_side):
+        norm = np.linalg.norm(JF[i])
+        if norm > 0:
+            d += sd * JF[i] / norm
+    hold = np.asarray(hold, dtype=int)
+    if len(hold):
+        A = JF[hold]
+        d -= A.T @ np.linalg.lstsq(A @ A.T, A @ d, rcond=None)[0]
+    norm = np.linalg.norm(d)
+    if not norm > 0:
+        return None
+    out = np.zeros(n)
+    out[F] = d / norm
+    return out
+
+
+def classify_near_rows(
+    grad, cval, jac, lower, upper, floating=None, near_tol=1e-6, rel_tol=1e-6
+):
+    """(rows, side, mu, distance, releasing) for the rows near a bound, see
+    :func:`releasing_rows`; ``releasing`` is a boolean mask over ``rows``."""
+    rows, side, mu, dist = _near_multipliers(
+        grad, cval, jac, lower, upper, floating, near_tol
+    )
+    if not len(rows):
+        return rows, side, mu, dist, np.zeros(0, dtype=bool)
+    tol = rel_tol * max(1.0, float(np.max(np.abs(mu))))
+    return rows, side, mu, dist, side * mu < -tol
+
+
 def releasing_rows(
     grad,
     cval,
@@ -208,13 +258,9 @@ def releasing_rows(
 
     Returns a list of ``(label, multiplier, distance)`` for the offending rows.
     """
-    rows, side, mu, dist = _near_multipliers(
-        grad, cval, jac, lower, upper, floating, near_tol
+    rows, side, mu, dist, bad = classify_near_rows(
+        grad, cval, jac, lower, upper, floating, near_tol, rel_tol
     )
-    if not len(rows):
-        return []
-    tol = rel_tol * max(1.0, float(np.max(np.abs(mu))))
-    bad = side * mu < -tol
     return [
         (str(labels[i]), float(m), float(d))
         for i, m, d in zip(rows[bad], mu[bad], dist[bad])

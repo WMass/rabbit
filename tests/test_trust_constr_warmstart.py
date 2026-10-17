@@ -21,6 +21,7 @@ import scipy
 from scipy.optimize import NonlinearConstraint, minimize
 from scipy.optimize._trustregion_constr import tr_interior_point as tip
 
+from rabbit import fitter
 from rabbit.constraints import warm_start
 
 from .test_sparse_fit import make_test_tensor
@@ -256,6 +257,67 @@ def test_a_face_that_must_be_released_is_released():
         np.testing.assert_allclose(_phys(warm), _phys(free), atol=1e-4)
         assert abs(float(warm.loss_val()) - float(free.loss_val())) < 1e-6
         assert warm.releasing_constraint_rows() == []
+
+
+def test_release_direction():
+    J = np.array([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 2.0]])
+    # release row 0 (lower bound: +), hold row 1 on its face
+    d = warm_start.release_direction(J, [0], [1.0], [1])
+    assert d[0] > 0 and abs(J[1] @ d) < 1e-12 and d[2] == 0
+    np.testing.assert_allclose(np.linalg.norm(d), 1.0)
+    # an upper bound releases downwards; frozen parameters do not move
+    d = warm_start.release_direction(J, [2], [-1.0], [], floating=[0, 1])
+    assert d is None
+    d = warm_start.release_direction(J, [1], [-1.0], [], floating=[0, 1])
+    assert d[2] == 0 and J[1] @ d < 0
+
+
+def test_warm_leg_stopped_on_a_releasing_face_is_released_warm(monkeypatch):
+    """The real-fit failure (NOLAT ptll saturated sub-fit, 2026-10-16): the warm
+    leg stops ON a curved face whose multiplier has turned releasing (a small
+    barrier cannot push off a face). Simulated here by a first warm leg that
+    does nothing. What follows must leave the face WARM -- a release step and a
+    new warm leg, not scipy's cold start, which walked the real fit away -- with
+    no loss rise above the start and no violated row."""
+    with tempfile.TemporaryDirectory() as tmp:
+        fn, names, cons, _ = _setup(tmp)
+        cold = _cold(fn, cons)
+        # more data: sig wants to grow, so the cubic face (active above) releases
+        nobs = cold.indata.data_obs.numpy() * 1.3
+        ref = _fitter(fn, "trust-constr", cons=cons())
+        ref.set_nobs(nobs)
+        ref.minimize()
+        st_ref = ref.minimizer_status()
+        assert st_ref["constraint_values"][0] > st_ref["constraint_lower_bounds"][0] + 1
+
+        f = _fitter(fn, "trust-constr", cons=cons())
+        f.set_nobs(nobs)
+        f.x.assign(cold.x.numpy())
+        loss0 = float(f.loss_val())
+        # at the old minimum the new data pull both faces' multipliers to the
+        # releasing sign; the linear one is binding again at the new minimum
+        assert "cubic" in [r[0] for r in f.releasing_constraint_rows()]
+
+        orig = fitter.Fitter._fit_leg
+        calls = []
+
+        def leg(self, tc_start="cold"):
+            calls.append(tc_start)
+            if len(calls) == 1:  # the stalled warm leg
+                return None
+            return orig(self, tc_start)
+
+        monkeypatch.setattr(fitter.Fitter, "_fit_leg", leg)
+        cb = f.minimize(warm_start=True)
+        st = f.minimizer_status()
+        assert calls == ["warm", "warm"]  # no "release" (= scipy's cold start)
+        assert st["warm_start_legs"] == ["warm", "release-step", "warm"]
+        assert "cubic" in st["warm_start_releasing"]
+        assert max(cb.loss_history) - loss0 < 1e-6
+        assert st["constr_violation"] < 1e-9
+        assert float(f.loss_val()) - float(ref.loss_val()) < 1e-6
+        np.testing.assert_allclose(_phys(f), _phys(ref), atol=1e-4)
+        assert f.releasing_constraint_rows() == []
 
 
 def test_cold_path_is_unchanged():
