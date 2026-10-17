@@ -559,6 +559,26 @@ def common_parser():
         "default, 1.0.",
     )
     parser.add_argument(
+        "--minimizerWarmStart",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="trust-constr with --constraints only: how to start a fit from a "
+        "previous minimum. scipy's interior-point start re-initialises the slacks "
+        "(a row on its face starts with slack 1, which walks x into the interior), "
+        "restarts the barrier at 0.1, and rabbit's keep_feasible rule pins every "
+        "slack of a strictly feasible start at its constraint value, which can "
+        "freeze a fit whose minimum moved. The warm start holds no row feasible, "
+        "starts the slacks at the constraint values and the barrier (and its "
+        "first tolerance) on the start's central path (max multiplier*slack over "
+        "the rows near a bound; --minimizerInitialBarrier/"
+        "--minimizerInitialBarrierTol override it), then checks the multipliers' "
+        "signs and, if a face should have been left, continues from scipy's own "
+        "start. 'auto' (default): warm for the starts rabbit knows are minima "
+        "(the saturated sub-fit, a fit after --externalPostfit, likelihood-scan "
+        "points, global asymmetric impact refits), cold otherwise; 'on': every "
+        "fit; 'off': never (the behaviour before this option).",
+    )
+    parser.add_argument(
         "--forceLinear",
         default=False,
         action="store_true",

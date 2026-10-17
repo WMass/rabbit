@@ -1,3 +1,4 @@
+import contextlib
 import time
 
 import h5py
@@ -17,6 +18,7 @@ from rabbit.callbacks import RESTART_MIN_IMPROVEMENT, FitterCallback, merge_call
 from rabbit.common import match_regexp_params
 from rabbit.constraints import postfit as constraints_postfit
 from rabbit.constraints import scipy_adapter
+from rabbit.constraints import warm_start as tc_warm
 from rabbit.impacts import (
     asym_impacts,
     global_asym_impacts,
@@ -122,6 +124,12 @@ class Fitter:
             ),
             "initial_tr_radius": getattr(options, "minimizerInitialTrRadius", None),
         }
+        # trust-constr + --constraints only: how to start a fit whose starting
+        # point is a previous minimum (rabbit.constraints.warm_start)
+        self.minimizer_warm_start = getattr(options, "minimizerWarmStart", "auto")
+        # what the last fit() did about it; None = a plain (cold) start
+        self._warm_start_info = None
+        self._warm_barrier = tc_warm.WARM_INITIAL_BARRIER
         # scipy's OptimizeResult from the last fit(), so the convergence
         # outcome can be written to the output. None if the minimizer raised.
         self.minimizer_result = None
@@ -1083,7 +1091,7 @@ class Fitter:
             cols.extend(int(i) for i in idx)
         return np.unique(np.asarray(cols, dtype=int))
 
-    def build_scipy_constraints(self, xstart, to_physical=None):
+    def build_scipy_constraints(self, xstart, to_physical=None, hold_feasible=True):
         """The --constraints rows as scipy NonlinearConstraints, see
         :func:`rabbit.constraints.scipy_adapter.build_nonlinear_constraints`."""
         if not len(self.constraints):
@@ -1098,6 +1106,7 @@ class Fitter:
             upper,
             labels,
             to_physical=to_physical,
+            hold_feasible=hold_feasible,
         )
         self._constraint_info = info
         return cons
@@ -2880,7 +2889,178 @@ class Fitter:
             names=self.parms.astype(str),
         )
 
-    def fit(self):
+    def _use_warm_start(self, warm_start):
+        """Whether fit(warm_start) runs the trust-constr warm start."""
+        mode = self.minimizer_warm_start
+        if (
+            mode == "off"
+            or (mode == "auto" and not warm_start)
+            or self.minimizer_method not in CONSTRAINED_METHODS
+            or not len(self.constraints)
+        ):
+            return False
+        ok, why = tc_warm.scipy_supports_slack_override()
+        if not ok:
+            logger.warning(
+                f"[minimize] trust-constr warm start unavailable ({why}); "
+                "starting from scipy's default interior-point start instead"
+            )
+            return False
+        return True
+
+    def _constraint_kkt_inputs(self):
+        """(grad, cval, J, lower, upper, labels, floating) at the current x."""
+        x = self.x.numpy()
+        _, grad = self.loss_val_grad()
+        cval, J = self.eval_physical(self._constraints_fn, x, jacobian=True)
+        lower, upper, labels = self._constraint_bounds()
+        floating = (
+            np.asarray(self.floating_indices, dtype=int)
+            if len(self.frozen_params) > 0
+            else None
+        )
+        return grad.numpy(), cval, J, lower, upper, labels, floating
+
+    def releasing_constraint_rows(self):
+        """--constraints rows near a bound whose multiplier, at the current x,
+        says the loss wants them released (see
+        :func:`rabbit.constraints.warm_start.releasing_rows`)."""
+        g, c, J, lo, up, labels, floating = self._constraint_kkt_inputs()
+        return tc_warm.releasing_rows(g, c, J, lo, up, labels, floating=floating)
+
+    #: release rounds (release step + warm leg) before the last-resort leg
+    WARM_RELEASE_ROUNDS = 3
+
+    def fit(self, warm_start=False):
+        """Minimise from the current self.x.
+
+        warm_start: the caller's statement that self.x is (near) the minimum of
+        a closely related problem -- a previous fit (--externalPostfit), the
+        main fit for the saturated sub-fit, the neighbouring scan point. It
+        changes anything only for trust-constr with --constraints, under
+        --minimizerWarmStart auto (the default; on/off override the caller).
+        The warm leg holds no row feasible, starts the slacks at c - lb and
+        the barrier on the start's central path (max multiplier * slack over
+        the rows near a bound, rabbit.constraints.warm_start.centred_barrier).
+
+        A small barrier cannot push off a face, and scipy's convergence test
+        does not check the multipliers' sign, so a warm leg whose minimum has
+        moved off a face stops ON it. The result is therefore checked
+        (releasing_constraint_rows). If a face should be left, a release step
+        moves off the releasing face(s) along their normals, holding the
+        binding ones (a Newton step on the loss along that direction, cut back
+        until the loss decreases and no row is violated), and a new warm leg
+        starts from there. Only if that fails WARM_RELEASE_ROUNDS times does
+        the fit fall back to scipy's own interior-point start (still holding
+        no row feasible), which walks away from the point and is slow.
+        See rabbit.constraints.warm_start.
+        """
+        if not self._use_warm_start(warm_start):
+            self._warm_start_info = None
+            return self._fit_leg("cold")
+        info = {"legs": [], "releasing": [], "barrier": None}
+        callback = None
+        for rnd in range(self.WARM_RELEASE_ROUNDS + 1):
+            g, c, J, lo, up, _, floating = self._constraint_kkt_inputs()
+            self._warm_barrier = tc_warm.centred_barrier(
+                g, c, J, lo, up, floating=floating
+            )
+            if info["barrier"] is None:
+                info["barrier"] = self._warm_barrier
+            logger.info(
+                "[minimize] trust-constr warm start: barrier from "
+                f"{self._warm_barrier:.3g} (the start's central path; "
+                "--minimizerInitialBarrier* override it), slacks from the "
+                "constraint values, no row held feasible"
+            )
+            callback = merge_callbacks(callback, self._fit_leg("warm"))
+            info["legs"].append("warm")
+            bad = self.releasing_constraint_rows()
+            if not bad:
+                break
+            info["releasing"].extend(lab for lab, _, _ in bad)
+            logger.warning(
+                "[minimize] warm leg stopped on face(s) the loss wants to leave "
+                "(multiplier of the releasing sign): "
+                + "; ".join(
+                    f"{lab} (mu={m:.3g}, distance {d:.2g})" for lab, m, d in bad
+                )
+            )
+            if rnd == self.WARM_RELEASE_ROUNDS or not self._release_step():
+                logger.warning(
+                    "[minimize] no release step; continuing from scipy's own "
+                    "interior-point start (expect a detour)"
+                )
+                callback = merge_callbacks(callback, self._fit_leg("release"))
+                info["legs"].append("release")
+                bad = self.releasing_constraint_rows()
+                if bad:
+                    logger.warning(
+                        "[minimize] still on face(s) with a releasing multiplier: "
+                        + "; ".join(lab for lab, _, _ in bad)
+                    )
+                break
+            info["legs"].append("release-step")
+        self._warm_start_info = info
+        return callback
+
+    def _release_step(self, max_halvings=40):
+        """Move self.x off the --constraints faces whose multiplier says the
+        loss wants them released, holding the binding ones; True if moved.
+
+        The direction is rabbit.constraints.warm_start.release_direction; the
+        length a Newton step on the loss along it (one HVP), halved until the
+        loss decreases and no row is violated beyond what it was. This only
+        restores the slack the interior point cannot grow by itself (a slack
+        of ~1e-9 has a scaled gradient ~1e-17); the warm leg that follows
+        finishes the job.
+        """
+        x0 = self.x.numpy()
+        g, c, J, lo, up, labels, floating = self._constraint_kkt_inputs()
+        rows, side, _, _, bad = tc_warm.classify_near_rows(
+            g, c, J, lo, up, floating=floating
+        )
+        d = tc_warm.release_direction(
+            J, rows[bad], side[bad], rows[~bad], floating=floating
+        )
+        if d is None:
+            return False
+        slope = float(g @ d)
+        if not slope < 0:
+            return False
+        _, _, hd = self.loss_val_grad_hessp(tf.constant(d, dtype=self.x.dtype))
+        curv = float(np.dot(d, hd.numpy()))
+        # no positive curvature: cap the move at 1e-3 of the first face's scale
+        t = (
+            -slope / curv
+            if curv > 0
+            else 1e-3 / max(abs(float(J[rows[bad][0]] @ d)), 1e-300)
+        )
+
+        def violation(cv):
+            return float(np.max(np.maximum(np.maximum(lo - cv, cv - up), 0.0)))
+
+        f0 = float(self.loss_val())
+        v0 = violation(c)
+        for _ in range(max_halvings):
+            self.x.assign(x0 + t * d)
+            ft = float(self.loss_val())
+            ct = self.eval_physical(self._constraints_fn, self.x.numpy())
+            if ft < f0 and violation(ct) <= v0:
+                logger.info(
+                    f"[minimize] release step: {t:.3g} along the release direction, "
+                    f"loss {f0:.10f} -> {ft:.10f}"
+                )
+                return True
+            t *= 0.5
+        self.x.assign(x0)
+        return False
+
+    def _fit_leg(self, tc_start="cold"):
+        """One minimisation from self.x. tc_start (trust-constr + --constraints
+        only): "cold" = scipy's interior-point start with rabbit's
+        keep_feasible rule; "warm" = no row held, slacks at c - lb, centred
+        barrier; "release" = no row held, scipy's start (last resort)."""
         logger.info("Perform iterative fit")
 
         # Optional reparameterisation. Built once at the starting point, it is
@@ -3003,6 +3183,7 @@ class Fitter:
             cons = self.build_scipy_constraints(
                 pc_cell[0].to_physical(xval),
                 to_physical=lambda yv: pc_cell[0].to_physical(yv),
+                hold_feasible=tc_start == "cold",
             )
             if cons:
                 info_minimize["constraints"] = cons
@@ -3044,6 +3225,10 @@ class Fitter:
             for k, v in self.minimizer_tc_init.items():
                 if v is not None:
                     sci_opts[k] = float(v)
+            if tc_start == "warm":
+                # explicit --minimizerInitialBarrier* still win
+                for k in ("initial_barrier_parameter", "initial_barrier_tolerance"):
+                    sci_opts.setdefault(k, self._warm_barrier)
             if "xtol" not in sci_opts:
                 logger.warning(
                     "[minimize] trust-constr without --minimizerXtol: a "
@@ -3148,16 +3333,24 @@ class Fitter:
                             callback=cb,
                         )
                     else:
-                        res = scipy.optimize.minimize(
-                            scipy_loss,
-                            xval,
-                            method=self.minimizer_method,
-                            jac=True,
-                            tol=0.0,
-                            callback=cb,
-                            options=sci_opts,
-                            **info_minimize,
-                        )
+                        with (
+                            tc_warm.consistent_slacks(
+                                tc_warm.WARM_SLACK_FLOOR_REL
+                                * sci_opts["initial_barrier_parameter"]
+                            )
+                            if tc_start == "warm" and "constraints" in info_minimize
+                            else contextlib.nullcontext()
+                        ):
+                            res = scipy.optimize.minimize(
+                                scipy_loss,
+                                xval,
+                                method=self.minimizer_method,
+                                jac=True,
+                                tol=0.0,
+                                callback=cb,
+                                options=sci_opts,
+                                **info_minimize,
+                            )
                 except Exception as ex:
                     # minimizer could have called the loss or hessp functions with "random" values, so restore the
                     # state from the end of the last iteration before the exception
@@ -3277,9 +3470,14 @@ class Fitter:
             out["constraint_lower_bounds"] = [float(c) for c in info["lower"]]
             out["constraint_upper_bounds"] = [float(c) for c in info["upper"]]
             out["constraint_labels"] = list(info["labels"])
+        if self._warm_start_info is not None:
+            out["warm_start_legs"] = list(self._warm_start_info["legs"])
+            out["warm_start_releasing"] = list(self._warm_start_info["releasing"])
+            out["warm_start_barrier"] = float(self._warm_start_info["barrier"])
         return out
 
-    def minimize(self):
+    def minimize(self, warm_start=False):
+        """warm_start: see :meth:`fit`."""
         if self.is_linear and len(self.constraints):
             if self.force_linear:
                 raise ValueError(
@@ -3357,7 +3555,7 @@ class Fitter:
 
             callback = None
         else:
-            callback = self.fit()
+            callback = self.fit(warm_start=warm_start)
 
         return callback
 
@@ -3459,7 +3657,7 @@ class Fitter:
                 self.x.assign(tf.tensor_scatter_nd_update(self.x, [[idx]], [ixval]))
 
                 _t0 = time.perf_counter()
-                self.fit()
+                self.fit(warm_start=True)
                 _wall = time.perf_counter() - _t0
 
                 islot = nscans // 2 + sign * i
@@ -3539,7 +3737,7 @@ class Fitter:
                 )
             )
 
-            self.fit()
+            self.fit(warm_start=True)
 
             dnlls[ix, iy] = self.reduced_nll().numpy() - nll_best
 
