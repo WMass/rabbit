@@ -14,6 +14,10 @@ logger = logging.child_logger(__name__)
 
 
 class TensorWriter:
+    # symmetrize modes supported for an up/down pair of folded systematics
+    # (add_systematic(..., fold_axis=...)); None keeps the asymmetric form
+    fold_symmetrize_modes = ("average", "conservative", "linear", "quadratic", None)
+
     def __init__(
         self,
         sparse=False,
@@ -63,6 +67,9 @@ class TensorWriter:
         # per-fold MC-stat variances (sum of w^2 per fold), same layout
         self.dict_sumw2_folds = {}
         self.fold_k = {}  # [channel][process] -> k
+        # bins of a folded process written without fold structure (each fold the
+        # full template / k): [channel][process] -> bool [nbinschan]
+        self.dict_flat_folds = {}
         # Split-logk fold templates (only for systematics added with fold_axis):
         # dict_logkavg_folds[channel][process][syst] = [k, nbinschan]; for
         # asymmetric folded systematics dict_logkhalfdiff_folds holds the per-fold
@@ -372,10 +379,13 @@ class TensorWriter:
                 var_hist > 0.0, var_given / np.where(var_hist > 0.0, var_hist, 1.0), 1.0
             )
             sumw2_folds = sumw2_folds * scale[None, :]
+        # bins written without fold structure
+        flat = np.zeros(norm_folds.shape[1], dtype=bool)
         if not np.any(sumw2_folds):
             # declared without MC-stat uncertainty (e.g. excluded from
             # bin-by-bin stat): MC-stat-exempt like a process without folds,
             # so the de-biasing does not act on noise declared absent
+            flat[:] = True
             logger.info(
                 f"Process {name} in channel {channel} has no MC-stat variance: "
                 "written without fold structure (MC-stat-exempt)."
@@ -393,6 +403,7 @@ class TensorWriter:
             if np.any(bad):
                 norm_folds[:, bad] = np.maximum(full[bad], 0.0)[None, :] / k
                 sumw2_folds[:, bad] = 0.0
+                flat = bad
                 logger.warning(
                     f"Process {name} in channel {channel}: {np.count_nonzero(bad)} "
                     "bins have a negative fold template (negative weights); they "
@@ -411,6 +422,7 @@ class TensorWriter:
         )
         self.dict_norm_folds[channel][name] = norm_folds.astype(self.dtype)
         self.dict_sumw2_folds[channel][name] = sumw2_folds.astype(self.dtype)
+        self.dict_flat_folds[channel][name] = flat
         self.fold_k[channel][name] = k
 
     def _common_fold_k(self):
@@ -591,6 +603,7 @@ class TensorWriter:
         self.dict_norm_folds[name] = {}
         self.dict_sumw2_folds[name] = {}
         self.fold_k[name] = {}
+        self.dict_flat_folds[name] = {}
         self.dict_logkavg_folds[name] = {}
         self.dict_logkhalfdiff_folds[name] = {}
         self.dict_logk_folds_delta[name] = {}
@@ -1646,8 +1659,11 @@ class TensorWriter:
         [up, down] of two histograms (asymmetric); both must carry the named
         fold_axis (the only extra axis beyond the channel). The process must have
         been added with the SAME fold_axis. The histograms must be hist.Hist (not
-        SparseHist); the 'linear'/'quadratic' symmetrize modes (which split into
-        two systematics) are not supported with folds."""
+        SparseHist). The 'linear'/'quadratic' symmetrize modes split the pair into
+        the SymAvg and SymDiff systematics in every fold, as for the full one. In
+        the bins the process was written without fold structure (a negative fold,
+        or no MC-stat variance) every fold gets the full logk, so that the
+        systematic adds no fold structure there either."""
         is_pair = isinstance(h, (list, tuple))
         h0 = h[0] if is_pair else h
         if self.sparse and self._issparse(h0):
@@ -1656,10 +1672,17 @@ class TensorWriter:
             raise RuntimeError(
                 "Only one histogram given but mirror=False, can not construct a variation"
             )
-        if is_pair and symmetrize in ("linear", "quadratic"):
+        split_pair = is_pair and symmetrize in ("linear", "quadratic")
+        is_asym = is_pair and symmetrize not in (
+            "conservative",
+            "average",
+            "linear",
+            "quadratic",
+        )
+        if is_asym and self.sparse:
             raise NotImplementedError(
-                "fold_axis systematics do not support the 'linear'/'quadratic' "
-                "symmetrize modes (they split into two systematics)."
+                "sparse split-logk does not support asymmetric folded systematics "
+                "(symmetric symmetrize modes only)."
             )
         if process not in self.dict_norm_folds[channel]:
             raise RuntimeError(
@@ -1685,6 +1708,20 @@ class TensorWriter:
         flow = self.channels[channel]["flow"]
         systematic_type = "normal" if add_to_data_covariance else self.systematic_type
 
+        diff_fact = np.sqrt(3.0) if symmetrize == "quadratic" else 1.0
+
+        def pair_logk(lu, ld):
+            """(logkavg, second component or None) of an up/down pair, as
+            _compute_asym_syst: the SymDiff systematic for linear/quadratic, the
+            half-difference for the asymmetric form."""
+            if symmetrize == "conservative":
+                return np.where(np.abs(lu) > np.abs(ld), lu, ld), None
+            if symmetrize == "average":
+                return 0.5 * (lu + ld), None
+            if split_pair:
+                return 0.5 * (lu + ld), 0.5 * diff_fact * (lu - ld)
+            return 0.5 * (lu + ld), 0.5 * (lu - ld)
+
         # full logkavg (vs the full nominal) for the sparse split-logk delta
         norm_full = self.dict_norm[channel][process]
         if self._issparse(norm_full):
@@ -1703,12 +1740,7 @@ class TensorWriter:
             ld_full = -self.get_logk(
                 down_full, norm_full, kfactor, systematic_type=systematic_type
             )
-            if symmetrize == "conservative":
-                logkavg_full = np.where(
-                    np.abs(lu_full) > np.abs(ld_full), lu_full, ld_full
-                )
-            else:
-                logkavg_full = 0.5 * (lu_full + ld_full)
+            logkavg_full, logk2_full = pair_logk(lu_full, ld_full)
         else:
             syst_full = self.get_flat_values(h[{fold_idx: sum}], flow=flow)
             if as_difference:
@@ -1716,11 +1748,12 @@ class TensorWriter:
             logkavg_full = self.get_logk(
                 syst_full, norm_full, kfactor, systematic_type=systematic_type
             )
+            logk2_full = None
 
-        # per-fold logkavg (+ logkhalfdiff for asymmetric) vs the per-fold nominal
+        # per-fold logkavg (+ the second component of a pair: the half-difference
+        # for asymmetric, SymDiff for linear/quadratic) vs the per-fold nominal
         logkavg_folds = np.zeros_like(norm_folds)
-        logkhalfdiff_folds = np.zeros_like(norm_folds)
-        is_asym = False
+        logk2_folds = np.zeros_like(norm_folds)
         for f in range(k):
             norm_f = norm_folds[f]
             if is_pair:
@@ -1735,14 +1768,9 @@ class TensorWriter:
                 ld = -self.get_logk(
                     down_f, norm_f, kfactor, systematic_type=systematic_type
                 )
-                if symmetrize == "conservative":
-                    logkavg_folds[f] = np.where(np.abs(lu) > np.abs(ld), lu, ld)
-                elif symmetrize == "average":
-                    logkavg_folds[f] = 0.5 * (lu + ld)
-                else:  # asymmetric: keep the half-difference
-                    is_asym = True
-                    logkavg_folds[f] = 0.5 * (lu + ld)
-                    logkhalfdiff_folds[f] = 0.5 * (lu - ld)
+                logkavg_folds[f], logk2_f = pair_logk(lu, ld)
+                if logk2_f is not None:
+                    logk2_folds[f] = logk2_f
             else:
                 syst_f = self.get_flat_values(h[{fold_idx: f}], flow=flow)
                 if as_difference:
@@ -1750,6 +1778,15 @@ class TensorWriter:
                 logkavg_folds[f] = self.get_logk(
                     syst_f, norm_f, kfactor, systematic_type=systematic_type
                 )
+
+        # no fold structure where the process has none: the full variation, as for
+        # a shared systematic (1/k of it per fold for the additive normal form)
+        flat = self.dict_flat_folds[channel].get(process)
+        if flat is not None and np.any(flat):
+            shared_scale = 1.0 / k if systematic_type == "normal" else 1.0
+            logkavg_folds[:, flat] = shared_scale * logkavg_full[None, flat]
+            if logk2_full is not None:
+                logk2_folds[:, flat] = shared_scale * logk2_full[None, flat]
 
         # register the FULL systematic by projecting the fold axis out
         if is_pair:
@@ -1769,26 +1806,27 @@ class TensorWriter:
             syst_axes=syst_axes,
             **kargs,
         )
-        if is_asym and self.sparse:
-            raise NotImplementedError(
-                "sparse split-logk does not support asymmetric folded systematics "
-                "(symmetric symmetrize modes only)."
-            )
-
-        # store the per-fold logk under the resolved (full) systematic name
+        # store the per-fold logk under the resolved (full) systematic names
+        folded = {name: (logkavg_folds, logkavg_full)}
+        if split_pair:
+            folded = {
+                name + "SymAvg": (logkavg_folds, logkavg_full),
+                name + "SymDiff": (logk2_folds, logk2_full),
+            }
         self.dict_logkavg_folds[channel].setdefault(process, {})
-        self.dict_logkavg_folds[channel][process][name] = logkavg_folds.astype(
-            self.dtype
-        )
-        # per-fold delta vs the full logk (for the sparse split-logk path)
         self.dict_logk_folds_delta[channel].setdefault(process, {})
-        self.dict_logk_folds_delta[channel][process][name] = (
-            logkavg_folds - logkavg_full[None, :]
-        ).astype(self.dtype)
+        for syst_name, (logk_f, logk_full) in folded.items():
+            self.dict_logkavg_folds[channel][process][syst_name] = logk_f.astype(
+                self.dtype
+            )
+            # per-fold delta vs the full logk (for the sparse split-logk path)
+            self.dict_logk_folds_delta[channel][process][syst_name] = (
+                logk_f - logk_full[None, :]
+            ).astype(self.dtype)
         if is_asym:
             self.dict_logkhalfdiff_folds[channel].setdefault(process, {})
-            self.dict_logkhalfdiff_folds[channel][process][name] = (
-                logkhalfdiff_folds.astype(self.dtype)
+            self.dict_logkhalfdiff_folds[channel][process][name] = logk2_folds.astype(
+                self.dtype
             )
 
     def add_beta_variations(

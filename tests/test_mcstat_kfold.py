@@ -491,6 +491,125 @@ def test_sparse_fold_storage_follows_norm_sparsity(tmp_path):
     )
 
 
+def _read_logk(fn):
+    """(process names, syst names, hlogk [nbins, nproc, nsyst], hlogk_folds
+    [k, nbins, nproc, nsyst]) of a symmetric dense tensor."""
+    import h5py
+
+    def read(d):
+        return d[...].reshape(d.attrs["original_shape"])
+
+    def names(d):
+        return [x.decode() if isinstance(x, bytes) else x for x in d[...]]
+
+    with h5py.File(fn) as h5:
+        logk_folds = read(h5["hlogk_folds"]) if "hlogk_folds" in h5 else None
+        return names(h5["hprocs"]), names(h5["hsysts"]), read(h5["hlogk"]), logk_folds
+
+
+@pytest.mark.parametrize("symmetrize", ["linear", "quadratic"])
+def test_folded_pair_split_symmetrization(symmetrize, tmp_path):
+    """A folded up/down pair with the 'linear'/'quadratic' symmetrization is split
+    into SymAvg and SymDiff in every fold, as for the full pair: per fold
+    SymAvg = (lu + ld) / 2 and SymDiff = c (lu - ld) / 2 (c = sqrt(3) for
+    quadratic) with lu = log(up/n), ld = -log(down/n) of that fold. The full
+    systematics are those of the pair without folds."""
+    k, nb = 4, 30
+    rng = np.random.default_rng(3)
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    folds = split_into_folds(rng, rng.poisson(np.full(nb, 2000.0)), k).astype(float)
+    w = 1.0 + 0.2 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    up = np.stack([rng.poisson(f * w) for f in folds]).astype(float)
+    down = np.stack([rng.poisson(f / w**0.5) for f in folds]).astype(float)
+
+    fns = {}
+    for folded in (True, False):
+        tw = TensorWriter()
+        tw.add_channel([ax], "ch0")
+        tw.add_data(_hist1d(ax, folds.sum(0)), "ch0")
+        tw.add_process(_fold_hist(ax, folds), "sig", "ch0", fold_axis="mcfold")
+        if folded:
+            pair = [_fold_hist(ax, up), _fold_hist(ax, down)]
+            kwargs = {"fold_axis": "mcfold"}
+        else:
+            pair = [_hist1d(ax, up.sum(0)), _hist1d(ax, down.sum(0))]
+            kwargs = {}
+        tw.add_systematic(
+            pair, "pair", "sig", "ch0", mirror=False, symmetrize=symmetrize, **kwargs
+        )
+        fns[folded] = _write(tw, tmp_path, f"pair_{symmetrize}_{folded}.hdf5")
+
+    _, systs, logk, logk_folds = _read_logk(fns[True])
+    _, systs_ref, logk_ref, _ = _read_logk(fns[False])
+    assert systs == systs_ref
+    assert sorted(systs) == ["pairSymAvg", "pairSymDiff"]
+    np.testing.assert_allclose(logk, logk_ref, rtol=1e-12)
+
+    c = np.sqrt(3.0) if symmetrize == "quadratic" else 1.0
+    lu, ld = np.log(up / folds), -np.log(down / folds)
+    iavg, idiff = systs.index("pairSymAvg"), systs.index("pairSymDiff")
+    np.testing.assert_allclose(logk_folds[:, :, 0, iavg], 0.5 * (lu + ld), rtol=1e-10)
+    np.testing.assert_allclose(
+        logk_folds[:, :, 0, idiff], 0.5 * c * (lu - ld), rtol=1e-10
+    )
+
+
+def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
+    """In the bins a folded process is written without fold structure (here a
+    negative fold), and everywhere for an MC-stat-exempt process, a folded
+    systematic gets the full logk in every fold, so that the fold prediction
+    stays the full one / k at any value of the nuisance."""
+    k, nb, bad = 4, 20, 7
+    rng = np.random.default_rng(5)
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    axf = hist.axis.IntCategory(list(range(k)), name="mcfold")
+    folds = split_into_folds(rng, rng.poisson(np.full(nb, 1000.0)), k).astype(float)
+    folds[0, bad] = -5.0  # negative weights
+    up = np.stack([rng.poisson(np.abs(f) * 1.05) * np.sign(f) for f in folds]).astype(
+        float
+    )
+
+    def fold_hist(values, variances):
+        h = hist.Hist(ax, axf, storage=hist.storage.Weight())
+        h.view()["value"] = values.T
+        h.view()["variance"] = variances.T
+        return h
+
+    tw = TensorWriter()
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, np.abs(folds).sum(0)), "ch0")
+    tw.add_process(fold_hist(folds, np.abs(folds)), "neg", "ch0", fold_axis="mcfold")
+    # MC-stat-exempt: no MC-stat variance at all
+    tw.add_process(
+        fold_hist(np.abs(folds), 0 * folds), "exempt", "ch0", fold_axis="mcfold"
+    )
+    for proc in ("neg", "exempt"):
+        tw.add_systematic(
+            fold_hist(np.abs(up) if proc == "exempt" else up, np.abs(up)),
+            f"tilt_{proc}",
+            proc,
+            "ch0",
+            fold_axis="mcfold",
+        )
+    procs, systs, logk, logk_folds = _read_logk(_write(tw, tmp_path, "flat.hdf5"))
+
+    ineg, iexempt = procs.index("neg"), procs.index("exempt")
+    isyst = systs.index("tilt_neg")
+    # the flattened bin: every fold the full logk; elsewhere the folds differ
+    np.testing.assert_allclose(
+        logk_folds[:, bad, ineg, isyst], logk[bad, ineg, isyst], rtol=1e-12
+    )
+    others = np.arange(nb) != bad
+    assert np.all(np.ptp(logk_folds[:, others, ineg, isyst], axis=0) > 0)
+    # the exempt process: every bin the full logk
+    isyst = systs.index("tilt_exempt")
+    np.testing.assert_allclose(
+        logk_folds[:, :, iexempt, isyst],
+        np.broadcast_to(logk[:, iexempt, isyst], (k, nb)),
+        rtol=1e-12,
+    )
+
+
 # ---------------------------------------------------------------------------
 # bin-by-bin stat: separately profiled jackknife terms, compensator
 # ---------------------------------------------------------------------------
