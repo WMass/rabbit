@@ -560,8 +560,9 @@ def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
     systematic gets the full logk in every fold, so that the fold prediction
     stays the full one / k at any value of the nuisance. So does a single fold
     with too few effective MC events (here cancelling weights), whose own
-    variation would be the ratio of two noise-dominated sums."""
-    k, nb, bad, low = 4, 20, 7, 12
+    variation would be the ratio of two noise-dominated sums. An empty fold has
+    no variation, as an empty full template."""
+    k, nb, bad, low, empty = 4, 20, 7, 12, 15
     rng = np.random.default_rng(5)
     ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
     axf = hist.axis.IntCategory(list(range(k)), name="mcfold")
@@ -583,6 +584,7 @@ def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
     variances = np.abs(folds)
     folds[1, low] = 0.5  # a near-cancellation: kstat = 0.25 / 100
     variances[1, low] = 100.0
+    folds[2, empty] = variances[2, empty] = 0.0  # an empty fold
     tw.add_process(fold_hist(folds, variances), "neg", "ch0", fold_axis="mcfold")
     # MC-stat-exempt: no MC-stat variance at all
     tw.add_process(
@@ -611,6 +613,8 @@ def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
         logk_folds[1, low, ineg, isyst], logk[low, ineg, isyst], rtol=1e-12
     )
     assert np.all(logk_folds[[0, 2, 3], low, ineg, isyst] != logk[low, ineg, isyst])
+    # an empty fold has no variation
+    assert logk_folds[2, empty, ineg, isyst] == 0.0
     # the exempt process: every bin the full logk
     isyst = systs.index("tilt_exempt")
     np.testing.assert_allclose(

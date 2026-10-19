@@ -1820,6 +1820,10 @@ class TensorWriter:
                 logk2_folds = np.where(
                     shared, shared_scale * logk2_full[None, :], logk2_folds
                 )
+        # no variation of an empty fold, as book_logk does for an empty template
+        # (get_logk gives it the sign-flip value)
+        logkavg_folds = np.where(norm_folds == 0.0, 0.0, logkavg_folds)
+        logk2_folds = np.where(norm_folds == 0.0, 0.0, logk2_folds)
 
         # register the FULL systematic by projecting the fold axis out
         if is_pair:
