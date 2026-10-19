@@ -558,8 +558,10 @@ def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
     """In the bins a folded process is written without fold structure (here a
     negative fold), and everywhere for an MC-stat-exempt process, a folded
     systematic gets the full logk in every fold, so that the fold prediction
-    stays the full one / k at any value of the nuisance."""
-    k, nb, bad = 4, 20, 7
+    stays the full one / k at any value of the nuisance. So does a single fold
+    with too few effective MC events (here cancelling weights), whose own
+    variation would be the ratio of two noise-dominated sums."""
+    k, nb, bad, low = 4, 20, 7, 12
     rng = np.random.default_rng(5)
     ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
     axf = hist.axis.IntCategory(list(range(k)), name="mcfold")
@@ -578,7 +580,10 @@ def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
     tw = TensorWriter()
     tw.add_channel([ax], "ch0")
     tw.add_data(_hist1d(ax, np.abs(folds).sum(0)), "ch0")
-    tw.add_process(fold_hist(folds, np.abs(folds)), "neg", "ch0", fold_axis="mcfold")
+    variances = np.abs(folds)
+    folds[1, low] = 0.5  # a near-cancellation: kstat = 0.25 / 100
+    variances[1, low] = 100.0
+    tw.add_process(fold_hist(folds, variances), "neg", "ch0", fold_axis="mcfold")
     # MC-stat-exempt: no MC-stat variance at all
     tw.add_process(
         fold_hist(np.abs(folds), 0 * folds), "exempt", "ch0", fold_axis="mcfold"
@@ -601,6 +606,11 @@ def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
     )
     others = np.arange(nb) != bad
     assert np.all(np.ptp(logk_folds[:, others, ineg, isyst], axis=0) > 0)
+    # the fold with too few effective events: the full logk, the others their own
+    np.testing.assert_allclose(
+        logk_folds[1, low, ineg, isyst], logk[low, ineg, isyst], rtol=1e-12
+    )
+    assert np.all(logk_folds[[0, 2, 3], low, ineg, isyst] != logk[low, ineg, isyst])
     # the exempt process: every bin the full logk
     isyst = systs.index("tilt_exempt")
     np.testing.assert_allclose(

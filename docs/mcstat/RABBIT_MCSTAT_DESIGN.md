@@ -237,6 +237,16 @@ logk · norm^{A/B}`, so the cross product `norm^A·norm^B` already de-biases the
 nominal noise. Split logk only for systematics whose up/down histograms reuse the
 nominal MC sample.
 
+A folded up/down pair takes any `symmetrize` mode; `linear`/`quadratic` split it
+into `SymAvg` and `SymDiff` in every fold, as for the full pair
+(`TensorWriter.fold_symmetrize_modes`). A folded systematic gets the full logk
+(1/`k` of it for the additive `normal` form) in every fold of the bins where its
+process has no fold structure (a negative fold, or no MC-stat variance), and in
+the folds with fewer effective MC events `sumw^2/sumw2` than
+`TensorWriter(mcstat_fold_min_kstat=3)`: there the per-fold variation is the
+ratio of two sums dominated by their noise (e.g. cancelling negative weights),
+and its logk can be arbitrarily large.
+
 **On `write()`** — extra HDF5 datasets (attribute `mcstat_fold_k` = `k`):
 - `hnorm_folds`: dense mode `[k, nbinsfull, nproc]`; sparse mode `[k, nnz]`, the
   fold values on the sparsity pattern of the sparse `hnorm_sparse` (so the folds

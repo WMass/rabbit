@@ -27,6 +27,7 @@ class TensorWriter:
         clip_syst_variations=False,
         zero_syst_low_neff=0.0,
         zero_syst_low_neff_procs=None,
+        mcstat_fold_min_kstat=3.0,
     ):
         self.allow_negative_expectation = allow_negative_expectation
 
@@ -70,6 +71,12 @@ class TensorWriter:
         # bins of a folded process written without fold structure (each fold the
         # full template / k): [channel][process] -> bool [nbinschan]
         self.dict_flat_folds = {}
+        # folds with fewer effective MC events kstat = sumw^2 / sumw2 than
+        # mcstat_fold_min_kstat: a folded systematic gets the full logk there,
+        # the ratio of two of their sums being dominated by noise (e.g.
+        # cancelling negative weights). [channel][process] -> bool [k, nbinschan]
+        self.mcstat_fold_min_kstat = mcstat_fold_min_kstat
+        self.dict_low_kstat_folds = {}
         # Split-logk fold templates (only for systematics added with fold_axis):
         # dict_logkavg_folds[channel][process][syst] = [k, nbinschan]; for
         # asymmetric folded systematics dict_logkhalfdiff_folds holds the per-fold
@@ -420,9 +427,20 @@ class TensorWriter:
         self.add_process(
             h_full, name, channel=channel, signal=signal, variances=variances
         )
+        # folds with too few effective MC events for a variation of their own
+        low_kstat = norm_folds**2 < self.mcstat_fold_min_kstat * sumw2_folds
+        if np.any(low_kstat):
+            logger.info(
+                f"Process {name} in channel {channel}: {np.count_nonzero(low_kstat)} "
+                f"fold entries (in {np.count_nonzero(np.any(low_kstat, axis=0))} "
+                f"bins) have fewer than {self.mcstat_fold_min_kstat} effective MC "
+                "events; folded systematics use the full variation there."
+            )
+
         self.dict_norm_folds[channel][name] = norm_folds.astype(self.dtype)
         self.dict_sumw2_folds[channel][name] = sumw2_folds.astype(self.dtype)
         self.dict_flat_folds[channel][name] = flat
+        self.dict_low_kstat_folds[channel][name] = low_kstat
         self.fold_k[channel][name] = k
 
     def _common_fold_k(self):
@@ -604,6 +622,7 @@ class TensorWriter:
         self.dict_sumw2_folds[name] = {}
         self.fold_k[name] = {}
         self.dict_flat_folds[name] = {}
+        self.dict_low_kstat_folds[name] = {}
         self.dict_logkavg_folds[name] = {}
         self.dict_logkhalfdiff_folds[name] = {}
         self.dict_logk_folds_delta[name] = {}
@@ -1663,7 +1682,9 @@ class TensorWriter:
         the SymAvg and SymDiff systematics in every fold, as for the full one. In
         the bins the process was written without fold structure (a negative fold,
         or no MC-stat variance) every fold gets the full logk, so that the
-        systematic adds no fold structure there either."""
+        systematic adds no fold structure there either; so does a fold with fewer
+        effective MC events than mcstat_fold_min_kstat, whose own variation is the
+        ratio of two sums dominated by their noise."""
         is_pair = isinstance(h, (list, tuple))
         h0 = h[0] if is_pair else h
         if self.sparse and self._issparse(h0):
@@ -1779,14 +1800,26 @@ class TensorWriter:
                     syst_f, norm_f, kfactor, systematic_type=systematic_type
                 )
 
-        # no fold structure where the process has none: the full variation, as for
-        # a shared systematic (1/k of it per fold for the additive normal form)
+        # the full variation, as for a shared systematic (1/k of it per fold for
+        # the additive normal form), where the process has no fold structure and
+        # in the folds with too few effective MC events for a variation of their
+        # own
+        shared = np.zeros(norm_folds.shape, dtype=bool)
         flat = self.dict_flat_folds[channel].get(process)
-        if flat is not None and np.any(flat):
+        if flat is not None:
+            shared |= flat[None, :]
+        low_kstat = self.dict_low_kstat_folds[channel].get(process)
+        if low_kstat is not None:
+            shared |= low_kstat
+        if np.any(shared):
             shared_scale = 1.0 / k if systematic_type == "normal" else 1.0
-            logkavg_folds[:, flat] = shared_scale * logkavg_full[None, flat]
+            logkavg_folds = np.where(
+                shared, shared_scale * logkavg_full[None, :], logkavg_folds
+            )
             if logk2_full is not None:
-                logk2_folds[:, flat] = shared_scale * logk2_full[None, flat]
+                logk2_folds = np.where(
+                    shared, shared_scale * logk2_full[None, :], logk2_folds
+                )
 
         # register the FULL systematic by projecting the fold axis out
         if is_pair:
