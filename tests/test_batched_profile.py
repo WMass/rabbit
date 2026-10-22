@@ -162,6 +162,23 @@ def test_fixed_points_take_physical_poi_values(tmp_path):
         bp.fixed_points(["sig_a"], [[-0.5]])
 
 
+def test_saddle_at_square_root_poi_zero_is_left(tmp_path):
+    """A POI stored as a square root has an identically vanishing gradient on the
+    whole hyperplane where it is 0, so a start there is a saddle point (the fit
+    wants the POI positive) that Newton steps alone never leave: the profile must
+    still reach the minimum."""
+    f = make_fitter(tmp_path, allow_negative=False)
+    names = f.parms.astype(str)
+    ia, ib = (int(np.where(names == p)[0][0]) for p in ("sig_a", "sig_b"))
+    xbest = f.x.numpy()
+    start = xbest.copy()
+    start[ib] = 0.0
+    res = BatchedProfile(f).profile([ia], [[xbest[ia]]], x_start=start[None, :])
+    assert res.converged[0]
+    assert abs(res.dnll[0]) < 1e-6
+    assert np.isclose(abs(res.x[0, ib]), abs(xbest[ib]), atol=1e-3)
+
+
 def test_undefined_points_are_given_up_at_once(tmp_path):
     """A point with a negative expected yield has no likelihood: it is reported
     as not finite and not converged after one evaluation, and does not hold up

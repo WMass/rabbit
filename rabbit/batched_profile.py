@@ -246,6 +246,10 @@ class BatchedProfile:
         batch_size=8,
         max_halvings=20,
         max_component=5.0,
+        negative_tol=1e-8,
+        negative_step=1.0,
+        fixed=None,
+        scale=None,
     ):
         """Minimize every row of X0 [N, npar] over the entries where ``free`` [N,
         npar] is 1.
@@ -260,11 +264,22 @@ class BatchedProfile:
         search has to undo) and backtracks every row with batched likelihood values
         only, which cost a small fraction of a Hessian. A row has converged when its
         estimated distance to the minimum, edm = g^T |H|^-1 g / 2 in units of the
-        NLL, is below ``edm_tol``. A row whose likelihood is not finite where it is
-        evaluated (e.g. a negative expected yield) is given up at once. Calls are
-        padded to the next power of two up to ``batch_size`` rows, so the last
-        unconverged rows do not pay for a full batch. Returns (X, nll, converged,
-        iterations, edm, grad_max_abs).
+        NLL, is below ``edm_tol`` and its Hessian has no eigenvalue below
+        -``negative_tol`` times its largest one. A row that would stop at such a
+        saddle point moves ``negative_step`` downhill along the most negative
+        curvature direction instead: the gradient vanishes, e.g., on the whole
+        hyperplane where a POI stored as a square root (without allowNegativeParam)
+        is 0, so Newton steps alone never leave it. A row whose likelihood is not
+        finite where it is evaluated (e.g. a negative expected yield) is given up at
+        once. Calls are padded to the next power of two up to ``batch_size`` rows, so
+        the last unconverged rows do not pay for a full batch.
+
+        Rows are started in order. With ``fixed`` (the columns held fixed in every
+        row, at values that differ between rows), a row starts from the solution of
+        the nearest converged row (distance over the fixed columns in units of
+        ``scale``) where that has a lower NLL than its own starting point.
+
+        Returns (X, nll, converged, iterations, edm, grad_max_abs).
         """
         X = np.array(X0, dtype=float)
         M = np.asarray(free, dtype=float)
@@ -281,6 +296,9 @@ class BatchedProfile:
             todo = np.where(~converged & ~failed & (iters < max_iter))[0][:batch_size]
             if not len(todo):
                 break
+            fresh = todo[iters[todo] == 0]
+            if fixed is not None and len(fresh) and converged.any():
+                self._neighbour_starts(X, fresh, converged, fixed, scale, batch_size)
             size = _pow2(len(todo), batch_size)
             v, g, H = self._padded(self._val_grad_hess_fn, X[todo], size)
             finite = np.isfinite(v) & np.isfinite(g).all(axis=1)
@@ -298,20 +316,30 @@ class BatchedProfile:
             H = H * m[:, :, None] * m[:, None, :] + np.einsum(
                 "ni,ij->nij", 1.0 - m, eye
             )
+            # eigenvalues in ascending order
             w, V = np.linalg.eigh(0.5 * (H + np.swapaxes(H, 1, 2)))
-            floor = 1e-10 * np.abs(w).max(axis=1, keepdims=True)
-            wabs = np.maximum(np.abs(w), floor)
+            wmax = np.abs(w).max(axis=1)
+            wabs = np.maximum(np.abs(w), 1e-10 * wmax[:, None])
             gv = np.einsum("nij,ni->nj", V, g)
             edm[todo] = 0.5 * np.einsum("nj,nj->n", gv, gv / wabs)
             gmax[todo] = np.abs(g).max(axis=1)
             iters[todo] += 1
-            done = edm[todo] < edm_tol
+            negative = w[:, 0] < -negative_tol * wmax
+            small = edm[todo] < edm_tol
+            done = small & ~negative
             converged[todo[done]] = True
             if done.all():
                 continue
             rows = todo[~done]
             step = np.clip(gv[~done] / wabs[~done], -max_component, max_component)
             p = -np.einsum("nij,nj->ni", V[~done], step)
+            nc = (small & negative)[~done]
+            if nc.any():
+                # a saddle point: downhill along the most negative curvature
+                # direction (either way where the gradient has no component along it)
+                sign = -np.sign(gv[~done][nc, 0])
+                sign[sign == 0] = 1.0
+                p[nc] += negative_step * sign[:, None] * V[~done][nc, :, 0]
             slope = np.einsum("ni,ni->n", g[~done], p)
             alpha = np.ones(len(rows))
             searching = np.ones(len(rows), dtype=bool)
@@ -348,37 +376,81 @@ class BatchedProfile:
             )
         return X, val, converged, iters, edm, gmax
 
+    def _values(self, X, batch_size):
+        """NLL of every row of X, batch_size rows per call."""
+        out = np.empty(len(X))
+        for i in range(0, len(X), batch_size):
+            rows = X[i : i + batch_size]
+            out[i : i + batch_size] = self._padded(
+                self._val_fn, rows, _pow2(len(rows), batch_size)
+            )
+        return out
+
+    def _neighbour_starts(self, X, fresh, solved, fixed, scale, batch_size):
+        """Start the rows ``fresh`` of X from the solution of the nearest ``solved``
+        row (with their own fixed values) where that has the lower NLL: the batched
+        counterpart of the sequential scan's warm start from the previous point."""
+        solved = np.where(solved)[0]
+        d = (X[fresh][:, fixed][:, None, :] - X[solved][:, fixed][None, :, :]) / scale
+        candidates = X[solved[np.argmin((d**2).sum(axis=-1), axis=1)]]
+        candidates[:, fixed] = X[fresh][:, fixed]
+        current = self._values(X[fresh], batch_size)
+        new = self._values(candidates, batch_size)
+        better = np.isfinite(new) & ~(new >= current)  # also where current is NaN
+        X[fresh[better]] = candidates[better]
+
     # ------------------------------------------------------------ fixed points
     def profile(self, indices, values, x_start=None, **kwargs):
         """Profile the likelihood with the parameters ``indices`` (k positions in
         Fitter.x) fixed at ``values`` [N, k], given as stored in Fitter.x (a POI
         without allowNegativeParam is stored as the square root of its value).
 
-        Everything else that is not frozen in the Fitter is profiled, starting from
-        x_start [N, npar] or from the linear profile extrapolation of the current
-        Fitter.x (assumed to be the minimum) with the Fitter's covariance. ``kwargs``
-        go to ``minimize``. Returns a ProfileResult with dnll relative to the NLL at
-        the current Fitter.x.
+        Everything else that is not frozen in the Fitter is profiled. Points are
+        profiled from the inside out (by their distance to the current Fitter.x,
+        assumed to be the minimum). Each starts from x_start [N, npar] if given;
+        otherwise from the lower-NLL of the minimum itself and its linear profile
+        extrapolation with the Fitter's covariance (the conditional mean of the
+        Gaussian approximation, which can be far off where the likelihood is not
+        Gaussian), or from the solution of the nearest point already profiled where
+        that is lower still. ``kwargs`` go to ``minimize``. Returns a ProfileResult
+        (in the order of ``values``) with dnll relative to the NLL at the current
+        Fitter.x.
         """
         f = self.fitter
+        batch_size = kwargs.get("batch_size", 8)
         idx = [int(i) for i in indices]
         values = np.asarray(values, dtype=float).reshape(-1, len(idx))
         xbest = f.x.numpy()
+        C = f.cov.numpy() if f.cov is not None else None
+        scale = np.sqrt(np.diag(C)[idx]) if C is not None else np.ones(len(idx))
         if x_start is not None:
             X0 = np.array(x_start, dtype=float)
+            X0[:, idx] = values
         else:
             X0 = np.tile(xbest, (len(values), 1))
-            if f.cov is not None:
-                # conditional mean of the Gaussian approximation at the minimum
-                C = f.cov.numpy()
+            X0[:, idx] = values
+            if C is not None:
                 shift = np.linalg.solve(C[np.ix_(idx, idx)], (values - xbest[idx]).T)
-                X0 = X0 + (C[:, idx] @ shift).T
+                linear = X0 + (C[:, idx] @ shift).T
+                linear[:, idx] = values
+                v_linear = self._values(linear, batch_size)
+                use = np.isfinite(v_linear) & ~(
+                    v_linear >= self._values(X0, batch_size)
+                )
+                X0[use] = linear[use]
         free = np.ones_like(X0)
         free[:, np.asarray(f.frozen_params_mask.numpy(), dtype=bool)] = 0.0
-        X0[:, idx] = values
         free[:, idx] = 0.0
+        order = np.argsort((((values - xbest[idx]) / scale) ** 2).sum(axis=1))
         nll_best = float(self._padded(self._val_fn, xbest[None, :], 1)[0])
-        X, val, converged, iters, edm, gmax = self.minimize(X0, free, **kwargs)
+        out = self.minimize(
+            X0[order],
+            free[order],
+            fixed=None if x_start is not None else idx,
+            scale=scale,
+            **kwargs,
+        )
+        X, val, converged, iters, edm, gmax = (a[np.argsort(order)] for a in out)
         return ProfileResult(val - nll_best, X, converged, iters, edm, gmax)
 
     def fixed_points(self, names, values, x_start=None, **kwargs):
