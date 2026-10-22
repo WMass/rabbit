@@ -12,6 +12,7 @@ from wums import logging
 from rabbit import external_likelihood, io_tools
 from rabbit import preconditioner as precond
 from rabbit import tfhelpers as tfh
+from rabbit.batched_profile import BatchedProfile
 from rabbit.bbstat.bbstat import BinByBinStat
 from rabbit.blinding import Blinding
 from rabbit.callbacks import RESTART_MIN_IMPROVEMENT, FitterCallback, merge_callbacks
@@ -5709,11 +5710,45 @@ class Fitter:
         "wall_s",
     )
 
+    def batched_profile(self):
+        """The BatchedProfile of this fitter (built on first use, its traced
+        functions reused by every later scan), or None if the configuration is not
+        supported by it."""
+        if not hasattr(self, "_batched_profile"):
+            try:
+                self._batched_profile = BatchedProfile(self)
+            except NotImplementedError as e:
+                logger.warning(f"{e}; likelihood scans run point by point")
+                self._batched_profile = None
+        return self._batched_profile
+
+    def _profile_points_batched(self, indices, values, batch_size):
+        """BatchedProfile.profile at the points ``values`` [N, k] of the parameters
+        ``indices`` (positions in x), or None if the fit is not supported by it."""
+        bp = self.batched_profile()
+        if bp is None:
+            return None
+        res = bp.profile(indices, values, batch_size=batch_size)
+        logger.info(
+            f"batched profile: {len(res.dnll)} points, "
+            f"{int(res.converged.sum())} converged, "
+            f"{int(res.iterations.max(initial=0))} Newton iterations at most"
+        )
+        return res
+
     def nll_scan(
-        self, param, scan_range, scan_points, use_prefit=False, save_detail=False
+        self,
+        param,
+        scan_range,
+        scan_points,
+        use_prefit=False,
+        save_detail=False,
+        batch_size=0,
     ):
         # make a likelihood scan for a single parameter
         # assuming the likelihood is minimized
+        # batch_size > 0: profile all points together with BatchedProfile,
+        # batch_size points per call
 
         # freeze minimize which mean to not update it in the fit
         self.freeze_params(param)
@@ -5740,6 +5775,38 @@ class Fitter:
             }
         else:
             detail = None
+
+        if batch_size > 0:
+            # every point but the minimum, in slot order
+            scan_vals = xval[idx].numpy() + np.concatenate(
+                [-param_offsets[::-1], param_offsets[1:]]
+            )
+            others = np.arange(nscans) != nscans // 2
+            res = self._profile_points_batched(
+                [idx], scan_vals[others, None], batch_size
+            )
+            if res is not None:
+                self.defreeze_params(param)
+                dnlls[nscans // 2] = 0
+                dnlls[others] = res.dnll
+                if save_detail:
+                    detail["x"][nscans // 2] = xval.numpy()
+                    detail["x"][others] = res.x
+                    # batched points have no scipy status or per-point wall time
+                    values = {
+                        "edmval": res.edmval,
+                        "grad_max_abs": res.grad_max_abs,
+                        "success": res.converged.astype(float),
+                        "nit": res.iterations.astype(float),
+                    }
+                    for k, field in enumerate(self.SCAN_DETAIL_FIELDS):
+                        if field in values:
+                            detail["diagnostics"][others, k] = values[field]
+                    for islot, ok in zip(np.where(others)[0], res.converged):
+                        detail["messages"][islot] = "batched Newton: " + (
+                            "converged" if ok else "not converged"
+                        )
+                return scan_vals, dnlls, detail
 
         def _record(islot, wall_s):
             """Per-point parameter vector and convergence diagnostics.
@@ -5813,7 +5880,9 @@ class Fitter:
 
         return scan_vals, dnlls, detail
 
-    def nll_scan2D(self, param_tuple, scan_range, scan_points, use_prefit=False):
+    def nll_scan2D(
+        self, param_tuple, scan_range, scan_points, use_prefit=False, batch_size=0
+    ):
 
         # freeze minimize which mean to not update it in the fit
         self.freeze_params(param_tuple)
@@ -5835,6 +5904,22 @@ class Fitter:
         dnlls = np.full((len(x_scans), len(y_scans)), np.nan)
         nll_best = self.reduced_nll().numpy()
         dnlls[best_fit, best_fit] = 0
+        if batch_size > 0:
+            # the points of the spiral below: the square of half-width best_fit
+            # around the best fit point
+            ix, iy = np.meshgrid(
+                np.arange(2 * best_fit + 1), np.arange(2 * best_fit + 1), indexing="ij"
+            )
+            keep = (ix != best_fit) | (iy != best_fit)
+            ix, iy = ix[keep], iy[keep]
+            points = np.stack(
+                [np.asarray(x_scans)[ix], np.asarray(y_scans)[iy]], axis=-1
+            )
+            res = self._profile_points_batched([idx0, idx1], points, batch_size)
+            if res is not None:
+                dnlls[ix, iy] = res.dnll
+                self.defreeze_params(param_tuple)
+                return x_scans, y_scans, dnlls
         # scan in a spiral around the best fit point
         dcol = -1
         drow = 0

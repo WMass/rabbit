@@ -105,6 +105,19 @@ def make_parser():
         help="use prefit uncertainty to define scan range",
     )
     parser.add_argument(
+        "--scanBatchSize",
+        default=0,
+        type=int,
+        help="profile the points of --scan and --scan2D together, up to this many "
+        "per call, with the batched Newton minimizer of rabbit.batched_profile "
+        "(exact Hessian per point, started from the linear profile extrapolation "
+        "of the minimum). Memory grows with the batch size times the number of "
+        "parameters times the number of non-zero template entries. Fits it does "
+        "not support (chisqFit, covarianceFit, regularization, external terms, "
+        "MC-stat de-biasing, blinding, masked channels, bin-by-bin modes other than "
+        "gamma lite) fall back to the default, one sequential fit per point (0).",
+    )
+    parser.add_argument(
         "--scanSaveDetail",
         default=False,
         action="store_true",
@@ -1343,6 +1356,7 @@ def fit(args, fitter, ws, dofit=True):
                 args.scanPoints,
                 args.scanRangeUsePrefit,
                 save_detail=args.scanSaveDetail,
+                batch_size=args.scanBatchSize,
             )
             if fitter.mcstat_scan_needs_adjustment():
                 # adjusted profile statistic of the de-biased objective; the raw
@@ -1370,7 +1384,11 @@ def fit(args, fitter, ws, dofit=True):
     if args.scan2D is not None:
         for param_tuple in args.scan2D:
             x_scan, yscan, dnll_values = fitter.nll_scan2D(
-                param_tuple, args.scanRange, args.scanPoints, args.scanRangeUsePrefit
+                param_tuple,
+                args.scanRange,
+                args.scanPoints,
+                args.scanRangeUsePrefit,
+                batch_size=args.scanBatchSize,
             )
             if fitter.mcstat_scan_needs_adjustment():
                 # direction-dependent adjustment, see mcstat_scan_adjustment
