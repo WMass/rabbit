@@ -812,7 +812,7 @@ def common_parser():
     )
     parser.add_argument(
         "--mcStatFoldBound",
-        default=0.5,
+        default=0.0,
         type=float,
         help="--mcStatDebias kfold with per-fold systematic variations (split logk, "
         "log_normal systematics): scale kappa of the bound on the deviation x of "
@@ -821,12 +821,12 @@ def common_parser():
         "otherwise unbounded below where a fold template outgrows the full one (a "
         "few MC events with large weights in one fold). Value, gradient and "
         "curvature at the nominal point are unchanged, and at x << kappa the change "
-        "is of order x^3 / kappa^2 (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a). 0 "
-        "disables it. Default 0.5.",
+        "is of order x^3 / kappa^2 (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a). 0, the "
+        "default, disables it; 0.5 bounds the W-mass fits.",
     )
     parser.add_argument(
         "--mcStatFoldMaxDeviation",
-        default=0.1,
+        default=0.0,
         type=float,
         help="--mcStatDebias kfold with per-fold systematic variations (split logk): "
         "the (bin, process) templates whose fold deviation norm, the largest over "
@@ -836,8 +836,8 @@ def common_parser():
         "norm times |theta|; above it the jackknife's noise-floor estimate is not "
         "reliable (templates of a few MC events with large weights), and the fit "
         "can drift along such directions. The decision depends on the templates "
-        "only; the number of templates concerned is logged. 0 disables it. "
-        "Default 0.1.",
+        "only; the number of templates concerned is logged. 0, the default, "
+        "disables it; 0.1 is used for the W-mass fits.",
     )
     parser.add_argument(
         "--mcStatFoldMinKstat",

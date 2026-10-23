@@ -380,7 +380,7 @@ class Fitter:
         self.mcStatDebiasCov = getattr(options, "mcStatDebiasCov", "sandwich")
         # bound on a fold's exponent deviation with split logk, see
         # _bound_fold_deviation; 0 disables it
-        self.mcstat_fold_bound = float(getattr(options, "mcStatFoldBound", 0.5) or 0.0)
+        self.mcstat_fold_bound = float(getattr(options, "mcStatFoldBound", 0.0) or 0.0)
         self.mcstat_fold_bound_form = getattr(options, "mcStatFoldBoundForm", "taper")
         if self.mcstat_fold_bound_form not in ("taper", "tanh"):
             raise ValueError(
@@ -394,7 +394,7 @@ class Fitter:
         # split logk: the templates whose fold deviation norm exceeds this take
         # the shared logk, see _share_noisy_fold_templates; 0 disables it
         self.mcstat_fold_max_dev = float(
-            getattr(options, "mcStatFoldMaxDeviation", 0.1) or 0.0
+            getattr(options, "mcStatFoldMaxDeviation", 0.0) or 0.0
         )
         if self.mcstat_fold_max_dev < 0.0:
             raise ValueError(
@@ -2143,7 +2143,8 @@ class Fitter:
                 logger.warning(
                     "k-fold de-biasing with split logk and --mcStatFoldBound 0: the "
                     "objective is unbounded below wherever a fold's variation "
-                    "outgrows the full-sample one"
+                    "outgrows the full-sample one (e.g. --mcStatFoldBound 0.5 bounds "
+                    "it)"
                 )
             elif self.mcstat_fold_bound >= kappa_max:
                 logger.warning(

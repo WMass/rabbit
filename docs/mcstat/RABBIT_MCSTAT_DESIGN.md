@@ -280,8 +280,9 @@ folded.
   one batched contraction, dense or sparse.
 - k-fold averaging: the complete pairwise U-statistic over all `k` folds in
   `--covMode fisher` (§2b), which averages over every fold pair in `O(k)`.
-- Bounded fold deviations (`--mcStatFoldBound κ`, default 0.5; `log_normal` split
-  logk). Per (fold, bin, process) the fold exponent `E_f = Σ_s logk_f,s θ_s` is
+- Bounded fold deviations (`--mcStatFoldBound κ`, off by default, 0.5 for the
+  W-mass fits; `log_normal` split logk). Per (fold, bin, process) the fold
+  exponent `E_f = Σ_s logk_f,s θ_s` is
   replaced by `E + d(E_f − E)` about the full-sample `E = Σ_s logk_s θ_s`. The
   jackknife combination is a bias correction to second order in the fold
   deviations `x = E_f − E`: for two equal halves deviating by `±x` the expectation
@@ -313,8 +314,9 @@ folded.
   `κ < log(k/b)` for tanh. At the ordinary minimum of the W-mass fit `|x| ≤ 0.11`
   everywhere (99.99% of the templates below 0.024). The additive `normal` form is
   not bounded.
-- Shared logk for noisy templates (`--mcStatFoldMaxDeviation τ`, default 0.1).
-  The bound keeps the objective bounded but does not make the noise-floor
+- Shared logk for noisy templates (`--mcStatFoldMaxDeviation τ`, off by default,
+  0.1 for the W-mass fits). The bound keeps the objective bounded but does not
+  make the noise-floor
   estimate reliable: on templates of a few MC events with large weights the k = 2
   estimate (one fold difference per template, as large as the noise itself)
   over-subtracts, the de-biased curvature along the coherent direction of their

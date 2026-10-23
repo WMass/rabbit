@@ -1035,8 +1035,10 @@ def make_one_fold_variation_toy(path, k=2, sparse=False):
 
 FORMS = ["taper", "tanh"]
 # the bound alone, without the shared-logk fallback for noisy templates (the
-# one-fold toy's fold deviation norm, ~0.2, is above its default threshold)
+# one-fold toy's fold deviation norm, ~0.2, is above the threshold of 0.1)
 NO_SHARING = ("--mcStatFoldMaxDeviation", "0")
+# the protections are off by default
+BOUND = ("--mcStatFoldBound", "0.5")
 
 
 @pytest.mark.parametrize("form", FORMS)
@@ -1091,7 +1093,9 @@ def test_fold_taper_hands_the_fold_back_to_the_full_template(tmp_path):
     """The taper returns to the shared logk for |x| >> kappa: very far along the
     systematic the folds follow the full-sample variation, d ~ kappa^2 / x, so
     the objective there is the ordinary likelihood with no gain for the fit."""
-    f = _fold_fitter(make_one_fold_variation_toy(tmp_path), tmp_path, *NO_SHARING)
+    f = _fold_fitter(
+        make_one_fold_variation_toy(tmp_path), tmp_path, *BOUND, *NO_SHARING
+    )
     _set_param(f, "onefold", 1000.0)  # |x| ~ 400 kappa in every bin
     assert np.abs(_fold_log_ratios(f)).max() < 0.01 * 0.5
 
@@ -1130,7 +1134,9 @@ def test_fold_bound_dense_equals_sparse(form, tmp_path):
     preds = []
     for sparse in (False, True):
         fn = make_one_fold_variation_toy(tmp_path, sparse=sparse)
-        f = _fold_fitter(fn, tmp_path, "--mcStatFoldBoundForm", form, *NO_SHARING)
+        f = _fold_fitter(
+            fn, tmp_path, *BOUND, "--mcStatFoldBoundForm", form, *NO_SHARING
+        )
         _set_param(f, "onefold", 30.0)
         preds.append(np.asarray(f._compute_fold_yields(halves=False)))
     np.testing.assert_allclose(preds[1], preds[0], rtol=1e-10)
@@ -1206,7 +1212,13 @@ def test_noisy_fold_templates_dense_equals_sparse(tmp_path):
     delta) storage alike: the same fold predictions."""
     preds = []
     for sparse in (False, True):
-        f = _fold_fitter(make_mixed_noise_toy(tmp_path, sparse=sparse), tmp_path)
+        f = _fold_fitter(
+            make_mixed_noise_toy(tmp_path, sparse=sparse),
+            tmp_path,
+            *BOUND,
+            "--mcStatFoldMaxDeviation",
+            "0.1",
+        )
         _set_param(f, "onefold", 30.0)
         _set_param(f, "tilt", 3.0)
         preds.append(np.asarray(f._compute_fold_yields(halves=False)))
