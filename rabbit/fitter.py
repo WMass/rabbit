@@ -279,6 +279,9 @@ class Fitter:
         # the shard evaluators read this flag; the Fitter's own blinding
         # branches go through the collaborator.
         self.do_blinding = do_blinding
+        # Read here rather than passed to init_fit_parms, so the saturated-test
+        # re-init in bin/rabbit_fit.py keeps the same frame without plumbing.
+        self.blinding_frame = getattr(options, "blindingFrame", "auto")
         self.prefit_unconstrained_nuisance_uncertainty = (
             options.prefitUnconstrainedNuisanceUncertainty
         )
@@ -479,6 +482,7 @@ class Fitter:
             enabled=self.do_blinding,
             unblind=unblind,
             blinding_group=blinding_group,
+            frame=getattr(self, "blinding_frame", "auto"),
         )
 
         self.parms = np.concatenate([self.param_model.params, self.indata.systs])

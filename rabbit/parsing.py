@@ -637,6 +637,23 @@ def common_parser():
         """,
     )
     parser.add_argument(
+        "--blindingFrame",
+        type=str,
+        default="auto",
+        choices=["auto", "data", "mc"],
+        help="""
+        Which frame the blinding offsets are drawn in. 'auto' (default): the
+        real-data frame if every data_obs bin of the card is integral, else the
+        MC/Asimov frame. 'data' / 'mc' force it: '--blindingFrame data' for a
+        fit to real data that is not integral (an unfolded cross section), so it
+        shares the reco data fit's offsets and blinded values can be subtracted;
+        '--blindingFrame mc' for pseudo-data stored with integer counts (e.g.
+        Poisson toys written as data_obs). Never force 'data' on a card whose
+        truth is known, nor 'mc' on real data: either unblinds the data fit.
+        A forced frame that differs from the card's verdict logs a WARNING.
+        """,
+    )
+    parser.add_argument(
         "--setConstraintMinimum",
         default=[],
         nargs=2,
