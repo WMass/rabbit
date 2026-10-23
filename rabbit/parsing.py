@@ -811,6 +811,46 @@ def common_parser():
         "docs/mcstat/RESULTS.md §7d, §9p). Default 'sandwich'.",
     )
     parser.add_argument(
+        "--mcStatFoldBound",
+        default=0.5,
+        type=float,
+        help="--mcStatDebias kfold with per-fold systematic variations (split logk, "
+        "log_normal systematics): scale kappa of the bound on the deviation x of "
+        "each fold's exponent from the full-sample one, per (fold, bin, process). "
+        "The jackknife objective, a bias correction valid for small x, is "
+        "otherwise unbounded below where a fold template outgrows the full one (a "
+        "few MC events with large weights in one fold). Value, gradient and "
+        "curvature at the nominal point are unchanged, and at x << kappa the change "
+        "is of order x^3 / kappa^2 (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a). 0 "
+        "disables it. Default 0.5.",
+    )
+    parser.add_argument(
+        "--mcStatFoldMaxDeviation",
+        default=0.1,
+        type=float,
+        help="--mcStatDebias kfold with per-fold systematic variations (split logk): "
+        "the (bin, process) templates whose fold deviation norm, the largest over "
+        "the folds of |logk_fold - logk|_2 over all systematics, exceeds this take "
+        "the shared logk (the full-sample variation in every fold). Along the most "
+        "unfavourable combination of nuisances a fold's exponent deviates by that "
+        "norm times |theta|; above it the jackknife's noise-floor estimate is not "
+        "reliable (templates of a few MC events with large weights), and the fit "
+        "can drift along such directions. The decision depends on the templates "
+        "only; the number of templates concerned is logged. 0 disables it. "
+        "Default 0.1.",
+    )
+    parser.add_argument(
+        "--mcStatFoldBoundForm",
+        default="taper",
+        choices=["taper", "tanh"],
+        help="Form of the --mcStatFoldBound bound: 'taper' x / (1 + x^2 / kappa^2), "
+        "which hands a fold back to the full template (the shared logk) for "
+        "|x| >> kappa, so that far out the objective is the ordinary likelihood; "
+        "'tanh' kappa tanh(x / kappa), which keeps the deviation at kappa and makes "
+        "the fit favour templates held there (kept for comparison). Default "
+        "'taper'.",
+    )
+    parser.add_argument(
         "--covMode",
         default="observed",
         choices=["observed", "fisher"],
