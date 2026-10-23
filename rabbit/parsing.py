@@ -840,6 +840,19 @@ def common_parser():
         "Default 0.1.",
     )
     parser.add_argument(
+        "--mcStatFoldMinKstat",
+        default=0.0,
+        type=float,
+        help="--mcStatDebias kfold: the (bin, process) templates with fewer "
+        "effective MC events, kstat = (sum w)^2 / sum w^2, than this are taken out "
+        "of the fold structure: every fold gets the full-sample template (nominal, "
+        "MC-stat variance and logk), so they enter the de-biased objective like the "
+        "ordinary likelihood, without bias correction. With a few events a fold "
+        "estimate is noise (with negative weights a fold can cancel to zero while "
+        "its variations do not), which the jackknife cannot correct and which makes "
+        "the objective unbounded below. 0 disables it. Default 0.",
+    )
+    parser.add_argument(
         "--mcStatFoldBoundForm",
         default="taper",
         choices=["taper", "tanh"],

@@ -1211,3 +1211,94 @@ def test_noisy_fold_templates_dense_equals_sparse(tmp_path):
         _set_param(f, "tilt", 3.0)
         preds.append(np.asarray(f._compute_fold_yields(halves=False)))
     np.testing.assert_allclose(preds[1], preds[0], rtol=1e-10)
+
+
+def make_few_event_toy(path, sparse=False, local=False):
+    """'sig' (~1000 unit-weight MC events per bin and fold, folded 'tilt' with
+    fold variations that differ by their MC noise only) and 'few', a background
+    of a few unit-weight events per bin (kstat ~2, one fold often empty) with a
+    folded 'onefew' that varies the events of one fold (+50%). With `local`,
+    'few' is a single bin with four events per fold (above the writer's floor of
+    3 for a fold's own variation, kstat 8 for the template), as a local nuisance
+    (e.g. a scale factor of one eta-pt cell) sees it. Asimov data. Returns the
+    filename."""
+    nb, k = 5, 2
+    rng = np.random.default_rng(7)
+    sig = rng.poisson(1000.0, size=(k, nb)).astype(float)
+    w = 1.0 + 0.1 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    sig_up = np.stack([rng.poisson(sig[i] * w) for i in range(k)]).astype(float)
+    if local:
+        few = np.zeros((k, nb))
+        few[:, 1] = 4.0
+    else:
+        few = np.array([[0.0, 1.0, 2.0, 0.0, 1.0], [2.0, 1.0, 0.0, 3.0, 2.0]])
+    few_up = few.copy()
+    few_up[1] *= 1.5
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    tw = TensorWriter(sparse=sparse)
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, sig.sum(0) + few.sum(0)), "ch0")
+    tw.add_process(_fold_hist(ax, sig), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_process(_fold_hist(ax, few), "few", "ch0", fold_axis="mcfold")
+    tw.add_systematic(_fold_hist(ax, sig_up), "tilt", "sig", "ch0", fold_axis="mcfold")
+    tw.add_systematic(
+        _fold_hist(ax, few_up), "onefew", "few", "ch0", fold_axis="mcfold"
+    )
+    name = f"few_event_{'local_' if local else ''}{'sp' if sparse else 'de'}.hdf5"
+    return _write(tw, path, name)
+
+
+@pytest.mark.parametrize("sparse", [False, True], ids=["dense", "sparse"])
+def test_low_kstat_templates_leave_the_fold_structure(sparse, tmp_path):
+    """With --mcStatFoldMinKstat, the few-event templates get 1/k of the full
+    nominal in every fold and follow the full-sample variation: their half
+    predictions equal the full one at any parameter values. The well-measured
+    templates keep their folds and their own fold variations."""
+    fn = make_few_event_toy(tmp_path, sparse=sparse)
+    f = _fold_fitter(fn, tmp_path, "--mcStatFoldMinKstat", "10", *NO_SHARING)
+    procs = [p.decode() if isinstance(p, bytes) else str(p) for p in f.indata.procs]
+    isig, ifew = procs.index("sig"), procs.index("few")
+    flags = np.asarray(f.mcstat_fold_optout_templates)
+    if sparse:
+        rows = np.asarray(f.indata.norm.indices)
+        flagged_procs = set(rows[flags, 1].tolist())
+        assert flagged_procs == {ifew}
+    else:
+        flags = flags[: f.indata.nbins]
+        assert flags[:, ifew].all() and not flags[:, isig].any()
+    _set_param(f, "onefew", 2.0)
+    _set_param(f, "tilt", 3.0)
+    _, norm_full = f._compute_yields_noBBB(full=False, compute_norm=True)
+    _, norm_halves = f._compute_fold_yields(halves=True, return_norm=True)
+    nb = f.indata.nbins
+    full = np.asarray(norm_full)[:nb]
+    halves = np.asarray(norm_halves)[:, :nb]
+    np.testing.assert_allclose(
+        halves[:, :, ifew], np.broadcast_to(full[None, :, ifew], (2, nb)), rtol=1e-12
+    )
+    assert np.abs(halves[:, :, isig] / full[None, :, isig] - 1.0).max() > 1e-4
+
+
+def test_low_kstat_opt_out_keeps_the_objective_bounded(tmp_path):
+    """Without protection the few-event template's fold variation makes the
+    de-biased objective fall without bound along 'onefew'; once the template has
+    left the fold structure the objective grows there like the ordinary one."""
+    fn = make_few_event_toy(tmp_path, local=True)
+    vals = {}
+    for kmin in ("0", "10"):
+        f = _fold_fitter(
+            fn,
+            tmp_path,
+            "--mcStatFoldMinKstat",
+            kmin,
+            "--mcStatFoldBound",
+            "0",
+            *NO_SHARING,
+        )
+        out = []
+        for th in (0.0, 5.0, 10.0, 20.0):
+            _set_param(f, "onefew", th)
+            out.append(float(f.loss_val_grad_hess()[0]))
+        vals[kmin] = np.array(out)
+    assert vals["0"][-1] < vals["0"][0] - 1e3
+    assert np.all(np.diff(vals["10"]) > 0.0)

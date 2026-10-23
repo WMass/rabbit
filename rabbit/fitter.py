@@ -400,6 +400,15 @@ class Fitter:
             raise ValueError(
                 f"--mcStatFoldMaxDeviation must be >= 0, got {self.mcstat_fold_max_dev}"
             )
+        # templates with fewer effective MC events leave the fold structure, see
+        # _opt_out_low_kstat_fold_templates; 0 disables it
+        self.mcstat_fold_min_kstat = float(
+            getattr(options, "mcStatFoldMinKstat", 0.0) or 0.0
+        )
+        if self.mcstat_fold_min_kstat < 0.0:
+            raise ValueError(
+                f"--mcStatFoldMinKstat must be >= 0, got {self.mcstat_fold_min_kstat}"
+            )
         self.covMode = getattr(options, "covMode", "observed")
         # the --covMode asked for; set_mcstat_asimov switches self.covMode to
         # fisher for an Asimov dataset of a de-biased fit
@@ -2076,9 +2085,14 @@ class Fitter:
         # (bin, process) templates given the shared logk, [nbinsfull, nproc]
         # dense or [nnz] sparse; None = none
         self.mcstat_fold_shared_templates = None
+        # (bin, process) templates taken out of the fold structure, same layout
+        self.mcstat_fold_optout_templates = None
         # the fold templates enter only the k-fold de-biased objective and its
         # curvature (_fold_debias_active)
         split = self.logk_folds is not None or self.logk_folds_delta is not None
+        if self.mcStatDebias == "kfold" and self.mcstat_fold_min_kstat > 0.0:
+            self._opt_out_low_kstat_fold_templates()
+            norm_folds = self.indata.norm_folds
         if split and self.mcStatDebias == "kfold" and self.mcstat_fold_max_dev > 0.0:
             self._share_noisy_fold_templates()
         k = int(norm_folds.shape[0])
@@ -2150,6 +2164,97 @@ class Fitter:
         # and whose score is the half average 1/2 (J_A + J_B)^T D (y - n). For
         # even k (a = b) they reduce to the familiar (2, 1/2, 1/2).
         self.jackknife_weights = (k * k / (2.0 * a * b), a / (2.0 * b), b / (2.0 * a))
+
+    def _opt_out_low_kstat_fold_templates(self):
+        """Take the (bin, process) templates with fewer effective MC events than
+        --mcStatFoldMinKstat, kstat = (sum w)^2 / sum w^2, out of the fold
+        structure: every fold gets 1/k of the full-sample nominal and MC-stat
+        variance and the full-sample logk. The halves then equal the full template,
+        so such a template enters 2 L_full - 1/2 L_A - 1/2 L_B like the ordinary
+        likelihood and gets no bias correction.
+
+        With a few events a fold estimate is noise: with k = 2 the folds of a
+        template of kstat ~ 1 often hold zero and all of it, and with negative
+        weights a fold can cancel to zero (or below) while its variations do not.
+        The jackknife cannot correct such templates, and the large per-fold logk
+        they carry make the objective unbounded below. Their own MC-stat bias is
+        of the order of their share of the bin."""
+        kmin = self.mcstat_fold_min_kstat
+        dtype = self.indata.dtype
+        sumw = self.indata.sumw
+        sumw2 = self.indata.sumw2
+        # no MC-stat variance (e.g. a data-driven process): no MC-stat noise
+        kstat = tf.where(
+            sumw2 > 0.0,
+            tf.math.divide_no_nan(tf.square(sumw), sumw2),
+            tf.constant(np.inf, dtype),
+        )  # [nbinsfull, nproc]
+        nf = self.indata.norm_folds
+        sw2f = self.indata.sumw2_folds
+        k = int(nf.shape[0])
+        if self.indata.sparse:
+            rows = self.indata.norm.indices
+            kstat_nz = tf.gather_nd(kstat, rows)  # [nnz]
+            folds_nz = tf.reduce_any(nf != 0.0, axis=0)
+            flag = (kstat_nz < kmin) & folds_nz
+            full = self.indata.norm.values
+            full_sw2 = tf.gather_nd(sumw2, rows)
+            flag_b = flag[None, :]
+            self.indata.norm_folds = tf.where(
+                flag_b, tf.broadcast_to(full[None] / k, nf.shape), nf
+            )
+            self.indata.sumw2_folds = tf.where(
+                flag_b, tf.broadcast_to(full_sw2[None] / k, sw2f.shape), sw2f
+            )
+            if self.logk_folds_delta is not None:
+                self.logk_folds_delta = tf.where(
+                    flag[None, :, None],
+                    tf.zeros_like(self.logk_folds_delta),
+                    self.logk_folds_delta,
+                )
+                self.indata.logk_folds_delta = self.logk_folds_delta
+            procs_of = np.asarray(rows[:, 1])
+            flag_np = np.asarray(flag)
+            nflag_proc = np.bincount(
+                procs_of[flag_np], minlength=self.indata.nproc
+            ).astype(int)
+            vals = np.abs(np.asarray(full))
+        else:
+            norm = self.indata.norm
+            nbf = int(nf.shape[1])
+            folds_nz = tf.reduce_any(nf != 0.0, axis=0)  # [nbinsfull, nproc]
+            flag = (kstat[:nbf] < kmin) & folds_nz
+            flag_b = flag[None]
+            self.indata.norm_folds = tf.where(
+                flag_b, tf.broadcast_to(norm[None] / k, nf.shape), nf
+            )
+            self.indata.sumw2_folds = tf.where(
+                flag_b,
+                tf.broadcast_to(tf.cast(sumw2[None], dtype) / k, sw2f.shape),
+                sw2f,
+            )
+            if self.logk_folds is not None:
+                lf = self.logk_folds
+                red = len(lf.shape) - 3
+                shape = [1, nbf, int(lf.shape[2])] + [1] * red
+                self.logk_folds = tf.where(
+                    tf.reshape(flag, shape), self.indata.logk[None], lf
+                )
+                self.indata.logk_folds = self.logk_folds
+            flag_np = np.asarray(flag)
+            nflag_proc = flag_np.sum(axis=0).astype(int)
+            vals = np.abs(np.asarray(norm))
+        self.mcstat_fold_optout_templates = flag_np
+        procs = [
+            p.decode() if isinstance(p, bytes) else str(p) for p in self.indata.procs
+        ]
+        byproc = ", ".join(f"{procs[i]} {n}" for i, n in enumerate(nflag_proc) if n > 0)
+        share = vals[flag_np].sum() / max(vals.sum(), 1e-300)
+        logger.info(
+            f"k-fold de-biasing: {int(flag_np.sum())} (bin, process) templates with "
+            f"kstat < {kmin} (--mcStatFoldMinKstat) taken out of the fold structure, "
+            f"{share:.2e} of the yield" + (f": {byproc}" if byproc else "")
+        )
 
     def _share_noisy_fold_templates(self):
         """The shared logk (the full-sample one in every fold) for the (bin,
