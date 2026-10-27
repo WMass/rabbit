@@ -476,7 +476,24 @@ def common_parser():
         "--chisqFit",
         default=False,
         action="store_true",
-        help="Perform diagonal chi-square fit instead of poisson likelihood fit",
+        help="Perform diagonal chi-square fit instead of poisson likelihood fit; "
+        "the per-bin variances are chosen with --chisqVariance",
+    )
+    parser.add_argument(
+        "--chisqVariance",
+        default=None,
+        type=str,
+        choices=["data", "mc"],
+        help="Per-bin variance of the --chisqFit chi2 (only with --chisqFit). "
+        "'data' (default): the data variances of the dataset fitted (stored with "
+        "the data or a pseudodata set, or those of a toy), otherwise the data "
+        "themselves (Poisson), i.e. the expected yields for the Asimov dataset. "
+        "'mc': the MC statistical variance of the nominal templates, the sum over "
+        "the processes of their sumw2 in each bin, for every dataset (data, "
+        "Asimov, toys, pseudodata); like a data variance it is a constant, the "
+        "nominal one rather than the one at the fit point. It counts the MC "
+        "statistics the bin-by-bin statistical uncertainties profile, so it "
+        "requires --noBinByBinStat (and no --mcStatDebias).",
     )
     parser.add_argument(
         "--covarianceFit",

@@ -269,6 +269,16 @@ class Fitter:
 
         self.chisqFit = options.chisqFit
         self.covarianceFit = options.covarianceFit
+        # the per-bin variance of the chi2 (--chisqVariance, see
+        # _chisq_variance): "data" or "mc", None for the other fits
+        chisq_variance = getattr(options, "chisqVariance", None)
+        if chisq_variance is not None and not self.chisqFit:
+            raise ValueError(
+                f"--chisqVariance {chisq_variance} only applies to --chisqFit: "
+                "--covarianceFit takes the data covariance of the input, and the "
+                "Poisson likelihood has no variance to choose."
+            )
+        self.chisqVariance = (chisq_variance or "data") if self.chisqFit else None
         # When True, self.is_linear is forced True regardless of the actual
         # linearity of the param model, asymmetry tensor, or systematic type.
         # The minimize() path then takes a single Cholesky / Hessian-CG step
@@ -355,6 +365,12 @@ class Fitter:
         self._mcstat_asimov_on = False
         # True while minimize() runs the ordinary-likelihood warm start
         self._mcstat_debias_suspended = False
+
+        # the chi2 variance of --chisqVariance mc [nbins]; reads the bin-by-bin
+        # stat and the de-biasing options above
+        self.mc_variance = (
+            self._mc_chisq_variance() if self.chisqVariance == "mc" else None
+        )
 
         # --- fit params
         self.init_fit_parms(
@@ -1124,8 +1140,9 @@ class Fitter:
         lognobs is log(nobs) with log 1 = 0 in empty bins: the offset that
         gives the saturated Poisson likelihood, for numerical precision in the
         minimizer (a plain log(nobs) makes -nobs (log nexp - log nobs) NaN
-        there). varnobs is the chi2 data variance, `variances` or else nobs,
-        and None for the other fits; a chi2 fit needs nobs > 0.
+        there). varnobs is the variance of the chi2 (_chisq_variance), and None
+        for the other fits, which do not read `variances` (--covarianceFit has
+        its data covariance from the input). A chi2 fit needs nobs > 0.
         """
         nobs = tf.convert_to_tensor(nobs, dtype=self.indata.dtype)
         varnobs = None
@@ -1137,15 +1154,82 @@ class Fitter:
                     raise RuntimeError(message)
             else:
                 tf.debugging.assert_positive(nobs, message=message)
-            varnobs = (
-                nobs
-                if variances is None
-                else tf.convert_to_tensor(variances, dtype=self.indata.dtype)
-            )
+            varnobs = self._chisq_variance(nobs, variances)
         nobssafe = tf.where(nobs == 0.0, tf.constant(1.0, dtype=nobs.dtype), nobs)
         return nobs, varnobs, tf.math.log(nobssafe)
 
+    def _chisq_variance(self, nobs, variances=None):
+        """The per-bin variance of the chi2 for the observations nobs (any
+        shape, as in _observations), following --chisqVariance:
+
+        - "data": `variances`, the data variances of the dataset (stored with
+          the data or a pseudodata set, or those of a toy), else nobs
+          themselves (Poisson); they must be > 0;
+        - "mc": the MC statistical variance of the nominal templates
+          (_mc_chisq_variance), whatever the dataset and `variances`.
+        """
+        if self.chisqVariance == "mc":
+            shape = [-1] + [1] * (len(nobs.shape) - 1)
+            return tf.broadcast_to(tf.reshape(self.mc_variance, shape), tf.shape(nobs))
+        if variances is None:
+            return nobs
+        variances = tf.convert_to_tensor(variances, dtype=self.indata.dtype)
+        message = (
+            "Bins with data variance <= 0 encountered, chi^2 fit can not be "
+            "performed."
+        )
+        if tf.executing_eagerly():
+            if tf.math.reduce_any(variances <= 0).numpy():
+                raise RuntimeError(message)
+        else:
+            tf.debugging.assert_positive(variances, message=message)
+        return variances
+
+    def _mc_chisq_variance(self):
+        """The chi2 variance of --chisqVariance mc [nbins]: the MC statistical
+        variance of the nominal templates in each data bin, the sum over the
+        processes of their sumw2.
+
+        A constant, like a data variance, rather than the variance of the
+        templates at the fit point (scaled with the yields): a chi2 whose
+        variance moves with the parameters is not the likelihood it stands for.
+        Minimized as it is, it favours the parameters that inflate the variance;
+        made a Gaussian likelihood by adding sum_b log V_b, it is no longer a
+        chi2 and draws spurious information on the parameters from how the
+        template statistics scale with them. The fitter also takes the chi2
+        variance as a constant throughout (the bin-by-bin stat profiling, the
+        data-stat global impacts, the residual covariances). The variance of the
+        templates at the fit point is what --binByBinStatDynamic profiles.
+        """
+        if self.bbstat.enabled:
+            raise ValueError(
+                "--chisqVariance mc makes the MC statistical variance the chi2 "
+                "variance; the bin-by-bin statistical uncertainties profile the "
+                "same MC statistics and would count them twice. Add "
+                "--noBinByBinStat."
+            )
+        if self.mcStatDebias != "none":
+            raise ValueError(
+                "--chisqVariance mc is not supported with --mcStatDebias: the "
+                "de-biasing accounts for the MC statistical fluctuations of the "
+                "templates, which the chi2 variance would then count again."
+            )
+        sumw2 = tf.convert_to_tensor(self.indata.sumw2)
+        if len(sumw2.shape) > 1:
+            sumw2 = tf.reduce_sum(sumw2, axis=-1)
+        variance = sumw2[: self.indata.nbins]
+        nonpositive = int(tf.math.count_nonzero(variance <= 0).numpy())
+        if nonpositive:
+            raise RuntimeError(
+                f"{nonpositive} bins with MC statistical variance <= 0 (sum over "
+                "the processes of sumw2) encountered, chi^2 fit with "
+                "--chisqVariance mc can not be performed."
+            )
+        return variance
+
     def set_nobs(self, values, variances=None):
+        """Set the observed data; `variances` are its data variances, for the
+        chi2 (see _chisq_variance)."""
         values, varnobs, lognobs = self._observations(values, variances)
         if self.chisqFit:
             self.varnobs.assign(varnobs)
@@ -1548,7 +1632,8 @@ class Fitter:
                 self.set_nobs(pdata.sample())
             else:
                 if self.chisqFit:
-                    data_var = data_nom if data_variances is None else data_variances
+                    # the width the chi2 assumes (--chisqVariance)
+                    data_var = self._chisq_variance(data_nom, data_variances)
                 else:
                     data_var = data_nom
 
