@@ -200,6 +200,21 @@ def _compute_global_impacts_x0(x, compute_lc_fn, cov_dexpdx):
     return sc @ cov_dexpdx
 
 
+def _data_stat_impacts(var_nobs):
+    """Data stat impacts from the remainder var_total - var_x0 - var_beta0.
+
+    The remainder is the data term's share of the curvature, which is not
+    positive semi-definite in general: where the postfit residuals are large
+    and the prediction is not linear in the parameters, the residual-weighted
+    curvature of the prediction can make it negative. Bin-by-bin stat
+    constraint centres beta0 far below 1 (which frequentist toys draw at low
+    kstat, down to 0) pull the fit enough for it in lite mode. The square root
+    of a negative remainder is reported as 0 rather than NaN; the groups then
+    add up to more than the total.
+    """
+    return tf.sqrt(tf.nn.relu(var_nobs))
+
+
 def _grouped_columns(impacts_x0_sq, group_idxs):
     """Quadrature-sum impacts_x0_sq over each group's columns -> [n_rows,
     n_groups]. group_idxs is a (ragged) list of full-x column-index lists, so
@@ -338,7 +353,7 @@ def global_impacts_parms(
         nmodel_params,
         param_groupidxs,
         impacts_x0_sq,
-        tf.sqrt(var_nobs),
+        _data_stat_impacts(var_nobs),
         impacts_beta0_total,
         impacts_beta0_process,
     )
@@ -451,7 +466,7 @@ def global_impacts_obs(
         nmodel_params,
         param_groupidxs,
         impacts_x0_sq,
-        tf.sqrt(var_nobs),
+        _data_stat_impacts(var_nobs),
         impacts_beta0_total,
         impacts_beta0_process,
     )

@@ -4315,7 +4315,19 @@ class Fitter:
 
                 dlbetadbeta = t1.gradient(lbeta, self.bbstat.ubeta)
             pd2lbetadbetadbeta0 = t2.gradient(dlbetadbeta, self.bbstat.beta0)
-            var_beta0 = pd2ldbeta2 / pd2lbetadbetadbeta0**2
+            # For gamma this is beta0 / kstat. A centre beta0 = 0 (a frequentist
+            # toy draws it at low kstat) leaves the constraint kstat * beta,
+            # so both derivatives vanish: take the limit, 0.
+            no_beta0 = pd2lbetadbetadbeta0 == 0.0
+            var_beta0 = tf.where(
+                no_beta0,
+                tf.zeros_like(pd2ldbeta2),
+                pd2ldbeta2
+                / tf.where(
+                    no_beta0, tf.ones_like(pd2lbetadbetadbeta0), pd2lbetadbetadbeta0
+                )
+                ** 2,
+            )
 
             if self.bbstat.binByBinStatType in ["gamma", "normal-multiplicative"]:
                 var_beta0 = tf.where(

@@ -287,8 +287,23 @@ class BinByBinStat:
 
     # --- toy randomization -------------------------------------------------
 
+    def _keep_masked(self, values, kept):
+        """``values`` with the masked entries set to ``kept``, for the toys.
+
+        In the multiplicative types a masked entry (betamask: sumw2 == 0 or
+        sumw == 0, or below --minBBKstat) has no constraint and its β scales
+        nothing; its kstat is a placeholder 1. normal-additive does not use
+        betamask: there an entry with sumw == 0 but sumw2 > 0 shifts its bin,
+        and one with sumw2 == 0 shifts nothing whatever its β.
+        """
+        if self.binByBinStatType == "normal-additive":
+            return values
+        return tf.where(self.betamask, kept, values)
+
     def randomize_bayes(self):
         """Bayesian toy: randomize the *value* of β around β0.
+
+        Masked entries keep β = β0 (see :meth:`_keep_masked`).
 
         FIXME: only valid for β0 = β = 1 in the gamma case (which should
         always hold when throwing toys).
@@ -307,20 +322,19 @@ class BinByBinStat:
                 / self.kstat
             )
             betagen = tf.where(self.kstat == 0.0, 0.0, betagen)
-            self.beta.assign(betagen)
+            self.beta.assign(self._keep_masked(betagen, self.beta0))
         else:
             if self.binByBinStatType == "normal-multiplicative":
                 stddev_beta0 = tf.sqrt(self.varbeta)
             elif self.binByBinStatType == "normal-additive":
                 stddev_beta0 = tf.ones_like(self.beta0)
-            self.beta.assign(
-                tf.random.normal(
-                    shape=[],
-                    mean=self.beta0,
-                    stddev=stddev_beta0,
-                    dtype=self.beta.dtype,
-                )
+            betagen = tf.random.normal(
+                shape=[],
+                mean=self.beta0,
+                stddev=stddev_beta0,
+                dtype=self.beta.dtype,
             )
+            self.beta.assign(self._keep_masked(betagen, self.beta0))
 
     def randomize_postfit(self):
         """Postfit toy: randomize β around β0 using a normal with stddev
@@ -350,6 +364,10 @@ class BinByBinStat:
     def randomize_frequentist(self):
         """Frequentist toy: randomize the *constraint minimum* β0 around β.
 
+        Masked entries keep the default β0 (see :meth:`_keep_masked`): their
+        kstat is a placeholder, and full mode's profile counts a masked
+        process's yield as β0 · norm while the prediction keeps norm.
+
         FIXME: only valid for β0 = β = 1 in the gamma case.
         """
         if not self.enabled:
@@ -369,20 +387,19 @@ class BinByBinStat:
                 tf.constant(0.0, dtype=self.kstat.dtype),
                 beta0gen,
             )
-            self.set_beta0(beta0gen)
+            self.set_beta0(self._keep_masked(beta0gen, self.default_beta0()))
         else:
             if self.binByBinStatType == "normal-multiplicative":
                 stddev_beta = tf.sqrt(self.varbeta)
             elif self.binByBinStatType == "normal-additive":
                 stddev_beta = tf.ones_like(self.beta)
-            self.set_beta0(
-                tf.random.normal(
-                    shape=[],
-                    mean=self.beta,
-                    stddev=stddev_beta,
-                    dtype=self.beta.dtype,
-                )
+            beta0gen = tf.random.normal(
+                shape=[],
+                mean=self.beta,
+                stddev=stddev_beta,
+                dtype=self.beta.dtype,
             )
+            self.set_beta0(self._keep_masked(beta0gen, self.default_beta0()))
 
     # --- constraint NLL term -----------------------------------------------
 
