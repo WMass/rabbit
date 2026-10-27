@@ -288,7 +288,18 @@ def test_asimov_recentring_carries_over_to_the_saturated_composite(tmp_path):
             [orig, SaturatedProjectModel(f.indata, chinfo, {"ch0": groups})]
         )
         fs = copy.deepcopy(f)
-        fs.init_fit_parms(comp, [], unblind=[], blinding_group=[], freeze_parameters=[])
+        # The saturated scales and the process strengths share one overall
+        # normalisation (mu -> c mu, s_g -> s_g / sqrt(c) leaves every
+        # prediction unchanged). The linear recentring term is not flat along
+        # that direction, so with it free the recentred null point is a saddle
+        # and the minimizer can run away from it. Fix one scale to remove it.
+        fs.init_fit_parms(
+            comp,
+            [],
+            unblind=[],
+            blinding_group=[],
+            freeze_parameters=["^saturated_ch0_g0$"],
+        )
         fs.xdefaultassign()
         xm = f.x.numpy()
         fs.x[: orig.nparams].assign(xm[: orig.nparams])
@@ -296,6 +307,11 @@ def test_asimov_recentring_carries_over_to_the_saturated_composite(tmp_path):
         fs.arm_regularizers()
         if recentre:
             fs.set_mcstat_asimov(True)
+            # the recentred null point is a minimum, not a saddle
+            _, g, h = fs.loss_val_grad_hess()
+            i = fs.floating_indices
+            np.testing.assert_allclose(np.asarray(g)[i], 0.0, atol=1e-8)
+            assert np.linalg.eigvalsh(np.asarray(h)[np.ix_(i, i)]).min() > 0
         fs.minimize(mcstat_warm_start=False)
         return 2 * (nll_main - float(fs.reduced_nll().numpy()))
 
