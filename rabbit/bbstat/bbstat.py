@@ -167,6 +167,12 @@ class BinByBinStat:
                     self.varbeta = self.indata.sumw2
                     self.sumw = self.indata.sumw
 
+            # sqrt(varbeta), computed once: a sqrt inside the likelihood is
+            # differentiated along with it, and its derivative is infinite
+            # where varbeta == 0 (a process without MC-stat uncertainty in a
+            # bin). Reverse-over-reverse through tf.vectorized_map (a batch of
+            # likelihoods) then turned that into NaN Hessians.
+            self.sbeta = tf.math.sqrt(self.varbeta)
             self.betamask = (self.varbeta == 0.0) | (self.sumw == 0.0)
             if self.minBBKstat > 0.0:
                 # Mask (bin, process) entries with effective MC stats below
@@ -498,13 +504,12 @@ class BinByBinStat:
         """
         nrows = norm.shape[0]
         var = self._dynamic_variance(norm)
-        varbeta = self.varbeta[:nrows]
         kstat = self.kstat[:nrows]
         betamask = self.betamask[:nrows]
 
         var_ok = var > 0.0
         var_safe = tf.where(var_ok, var, tf.ones_like(var))
-        sbeta = tf.where(var_ok, tf.sqrt(var_safe), tf.sqrt(varbeta))
+        sbeta = tf.where(var_ok, tf.sqrt(var_safe), self.sbeta[:nrows])
 
         if self.proc_zero_var_mask is not None:
             zv_mask = self.proc_zero_var_mask[:nrows]
@@ -615,7 +620,7 @@ class BinByBinStat:
                 sbeta_profile = sbeta_dyn[: self.indata.nbins]
                 varbeta = tf.square(sbeta_profile)
             else:
-                sbeta_profile = tf.math.sqrt(varbeta)
+                sbeta_profile = self.sbeta[: self.indata.nbins]
 
             if self.chisqFit:
                 if self.binByBinStatType == "gamma":
@@ -1039,7 +1044,7 @@ class BinByBinStat:
             if self.dynamic:
                 sbeta = sbeta_dyn
             else:
-                sbeta = tf.math.sqrt(self.varbeta[: nexp.shape[0]])
+                sbeta = self.sbeta[: nexp.shape[0]]
             if self.binByBinStatMode == "full":
                 norm = norm + sbeta * betasel
                 nexp = tf.reduce_sum(norm, -1)

@@ -647,6 +647,12 @@ class MultiDeviceFitter(Fitter):
             "The data-propagated sandwich", "--mcStatDebiasCov dataPropagated"
         )
 
+    def _batched_fn(self, name):
+        """The batched API (loss_val_batched and friends) evaluates the
+        likelihood over the full logk on one device, which is what --nDevices
+        exists to avoid."""
+        self._unsharded("The batched likelihood API", "loss_val_batched and friends")
+
     def loss_val_grad_hess_beta(self, *args, **kwargs):
         """Beta-space EDM diagnostic (--diagnostics with bin-by-bin stat).
 
