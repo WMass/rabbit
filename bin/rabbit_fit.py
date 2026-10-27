@@ -880,12 +880,20 @@ def fit(args, fitter, ws, dofit=True):
                 f"[timing] minimizer: {len(cb.loss_history)} iterations recorded"
             )
 
-        # the main fit's convergence outcome (for trust-constr: the KKT
-        # optimality, constraint violation, multipliers and constraint values,
-        # the only meaningful convergence measures at an active constraint)
+        # The minimizer's own outcome, kept for diagnostics: it is not the
+        # fit's convergence verdict, which is the EDM. The default tolerances
+        # run the minimizer until it cannot improve, so at a converged point it
+        # usually reports a failure (e.g. trust-krylov status 2). For
+        # trust-constr it carries the KKT optimality, constraint violation,
+        # multipliers and constraint values, the meaningful measures at an
+        # active constraint.
         status = fitter.minimizer_status()
         if status is not None:
-            logger.info(f"minimizer status: {status}")
+            logger.debug(
+                f"minimizer status: {status} (diagnostic only: with the default "
+                "tolerances the minimizer runs until it cannot improve, so a "
+                "failure status is expected; convergence is judged by the EDM)"
+            )
             ws.add_minimizer_status(status)
 
     # default for add_parms_hist below: NaN variances so the parms hist is

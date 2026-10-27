@@ -5342,7 +5342,12 @@ class Fitter:
         """One minimisation from self.x. tc_start (trust-constr + --constraints
         only): "cold" = scipy's interior-point start with rabbit's
         keep_feasible rule; "warm" = no row held, slacks at c - lb, centred
-        barrier; "release" = no row held, scipy's start (last resort)."""
+        barrier; "release" = no row held, scipy's start (last resort).
+
+        A minimizer that raises leaves the fit at the last accepted iterate,
+        or where an earlier round stalled (status -3). Only if the first round
+        raises before accepting a step is there nothing to keep: this raises
+        RuntimeError then, chained to the error, with self.x at the start."""
         logger.info("Perform iterative fit")
 
         # Optional reparameterisation. Built once at the starting point, it is
@@ -5569,6 +5574,11 @@ class Fitter:
         callback = None
         prev_loss = None
         attempt = 0
+        # how the loop ended on a stall, for the minimizer status message
+        stall_exit = None
+        # where the first round starts: a minimizer that raises there, before
+        # accepting a step, leaves nothing to keep
+        xval_start = xval
 
         # to_physical is the whole reason this is built here rather than in the
         # callback: under preconditioning the minimiser's iterate is in internal
@@ -5646,18 +5656,46 @@ class Fitter:
                     # minimizer could have called the loss or hessp functions with "random" values, so restore the
                     # state from the end of the last iteration before the exception
                     xval = cb.xval
-                    # An early stop throws scipy's result away; for a
-                    # constrained fit keep the KKT measures of the last
-                    # accepted iterate (the one xval holds) instead.
-                    self.minimizer_result = getattr(cb, "last_state", None)
+                    # scipy returns no result when the minimizer raises, so
+                    # describe the round from the callback instead, at the last
+                    # accepted iterate (the one xval holds): an early stop is
+                    # status -2, a genuine failure -3. Every exit of this loop
+                    # thus leaves a minimizer status, as a normal return does.
+                    self.minimizer_result = cb.stopped_result(ex)
                     if not cb.stopped_early:
-                        # a real failure, not a stall: surface it rather than
-                        # letting a broken callback look like a converged fit
-                        logger.warning(f"Minimizer raised: {ex}")
-                        # the expensive case: a failure here used to discard the
-                        # whole fit, however close to the minimum it had got
+                        # a real failure, not a stall. Snapshot first: a failure
+                        # here used to discard the whole fit, however close to
+                        # the minimum it had got.
                         snapshotter.save(
                             cb.xval, "minimizer-failed", error=str(ex)[:200]
+                        )
+                        # A later round keeps what the earlier ones reached
+                        # (they ended by a stall, a result in itself). The
+                        # first one has nothing to keep if it never accepted
+                        # a step -- not if it merely iterated: the callback
+                        # also runs on rejected steps, but its x only moves on
+                        # accepted ones. Carrying on would then report the
+                        # start point as the fit result, with no error, and an
+                        # error before the first step is almost always
+                        # systematic (an op the backend cannot run, a loss
+                        # that cannot be evaluated at the start).
+                        if attempt == 0 and np.array_equal(xval, xval_start):
+                            self.minimizer_result.message += (
+                                "; it never accepted a step, so the fit has no "
+                                "result."
+                            )
+                            self.minimizer_result.restarts = attempt
+                            self.x.assign(pc_cell[0].to_physical(xval))
+                            raise RuntimeError(self.minimizer_result.message) from ex
+                        self.minimizer_result.message += (
+                            "; kept the last accepted iterate."
+                        )
+                        # recover, but say so: the postfit is computed at that
+                        # iterate, and its EDM tells whether it is a minimum
+                        logger.warning(
+                            f"{self.minimizer_result.message} The results are "
+                            "computed there; its EDM tells whether it is a "
+                            "minimum."
                         )
                     logger.debug(ex)
                 else:
@@ -5684,12 +5722,23 @@ class Fitter:
                         f"Restart did not reduce the loss further ({prev_loss} -> "
                         f"{last_loss}); stopping after {attempt} restart(s)."
                     )
+                    stall_exit = (
+                        "The last restart did not reduce the loss further "
+                        f"({prev_loss} -> {last_loss})."
+                    )
                     break
                 if 0 <= self.max_restarts <= attempt:
                     logger.warning(
                         f"Minimizer still stalling at loss {last_loss} after "
                         f"{self.max_restarts} restart(s) and the loss was still "
                         "coming down; raise --maxRestarts to let it continue."
+                    )
+                    stall_exit = (
+                        "Restarting is disabled (--maxRestarts 0)."
+                        if attempt == 0
+                        else "The last restart still reduced the loss "
+                        f"({prev_loss} -> {last_loss}), but --maxRestarts "
+                        f"{self.max_restarts} allows no more."
                     )
                     break
                 attempt += 1
@@ -5708,6 +5757,12 @@ class Fitter:
                 pc_cell[0] = self._build_preconditioner()
                 xval = pc_cell[0].from_physical(self.x.numpy())
 
+        # The status describes the last round only: its nit and nfev leave out
+        # the rounds before it (each ended by a stall), so say how many there were.
+        self.minimizer_result.restarts = attempt
+        if stall_exit is not None:
+            self.minimizer_result.message += f" {stall_exit}"
+
         # xval (and callback.xval) are internal coordinates; everything outside
         # fit() expects physical parameters.
         self.x.assign(pc_cell[0].to_physical(xval))
@@ -5722,10 +5777,23 @@ class Fitter:
         return callback
 
     def minimizer_status(self):
-        """Convergence outcome of the last :meth:`fit`, or None if none ran.
+        """The minimizer's outcome of the last :meth:`fit`, or None if none ran.
 
-        NB ``success`` is scipy's flag, not a convergence test on its own:
-        BFGS reports False ("precision loss") at points with EDM ~1e-17.
+        A diagnostic, not the fit's convergence verdict, which is the EDM: the
+        default tolerances (gtol 0) run the minimizer until it cannot improve,
+        so at a converged point it usually reports a failure (trust-krylov
+        status 2, "A bad approximation caused failure to predict
+        improvement"). Likewise ``success`` is scipy's flag: BFGS reports False
+        ("precision loss") at points with EDM ~1e-17.
+
+        A round the minimizer did not finish has no scipy result; it reports
+        success False and status -2 for an --earlyStopping stop (the message
+        says how the restarts ended) or -3 for a minimizer that raised, with
+        nit (and nfev where the method reports it, else -1) at the last
+        accepted iterate. If the first round raised before accepting a step
+        there is no result, and :meth:`fit` raises instead; the status -3 is
+        still recorded. ``restarts`` counts the rounds before the last one,
+        each ended by a stall; nit and nfev cover the last round only.
         """
         res = self.minimizer_result
         if res is None:
@@ -5737,6 +5805,9 @@ class Fitter:
             "nfev": int(getattr(res, "nfev", -1)),
             "message": str(getattr(res, "message", "")),
         }
+        restarts = getattr(res, "restarts", None)
+        if restarts is not None:
+            out["restarts"] = int(restarts)
         # Constrained runs: at an active constraint grad f is balanced by the
         # constraint forces, so EDM says nothing. scipy's own test is
         #     optimality < gtol and constr_violation < gtol  ->  status 1
