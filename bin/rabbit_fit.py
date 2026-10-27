@@ -405,7 +405,7 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
 
                 logger.info("Linear chi2:")
                 logger.info(f"    ndof: {ndf}")
-                logger.info(f"    chi2/ndf = {round(chi2val)}")
+                logger.info(f"    chi2/ndf = {chi2val:.2f}/{ndf}")
                 logger.info(rf"    p-value: {round(p_val * 100, 2)}%")
 
                 ws.add_chi2(chi2val, ndf, prefit, mapping)
