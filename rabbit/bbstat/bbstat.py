@@ -274,6 +274,24 @@ class BinByBinStat:
     def beta_default_assign(self):
         self.beta.assign(self.beta0)
 
+    def _constraint_width(self):
+        """Standard deviation of β under its constraint, at its minimum β = β0.
+
+        From :meth:`lbeta`: 1/sqrt(kstat) for normal-multiplicative
+        (0.5·kstat·(β - β0)²), 1 for normal-additive (0.5·(β - β0)², β in
+        units of sqrt(varbeta)), and sqrt(β0/kstat) for gamma (the inverse
+        square root of the curvature kstat·β0/β² of kstat·(β - β0·log β) at
+        β = β0). Masked entries of the multiplicative types have no
+        constraint (and a placeholder kstat): 0.
+        """
+        if self.binByBinStatType == "normal-additive":
+            return tf.ones_like(self.beta0)
+        if self.binByBinStatType == "normal-multiplicative":
+            width = tf.math.rsqrt(self.kstat)
+        else:
+            width = tf.sqrt(self.beta0 / self.kstat)
+        return tf.where(self.betamask, tf.zeros_like(width), width)
+
     @property
     def is_linear(self):
         """Whether the BBB contribution to the loss is purely quadratic.
@@ -310,12 +328,12 @@ class BinByBinStat:
             self.beta.assign(betagen)
         else:
             if self.binByBinStatType == "normal-multiplicative":
-                stddev_beta0 = tf.sqrt(self.varbeta)
+                stddev_beta0 = self._constraint_width()
             elif self.binByBinStatType == "normal-additive":
                 stddev_beta0 = tf.ones_like(self.beta0)
             self.beta.assign(
                 tf.random.normal(
-                    shape=[],
+                    shape=tf.shape(self.beta0),
                     mean=self.beta0,
                     stddev=stddev_beta0,
                     dtype=self.beta.dtype,
@@ -323,26 +341,25 @@ class BinByBinStat:
             )
 
     def randomize_postfit(self):
-        """Postfit toy: randomize β around β0 using a normal with stddev
-        ``sqrt(varbeta)``.
+        """Starting-point toy: randomize β around β0 with a normal of the
+        width of its constraint (:meth:`_constraint_width`), independently
+        per entry.
 
         Used by :meth:`Fitter.toyassign` when ``randomize_parameters=True``
-        — i.e., when the toy-throwing routine wants to perturb β alongside
-        the fit parameters ``x``. No-op when BBB is disabled.
-
-        Note: type-agnostic (unlike :meth:`randomize_bayes`); always uses
-        the normal-multiplicative-form stddev. Preserves the legacy
-        behaviour from ``Fitter.toyassign`` and is correct in expectation
-        for ``normal-multiplicative``; the gamma and normal-additive cases
-        re-use the same approximation as before.
+        (--toysRandomizeParameters), which randomizes the starting values of
+        the fit parameters ``x`` alike. A profiled fit does not read the
+        starting β; the predictions without profiling (e.g. the prefit
+        histograms of the toy) do. For gamma the normal can draw β < 0 where
+        kstat·β0 is small (probability Φ(-sqrt(kstat·β0))). No-op when BBB
+        is disabled.
         """
         if not self.enabled:
             return
         self.beta.assign(
             tf.random.normal(
-                shape=[],
+                shape=tf.shape(self.beta0),
                 mean=self.beta0,
-                stddev=tf.sqrt(self.varbeta),
+                stddev=self._constraint_width(),
                 dtype=self.beta.dtype,
             )
         )
@@ -372,12 +389,12 @@ class BinByBinStat:
             self.set_beta0(beta0gen)
         else:
             if self.binByBinStatType == "normal-multiplicative":
-                stddev_beta = tf.sqrt(self.varbeta)
+                stddev_beta = self._constraint_width()
             elif self.binByBinStatType == "normal-additive":
                 stddev_beta = tf.ones_like(self.beta)
             self.set_beta0(
                 tf.random.normal(
-                    shape=[],
+                    shape=tf.shape(self.beta),
                     mean=self.beta,
                     stddev=stddev_beta,
                     dtype=self.beta.dtype,

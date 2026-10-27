@@ -1556,7 +1556,7 @@ class Fitter:
                     tf.random.normal(
                         mean=data_nom,
                         stddev=tf.sqrt(data_var),
-                        shape=[],
+                        shape=tf.shape(data_nom),
                         dtype=self.nobs.dtype,
                     ),
                     data_variances,
@@ -1589,7 +1589,7 @@ class Fitter:
                 )
                 self.x.assign(
                     tf.random.normal(
-                        shape=[],
+                        shape=tf.shape(self.x),
                         mean=self.x,
                         stddev=stddev,
                         dtype=self.x.dtype,
