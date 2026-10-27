@@ -321,9 +321,11 @@ BBB_CASES = [
 
 def _toy_beta0(f, seed=13):
     """NBATCH bin-by-bin stat constraint centres [.., B] around the stored
-    ones, of the β shape; additive centres shift, multiplicative ones scale
-    (gamma lite: some centres 0, which log_beta0 maps to log 1; for gamma
-    full mode see test_full_gamma_zero_centres_are_nan_unbatched_too)."""
+    ones, of the β shape; additive centres shift, multiplicative ones scale.
+    gamma: some centres 0, as frequentist toys draw them at low kstat, which
+    log_beta0 maps to log 1: whole bins in column 1 and, in full mode, the
+    signal in column 2 (it has the smallest kstat / norm, so its profile
+    minimum can be on the threshold)."""
     beta00 = f.bbstat.beta0.numpy()
     rng = np.random.default_rng(seed)
     noise = rng.standard_normal(beta00.shape + (NBATCH,))
@@ -331,8 +333,10 @@ def _toy_beta0(f, seed=13):
         beta0 = beta00[..., None] + 0.3 * noise
     else:
         beta0 = beta00[..., None] * np.exp(0.2 * noise)
-    if f.bbstat.binByBinStatType == "gamma" and f.bbstat.binByBinStatMode == "lite":
-        beta0[::5, 1] = 0.0
+    if f.bbstat.binByBinStatType == "gamma":
+        beta0[::5, ..., 1] = 0.0
+        if f.bbstat.binByBinStatMode == "full":
+            beta0[2::5, 0, 2] = 0.0
     return beta0
 
 
@@ -631,11 +635,10 @@ def test_traced_loss_keeps_the_static_batch_width(case, monkeypatch):
     assert [t.shape[-1] for t in outputs] == [1, 1]
 
 
-def test_full_gamma_zero_centres_are_nan_unbatched_too():
-    """Not batching specific: gamma full mode gives a NaN likelihood where a
-    constraint centre is 0, which a frequentist toy draws for low kstat
-    (Poisson(kstat beta) / kstat). Batched and unbatched agree on it; this
-    pins the behaviour until it is fixed on its own."""
+def test_full_gamma_zero_centres_batched_equal_single():
+    """Gamma full mode with constraint centres 0 in whole bins, which a
+    frequentist toy draws for low kstat (Poisson(kstat beta) / kstat): the
+    likelihood is finite, and batched and unbatched agree on it."""
     with tempfile.TemporaryDirectory() as tmp:
         f = _fitter(tmp, "bbb_full_gamma")
         X = _points(f)[:, :1]
@@ -651,7 +654,8 @@ def test_full_gamma_zero_centres_are_nan_unbatched_too():
             lambda b: f.bbstat.set_beta0(tf.constant(beta0)),
             lambda: f.bbstat.set_beta0(tf.constant(beta00)),
         )
-        assert np.isnan(batched).all() and np.isnan(single).all()
+        assert np.isfinite(batched).all()
+        np.testing.assert_allclose(batched, single, rtol=RTOL, atol=0)
 
 
 @pytest.mark.parametrize("case", ["dense", "bbb_full_gamma", "chisq"])

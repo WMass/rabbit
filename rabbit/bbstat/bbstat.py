@@ -8,7 +8,11 @@ package docstring in :mod:`rabbit.bbstat` for the high-level layout.
 import tensorflow as tf
 from wums import logging
 
-from rabbit.bbstat.formulas import solve_quad_eq
+from rabbit.bbstat.formulas import (
+    gamma_full_beta,
+    gamma_full_threshold_profile,
+    solve_quad_eq,
+)
 
 logger = logging.child_logger(__name__)
 
@@ -662,6 +666,20 @@ class BinByBinStat:
                         )
                         threshold = nobs - varnobs * min_f
 
+                        # zero centres can put the minimum on the threshold,
+                        # which the Newton solve does not reach
+                        on_threshold, beta_threshold, newton_beta0 = (
+                            gamma_full_threshold_profile(
+                                kstat,
+                                beta0,
+                                norm_profile,
+                                betamask,
+                                zero_norm,
+                                f_thresh,
+                                threshold,
+                            )
+                        )
+
                         # solving nbeta numerically using newtons method
                         def fnll_nbeta(u, t):
                             x = t["threshold"] + tf.exp(u)
@@ -670,7 +688,7 @@ class BinByBinStat:
                                 + ((x - t["nobs"]) / t["varnobs"])[..., None]
                                 * t["norm_profile"]
                             )
-                            beta = t["kstat"] * t["beta0"] / den
+                            beta = gamma_full_beta(t["kstat"], t["beta0"], den)
                             beta = tf.where(betamask, t["beta0"], beta)
                             betasafe = tf.where(
                                 t["beta0"] == 0.0,
@@ -696,7 +714,7 @@ class BinByBinStat:
                             inputs=dict(
                                 threshold=threshold,
                                 kstat=kstat,
-                                beta0=beta0,
+                                beta0=newton_beta0,
                                 logbeta0=logbeta0,
                                 norm_profile=norm_profile,
                                 nobs=nobs,
@@ -704,6 +722,7 @@ class BinByBinStat:
                             ),
                             chisq_fit=True,
                         )
+                        beta = tf.where(on_threshold[:, None], beta_threshold, beta)
 
                     beta = tf.where(betamask, beta0, beta)
                 elif self.binByBinStatType == "normal-multiplicative":
@@ -873,22 +892,36 @@ class BinByBinStat:
                         norm_thresh = tf.where(
                             zero_norm, tf.ones_like(norm_profile), norm_profile
                         )
-                        f_thresh = tf.where(
+                        ratio = tf.where(
                             zero_norm,
                             tf.fill(
                                 tf.shape(kstat),
                                 tf.cast(float("inf"), kstat.dtype),
                             ),
-                            1.0 + kstat / norm_thresh,
+                            kstat / norm_thresh,
                         )
-                        threshold = nobs / tf.reduce_min(f_thresh, axis=1)
+                        threshold = nobs / tf.reduce_min(1.0 + ratio, axis=1)
+
+                        # zero centres can put the minimum on the threshold,
+                        # which the Newton solve does not reach
+                        on_threshold, beta_threshold, newton_beta0 = (
+                            gamma_full_threshold_profile(
+                                kstat,
+                                beta0,
+                                norm_profile,
+                                betamask,
+                                zero_norm,
+                                ratio,
+                                threshold,
+                            )
+                        )
 
                         def fnll_nbeta(u, t):
                             x = t["threshold"] + tf.exp(u)
                             den = (1 - t["nobs"] / x)[..., None] * t[
                                 "norm_profile"
                             ] + t["kstat"]
-                            beta = t["kstat"] * t["beta0"] / den
+                            beta = gamma_full_beta(t["kstat"], t["beta0"], den)
                             beta = tf.where(betamask, t["beta0"], beta)
                             betasafe = tf.where(
                                 t["beta0"] == 0.0,
@@ -920,7 +953,7 @@ class BinByBinStat:
                             inputs=dict(
                                 threshold=threshold,
                                 kstat=kstat,
-                                beta0=beta0,
+                                beta0=newton_beta0,
                                 logbeta0=logbeta0,
                                 norm_profile=norm_profile,
                                 nobs=nobs,
@@ -928,6 +961,7 @@ class BinByBinStat:
                             ),
                             chisq_fit=False,
                         )
+                        beta = tf.where(on_threshold[:, None], beta_threshold, beta)
 
                     beta = tf.where(betamask, beta0, beta)
                 elif self.binByBinStatType == "normal-multiplicative":
@@ -1142,11 +1176,7 @@ class BinByBinStat:
         x = inputs["threshold"] + tf.exp(u_diff)
         if chisq_fit:
             varnobs = inputs["varnobs"]
-            beta = (
-                kstat
-                * beta0
-                / (kstat + ((x - nobs) / varnobs)[..., None] * norm_profile)
-            )
+            den = kstat + ((x - nobs) / varnobs)[..., None] * norm_profile
         else:
-            beta = kstat * beta0 / ((1 - nobs / x)[..., None] * norm_profile + kstat)
-        return beta
+            den = (1 - nobs / x)[..., None] * norm_profile + kstat
+        return gamma_full_beta(kstat, beta0, den)
