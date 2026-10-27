@@ -250,11 +250,13 @@ def build_tf_external_terms(terms, parms, dtype):
     * The Gaussian scalars ``const`` / ``lognorm`` (see the module
       docstring) are filled in here when the term did not carry them and
       the Hessian is dense. A sparse Hessian that arrives without them is
-      left uncorrected, with a warning: deriving ``const`` would need a
-      sparse solve and ``lognorm`` a sparse log-determinant, neither of
-      which belongs in a load path. Supply them at write time instead --
+      left uncorrected, with a warning for each one missing: deriving
+      ``const`` would need a sparse solve and ``lognorm`` a sparse
+      log-determinant, neither of which belongs in a load path (a term with
+      no linear part needs no ``const``: it is exactly 0). Supply them at
+      write time instead --
       ``TensorWriter.add_external_likelihood_term(hess=..., mean=...)``
-      gets ``const`` from a single matvec.
+      gets ``const`` from a single matvec, ``lognorm=`` passes the other.
 
     Returns
     -------
@@ -319,16 +321,34 @@ def build_tf_external_terms(terms, parms, dtype):
                 const = d_const if const is None else const
                 lognorm = d_lognorm if lognorm is None else lognorm
             elif term["hess_sparse"] is not None:
-                logger.warning(
-                    f"External likelihood term '{term['name']}' has a sparse Hessian "
-                    "and no stored const/lognorm, so it cannot be centered or "
-                    "normalized here (that would need a sparse solve and "
-                    "log-determinant). Absolute NLL values will be offset for this "
-                    "term. Pass mean= to TensorWriter.add_external_likelihood_term "
-                    "to have them computed at write time."
-                )
-                const = 0.0 if const is None else const
-                lognorm = 0.0 if lognorm is None else lognorm
+                # Neither scalar is derived from a sparse Hessian here; say
+                # which one is missing and what that costs.
+                grad = term["grad_values"]
+                if const is None and (grad is None or not np.any(grad)):
+                    # no linear part: centered at the origin, const is exactly 0
+                    const = 0.0
+                if const is None:
+                    logger.warning(
+                        f"External likelihood term '{term['name']}' has a sparse "
+                        "Hessian, a nonzero gradient and no stored centering "
+                        "constant, which here would need a sparse solve. The term "
+                        "is not centered, so absolute NLL values (reduced and "
+                        "full) are offset by a constant for it; fits and NLL "
+                        "differences are unaffected. Pass mean= to "
+                        "TensorWriter.add_external_likelihood_term to have the "
+                        "constant computed at write time."
+                    )
+                    const = 0.0
+                if lognorm is None:
+                    logger.warning(
+                        f"External likelihood term '{term['name']}' has a sparse "
+                        "Hessian and no stored log-normalization, which here would "
+                        "need a sparse log-determinant. The full NLL lacks this "
+                        "term's Gaussian normalization; the reduced NLL and the fit "
+                        "are unaffected. Pass lognorm= to "
+                        "TensorWriter.add_external_likelihood_term to supply it."
+                    )
+                    lognorm = 0.0
             else:
                 # grad-only: a linear tilt with no minimum, nothing to center.
                 const = 0.0 if const is None else const

@@ -1858,6 +1858,66 @@ class TensorWriter:
             )
         return np.array([ax.value(i) for i in range(len(ax))], dtype=object)
 
+    @staticmethod
+    def _flow_bin_error(name, what, count, sparse=False):
+        hint = (
+            " A wums.SparseHist is indexed in the with-flow layout (axis.extent "
+            "bins per axis): with the default overflow=True a matrix over n "
+            "parameters is (n+1) x (n+1), the parameters in its first n rows "
+            "and columns. Build the axes with overflow=False for an (n, n) "
+            "matrix."
+            if sparse
+            else ""
+        )
+        return ValueError(
+            f"External likelihood term '{name}': {what} has {count} nonzero "
+            "value(s) in flow (underflow/overflow) bins of its StrCategory axes. "
+            "A flow bin is not a parameter, so these cannot be stored (filling a "
+            f"label that is missing from the axes lands in the overflow bin).{hint}"
+        )
+
+    def _check_no_flow_content(self, h, name, what):
+        """Refuse nonzero values in the flow bins of a dense external-term hist,
+        which ``h.values()`` would otherwise drop without a word."""
+        full = np.asarray(h.values(flow=True))
+        regular = []
+        for ax in h.axes:
+            u = SparseHist._underflow_offset(ax)
+            regular.append(slice(u, u + len(ax)))
+        count = int(np.count_nonzero(full) - np.count_nonzero(full[tuple(regular)]))
+        if count:
+            raise self._flow_bin_error(name, what, count)
+
+    def _sparse_hess_entries(self, hess, name):
+        """(rows, cols, values) of a SparseHist Hessian, indexed by parameter.
+
+        The SparseHist's internal flat (indices, values) buffers are read
+        directly: going through ``to_flat_csr`` would do an O(nnz log nnz)
+        sort that is not needed here, since the stored representation is
+        unordered. The flat indices run over the with-flow layout, i.e.
+        ``axis.extent`` bins per axis, which for a StrCategory axis includes
+        the overflow bin unless the axis was built with ``overflow=False``.
+        They are unravelled in that layout and shifted to the parameter list.
+        A flow bin is not a parameter: a nonzero entry in one is refused, an
+        explicitly stored zero is dropped.
+        """
+        ax0, ax1 = hess.axes
+        flat = np.asarray(hess._flat_indices, dtype=np.int64)
+        vals = np.asarray(hess._values, dtype=self.dtype)
+        rows, cols = np.divmod(flat, int(ax1.extent))
+        if int(ax0.extent) == len(ax0) and int(ax1.extent) == len(ax1):
+            # no flow bins: the with-flow layout is the parameter layout
+            return rows, cols, vals
+        rows -= SparseHist._underflow_offset(ax0)
+        cols -= SparseHist._underflow_offset(ax1)
+        regular = (rows >= 0) & (rows < len(ax0)) & (cols >= 0) & (cols < len(ax1))
+        if not regular.all():
+            count = int(np.count_nonzero(vals[~regular]))
+            if count:
+                raise self._flow_bin_error(name, "hess", count, sparse=True)
+            rows, cols, vals = rows[regular], cols[regular], vals[regular]
+        return rows, cols, vals
+
     def add_external_likelihood_term(
         self, grad=None, hess=None, name=None, mean=None, const=None, lognorm=None
     ):
@@ -1895,6 +1955,11 @@ class TensorWriter:
             be a dense ``hist.Hist`` or a ``wums.SparseHist`` for sparse
             storage. ``H`` should be symmetric (the formula is
             ``0.5 x^T H x``); the user is responsible for symmetrizing.
+            A SparseHist is laid out over its axes' flow bins too, so with
+            the default ``overflow=True`` it is ``(n+1) x (n+1)``; build the
+            axes with ``overflow=False`` for an ``(n, n)`` matrix. Nonzero
+            values in flow bins are refused, for ``grad``, ``hess`` and
+            ``mean``, dense or sparse: a flow bin is not a parameter.
         name : str, optional
             Identifier for this term. Auto-generated if not provided.
             Multiple terms can be added by calling this method repeatedly.
@@ -1948,7 +2013,13 @@ class TensorWriter:
                     f"grad must be a 1D histogram, got {type(grad).__name__} with "
                     f"{len(grad.axes) if hasattr(grad, 'axes') else 0} axes"
                 )
+            if isinstance(grad, SparseHist):
+                raise TypeError(
+                    "grad must be a dense hist.Hist; wums.SparseHist is only "
+                    "supported for hess"
+                )
             grad_params = self._strcategory_labels(grad.axes[0])
+            self._check_no_flow_content(grad, name, "grad")
             grad_values = np.asarray(grad.values()).flatten().astype(self.dtype)
             if len(grad_values) != len(grad_params):
                 raise RuntimeError(
@@ -1982,24 +2053,14 @@ class TensorWriter:
                 params = hess_params0
 
             if isinstance(hess, SparseHist):
-                # Access the SparseHist's internal flat (indices, values)
-                # buffers directly. Going through ``to_flat_csr`` would do an
-                # O(nnz log nnz) sort that we don't need here, since the
-                # downstream representation is unordered (rows, cols, values).
-                # The flat indices live in the with-flow layout of the dense
-                # shape, but for StrCategory axes with overflow=False the
-                # extents equal the sizes so there are no flow bins to drop.
-                n = len(params)
-                flat = np.asarray(hess._flat_indices, dtype=np.int64)
-                vals = np.asarray(hess._values, dtype=self.dtype)
-                rows, cols = np.divmod(flat, n)
-                hess_sparse = (rows, cols, vals)
+                hess_sparse = self._sparse_hess_entries(hess, name)
             elif self._issparse(hess):
                 raise ValueError(
                     "raw scipy sparse hess inputs are not supported; "
                     "wrap in wums.SparseHist with the parameter axes attached"
                 )
             else:
+                self._check_no_flow_content(hess, name, "hess")
                 hess_dense = np.asarray(hess.values()).astype(self.dtype)
                 if hess_dense.shape != (len(params), len(params)):
                     raise RuntimeError(
@@ -2012,12 +2073,18 @@ class TensorWriter:
         # for a sparse H too -- which the load-time derivation cannot, since
         # recovering mu from g there would take a sparse solve.
         if mean is not None:
+            if isinstance(mean, SparseHist):
+                raise TypeError(
+                    "mean must be a dense hist.Hist or array-like; "
+                    "wums.SparseHist is only supported for hess"
+                )
             if hasattr(mean, "axes"):
                 if len(mean.axes) != 1:
                     raise ValueError(
                         f"mean must be a 1D histogram, got {len(mean.axes)} axes"
                     )
                 mean_params = self._strcategory_labels(mean.axes[0])
+                self._check_no_flow_content(mean, name, "mean")
                 if not np.array_equal(params, mean_params):
                     raise ValueError(
                         "mean and hess must use the same parameter list in the "
