@@ -1636,7 +1636,7 @@ def main():
     # loud, with the numbers, before the minimiser starts.
     if args.nDevices > 1:
         _hess_per_iter = []
-        if args.minimizerMethod in ("trust-exact", "dogleg", "tf-trust-exact"):
+        if args.minimizerMethod in fitter.DENSE_HESSIAN_METHODS:
             _hess_per_iter.append(f"--minimizerMethod {args.minimizerMethod}")
         if args.asymImpacts and args.asymImpactsHess == "exact":
             _hess_per_iter.append("--asymImpacts with --asymImpactsHess exact")
