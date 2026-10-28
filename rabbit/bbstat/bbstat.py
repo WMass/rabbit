@@ -210,7 +210,7 @@ class BinByBinStat:
                 # precompute decomposition of composite matrix to speed up
                 # calculation of profiled beta values
                 if covarianceFit:
-                    sbeta = tf.math.sqrt(self.varbeta[: self.indata.nbins])
+                    sbeta = self.sbeta[: self.indata.nbins]
 
                     # with --binByBinStatDynamic sbeta changes with the
                     # yields, so the composite matrix is solved per evaluation
