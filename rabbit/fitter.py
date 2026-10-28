@@ -4924,13 +4924,16 @@ class Fitter:
     def _batched_fn(self, name):
         """The traced function `name` of the batched API, built on first use.
         reduce_retracing generalizes the batch width after a second one, so a
-        stream of batch widths does not retrace each time."""
+        stream of batch widths does not retrace each time.
+
+        Not XLA-compiled: under XLA the gradient through tf.vectorized_map is
+        recompiled whenever the values of the batched inputs change (~1 s for
+        a dense tensor with 190 parameters), and runs slower than without XLA
+        afterwards; a minimizer changes them on every call."""
         fns = self.__dict__.setdefault("_batched_tf_fns", {})
         if name not in fns:
             impl = getattr(self, f"_batched_{name}")
-            # no XLA for the fwdrev HVP (see _make_tf_functions)
-            jit = self.jit_compile and name != "val_grad_hessp_fwdrev"
-            fns[name] = tf.function(impl, jit_compile=jit, reduce_retracing=True)
+            fns[name] = tf.function(impl, jit_compile=False, reduce_retracing=True)
         return fns[name]
 
     def _batched_nll(self, X, data, x0, beta0, profile):
