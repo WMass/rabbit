@@ -1501,11 +1501,9 @@ def main():
             # after each per-tau minimize, discarding finished fits mid-scan.
             _md.append("--lCurveScan / --lCurveOptimize")
         if args.covarianceFit:
-            # Fitter.__init__ builds a dense [nbins, nbins] tf.linalg.diag when
-            # no data_cov_inv is in the workspace -- ~68 GB at 92144 bins -- and
-            # that runs before init_fit_parms reaches _build_shards, so without
-            # this entry the user gets an allocation failure rather than the
-            # refusal naming the flag.
+            # The dense data covariance couples all bins, so the shards cannot
+            # split the data term (MultiDeviceFitter refuses it as well); checked
+            # here so the run ends before the input is loaded.
             _md.append("--covarianceFit")
         if args.diagnostics and not args.noBinByBinStat:
             # loss_val_grad_hess_beta takes a jacobian over the full-length

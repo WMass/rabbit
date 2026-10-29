@@ -306,15 +306,15 @@ class Fitter:
             )
         elif self.covarianceFit:
             if self.indata.data_cov_inv is None:
-                logger.warning(
-                    "No covariance provided, use reciproval of data variances"
+                # --covarianceFit fits the correlations of the data, so a missing
+                # covariance is an error rather than something to guess
+                raise RuntimeError(
+                    "--covarianceFit needs a data covariance, but the input tensor "
+                    "has none. Check that the tensor was written with one "
+                    "(TensorWriter.add_data_covariance); for a chi-square fit with "
+                    "uncorrelated data variances, use --chisqFit instead."
                 )
-                self.data_cov_inv = tf.linalg.diag(
-                    1.0 / self.indata.getattr("data_obs", "data_var")
-                )
-            else:
-                # provided covariance
-                self.data_cov_inv = self.indata.data_cov_inv
+            self.data_cov_inv = self.indata.data_cov_inv
 
         # --- bin-by-bin statistical treatment (β nuisances + masks + kstat).
         # All BBB state is owned by the BinByBinStat helper. Constructed
