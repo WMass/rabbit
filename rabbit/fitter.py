@@ -4033,26 +4033,36 @@ class Fitter:
                 # (sliced to nbins when masked channels are excluded).
                 self.rnorm_init = rnorm_init
 
-    def _compute_yields_noBBB(self, full=True, compute_norm=True):
+    def _compute_yields_noBBB(self, full=True, compute_norm=True, forward_mode=False):
         # full: compute yields inclduing masked channels
         # compute_norm: also build the dense [nbins, nproc] normcentral tensor.
         # In sparse mode this is expensive (forward + backward) and is only
         # needed when an external caller requests per-process yields, or for
         # binByBinStat in "full" mode. The default is True for backward
         # compatibility; the NLL/grad/HVP path passes compute_norm=False.
+        # forward_mode: see _compute_yields_noBBB_batched.
         nexpcentral, normcentral = self._compute_yields_noBBB_batched(
-            self.x[:, None], full=full, compute_norm=compute_norm
+            self.x[:, None],
+            full=full,
+            compute_norm=compute_norm,
+            forward_mode=forward_mode,
         )
         if normcentral is not None:
             normcentral = normcentral[..., 0]
         return nexpcentral[:, 0], normcentral
 
-    def _compute_yields_noBBB_batched(self, x, full=True, compute_norm=True):
+    def _compute_yields_noBBB_batched(
+        self, x, full=True, compute_norm=True, forward_mode=False
+    ):
         """Yields without bin-by-bin stat at the B columns of x [npar, B]:
         nexpcentral [nbins, B] and, with compute_norm, normcentral
         [nbins, nproc, B] (else None). The batch axis goes last, so the logk
         contraction is the same [.., nsyst] x [nsyst, B] product for B = 1
-        and reads logk once for all B columns otherwise."""
+        and reads logk once for all B columns otherwise.
+
+        forward_mode: the result is differentiated in forward mode
+        (tf.autodiff.ForwardAccumulator); sparse mode then avoids the CSR
+        matmul, see below. No effect on dense inputs."""
         poi = self.get_poi(x)
         model_nui = self.get_model_nui(x)
         theta = self.get_theta(x)
@@ -4071,7 +4081,20 @@ class Fitter:
             # kernel. NOTE: SparseMatrixMatMul has no XLA kernel, so the
             # enclosing loss/grad/HVP tf.functions are built with
             # jit_compile=False in sparse mode (see _make_tf_functions).
-            logsnorm = tf_sparse_csr.matmul(self.logk_csr, mthetaalpha)  # [nnz, B]
+            #
+            # It cannot be differentiated in forward mode, though: the
+            # ForwardAccumulator gives every input without a tangent a
+            # zeros_like one, the CSRSparseMatrix variant included, and
+            # TensorFlow has no CPU ZEROS_LIKE kernel for that variant
+            # ("No unary variant unary_op function found for op ZEROS_LIKE").
+            # A forward-mode caller (the JVP global impacts) gets the same
+            # contraction from the index/value tensors of logk instead:
+            # slower per call, but off the NLL/grad/HVP path.
+            if forward_mode:
+                logsnorm = tf.sparse.sparse_dense_matmul(self.logk, mthetaalpha)
+            else:
+                logsnorm = tf_sparse_csr.matmul(self.logk_csr, mthetaalpha)
+            # logsnorm: [nnz, B]
 
             # The values of a [nbinsfull, nproc] sparse tensor with the sparsity
             # pattern of self.indata.norm (without the masked channels' entries
@@ -4182,9 +4205,16 @@ class Fitter:
 
         return nexpcentral, normcentral
 
-    def _compute_yields_with_beta(self, profile=True, compute_norm=False, full=True):
+    def _compute_yields_with_beta(
+        self, profile=True, compute_norm=False, full=True, forward_mode=False
+    ):
+        # forward_mode: see _compute_yields_noBBB_batched.
         nexp, norm, beta = self._compute_yields_with_beta_batched(
-            self.x[:, None], profile=profile, compute_norm=compute_norm, full=full
+            self.x[:, None],
+            profile=profile,
+            compute_norm=compute_norm,
+            full=full,
+            forward_mode=forward_mode,
         )
         return tuple(None if t is None else t[..., 0] for t in (nexp, norm, beta))
 
@@ -4197,7 +4227,14 @@ class Fitter:
         )
 
     def _compute_yields_with_beta_batched(
-        self, x, data=None, profile=True, compute_norm=False, full=True, beta0=None
+        self,
+        x,
+        data=None,
+        profile=True,
+        compute_norm=False,
+        full=True,
+        beta0=None,
+        forward_mode=False,
     ):
         """_compute_yields_with_beta at the B columns of x [npar, B]: nexp
         [nbins, B], norm [nbins, nproc, B] or None, beta [.., B] or None.
@@ -4207,7 +4244,8 @@ class Fitter:
         bin-by-bin stat constraint centres, of bbstat.beta_shape (masked
         channels included) plus the batch axis (default the stored ones). Bin-by-bin stat is element-wise in the bins:
         B = 1 calls profile_and_apply directly, larger batches vectorize the
-        same call (tfh.map_batch)."""
+        same call (tfh.map_batch). forward_mode: see
+        _compute_yields_noBBB_batched."""
         # Only materialize the dense [nbins, nproc] normcentral when an
         # external caller requested it, when BBB "full" mode needs per-process
         # yields for the analytic β solution, or when "lite" mode needs to
@@ -4215,7 +4253,7 @@ class Fitter:
         # contributions per bin.
         need_norm = compute_norm or self.bbstat.needs_per_proc_norm()
         nexp, norm = self._compute_yields_noBBB_batched(
-            x, full=full, compute_norm=need_norm
+            x, full=full, compute_norm=need_norm, forward_mode=forward_mode
         )
         if not self.bbstat.enabled:
             return nexp, norm, None
