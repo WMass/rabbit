@@ -4879,16 +4879,6 @@ class Fitter:
         return val, grad
 
     @tf.function
-    def loss_val_valfull_grad_hess(self, profile=True):
-        with tf.GradientTape() as t2:
-            with tf.GradientTape() as t1:
-                val, valfull = self._compute_nll(profile=profile)
-            grad = t1.gradient(val, self.x)
-        hess = t2.jacobian(grad, self.x)
-
-        return val, valfull, grad, hess
-
-    @tf.function
     def loss_val_grad_hess_beta(self, profile=True):
         with tf.GradientTape() as t2:
             t2.watch(self.bbstat.ubeta)

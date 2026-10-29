@@ -469,8 +469,6 @@ def test_regularizers_are_refused_rather_than_silently_dropped():
         ("global_impacts_parms", "--globalImpacts"),
         ("gaussian_global_impacts_parms", "--gaussianGlobalImpacts"),
         ("toyassign", "-t > 0"),
-        # full_nll, not loss_val_valfull_grad_hess: the latter has no caller
-        # in bin/, so testing it left the real --fullNll entry point uncovered
         ("full_nll", "--fullNll"),
     ],
 )

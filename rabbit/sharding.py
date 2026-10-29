@@ -680,9 +680,6 @@ class MultiDeviceFitter(Fitter):
     def toyassign(self, *args, **kwargs):
         self._unsharded("Toy generation", "-t > 0")
 
-    def loss_val_valfull_grad_hess(self, *args, **kwargs):
-        self._unsharded("The full-NLL value/gradient/Hessian", "--fullNll")
-
     def reduced_nll(self):
         """Sharded counterpart of Fitter.reduced_nll.
 
