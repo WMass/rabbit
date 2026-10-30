@@ -227,11 +227,11 @@ class Fitter:
         # jitCompile accepts "auto" (the default), "on", or "off".
         # True / False from programmatic callers are accepted as
         # aliases for "on" / "off". The tri-state is resolved to the
-        # final boolean self.jit_compile right here, using the only
-        # runtime condition it can depend on: whether the input is
-        # sparse. Sparse mode uses SparseMatrixMatMul which has no
-        # XLA kernel, so "auto" silently disables jit and "on" warns
-        # and falls back.
+        # final boolean self.jit_compile right here, from the input:
+        # SparseMatrixMatMul (the CSR matmul) has no XLA kernel, and the
+        # likelihood calls it for a sparse tensor and for each external
+        # term whose Hessian is stored sparse, with a dense tensor too.
+        # Either way "auto" disables jit and "on" warns and falls back.
         _jit_opt = getattr(options, "jitCompile", "auto")
         if _jit_opt is True:
             _jit_opt = "on"
@@ -241,20 +241,38 @@ class Fitter:
             raise ValueError(
                 f"jitCompile must be one of 'auto', 'on', 'off'; got {_jit_opt!r}"
             )
-        if _jit_opt == "off":
-            self.jit_compile = False
-        elif _jit_opt == "on":
-            if self.indata.sparse:
-                logger.warning(
-                    "--jitCompile=on requested but input data is sparse; "
-                    "XLA has no kernel for the sparse matmul ops used in "
-                    "sparse mode, so jit_compile will be disabled."
+        # only the external terms the loss evaluates: an MC-stat moment term
+        # is dropped unless --mcStatDebias continuousM (see init_fit_parms)
+        continuous_m = getattr(options, "mcStatDebias", "none") == "continuousM"
+        csr_terms = external_likelihood.sparse_hessian_terms(
+            t
+            for t in self.indata.external_terms
+            if continuous_m or not _is_mcstat_term(t)
+        )
+        no_xla = []
+        if self.indata.sparse:
+            no_xla.append("input data is sparse")
+        if csr_terms:
+            no_xla.append(
+                f"external likelihood term(s) {csr_terms} store their Hessian sparse"
+            )
+        self.jit_compile = _jit_opt != "off" and not no_xla
+        if _jit_opt != "off" and no_xla:
+            why = (
+                f"{' and '.join(no_xla)}; XLA has no kernel for the sparse (CSR) "
+                "matmul ops used there, so jit_compile will be disabled"
+            )
+            if _jit_opt == "on":
+                logger.warning(f"--jitCompile=on requested but {why}.")
+            elif not self.indata.sparse:
+                # A sparse tensor runs without jit by design; a dense one
+                # losing it to an external term is not obvious.
+                logger.info(
+                    f"--jitCompile=auto: {why}. A dense Hessian (hist.Hist "
+                    "instead of wums.SparseHist in "
+                    "TensorWriter.add_external_likelihood_term) would keep "
+                    "jit_compile for this dense tensor."
                 )
-                self.jit_compile = False
-            else:
-                self.jit_compile = True
-        else:  # "auto"
-            self.jit_compile = not self.indata.sparse
         # When --noHessian is requested the postfit Hessian is never
         # computed, so the dense [npar, npar] covariance matrix should
         # not be allocated. self.cov is set to None in that case and
@@ -4776,8 +4794,8 @@ class Fitter:
         # jit_compile and the HVP autodiff mode can be controlled via fit
         # options without redefining the class. self.jit_compile has
         # already been resolved to a plain bool in __init__ (tri-state
-        # "auto"/"on"/"off" collapsed against self.indata.sparse), so
-        # this body just reads it.
+        # "auto"/"on"/"off" collapsed against the sparse tensor and the
+        # sparse external Hessians), so this body just reads it.
         jit = self.jit_compile
         # the kept set of the other de-biasing setting is now stale
         self._mcstat_tf_standby = None
@@ -4833,11 +4851,23 @@ class Fitter:
         self._scalar_hessian_fns = {}
         # tf.autodiff.ForwardAccumulator does not support tangent
         # propagation through SparseMatrixMatMul (no JVP rule for the
-        # CSR variant), so the fwdrev HVP cannot be used in sparse mode.
-        # Fall back to revrev with a warning.
-        if self.hvp_method == "fwdrev" and self.indata.sparse:
+        # CSR variant), so the fwdrev HVP cannot be used in sparse mode,
+        # nor with an external term whose Hessian is stored sparse (also
+        # contracted with it). Fall back to revrev with a warning.
+        csr_terms = [
+            t["name"]
+            for t in self.external_terms + self.mcstat_terms
+            if t["hess_csr"] is not None
+        ]
+        if self.hvp_method == "fwdrev" and (self.indata.sparse or csr_terms):
+            where = (
+                "in sparse mode"
+                if self.indata.sparse
+                else f"with external likelihood term(s) {csr_terms}, whose "
+                "Hessian is stored sparse"
+            )
             logger.warning(
-                "fwdrev HVP is not supported in sparse mode "
+                f"fwdrev HVP is not supported {where} "
                 "(tf.autodiff.ForwardAccumulator cannot trace through "
                 "tf.linalg.sparse's CSR matmul); falling back to revrev."
             )

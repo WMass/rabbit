@@ -467,10 +467,12 @@ def common_parser():
         type=str,
         choices=["auto", "on", "off"],
         help="Control XLA jit_compile=True on the loss/gradient/HVP tf.functions. "
-        "'auto' (default) enables jit_compile in dense mode and disables it in "
-        "sparse mode (where the CSR matmul kernels have no XLA implementation). "
-        "'on' forces jit_compile on (falling back to off with a warning in sparse "
-        "mode). 'off' disables jit_compile unconditionally.",
+        "'auto' (default) enables jit_compile in dense mode and disables it where "
+        "the likelihood uses the CSR matmul, which has no XLA implementation: in "
+        "sparse mode, and with an external likelihood term whose Hessian is "
+        "stored sparse (also with a dense tensor). 'on' forces jit_compile on "
+        "(falling back to off with a warning in those cases). 'off' disables "
+        "jit_compile unconditionally.",
     )
     parser.add_argument(
         "--chisqFit",
