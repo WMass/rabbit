@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from .test_batched_nll import NBATCH, _fitter, _points
+from .test_batched_nll import NBATCH, _fitter, _points, _single
 
 RTOL = 1e-10
 
@@ -29,6 +29,7 @@ CASES = [
     "bbb_normal_additive",
     "bbb_full_additive",
     "chisq",
+    "covariance",
     "frozen",
     "blinded",
     "external_dense",
@@ -43,19 +44,6 @@ def _close(a, b):
 def _directions(f, seed=2):
     rng = np.random.default_rng(seed)
     return rng.standard_normal((f.x.shape[0], NBATCH))
-
-
-def _single(f, X, fn):
-    """fn() at each column of X, with self.x restored afterwards."""
-    xsave = f.x.numpy()
-    try:
-        out = []
-        for b in range(X.shape[-1]):
-            f.x.assign(X[:, b])
-            out.append(fn(b))
-        return out
-    finally:
-        f.x.assign(xsave)
 
 
 @pytest.mark.parametrize("hvp_method", ["revrev", "fwdrev"])
@@ -85,7 +73,7 @@ def test_batched_val_grad_hessp_equal_the_single_api(case, hvp_method):
 
 @pytest.mark.parametrize("from_hvp", [False, True], ids=["jacobian", "hvp"])
 @pytest.mark.parametrize(
-    "case", ["dense", "sparse", "bbb_full", "bbb_full_additive", "frozen"]
+    "case", ["dense", "sparse", "bbb_full", "bbb_full_additive", "covariance", "frozen"]
 )
 def test_batched_hessians_equal_the_single_api(case, from_hvp):
     with tempfile.TemporaryDirectory() as tmp:
@@ -161,25 +149,31 @@ def test_batch_widths_do_not_retrace_each_time():
             _, _, hessp = f.loss_val_grad_hessp_batched(X, rng.standard_normal((n, B)))
             assert hessp.shape == X.shape
             assert f.loss_val_grad_hess_batched(X)[2].shape == (n, n, B)
-        for name in ("val", "val_grad", f"val_grad_hessp_{f._batched_hvp_method()}"):
+        for name in ("val", "val_grad", "val_grad_hessp"):
             assert f._batched_fn(name).experimental_get_tracing_count() <= 2
 
 
-def test_unprofiled_batch_equals_the_single_api():
+@pytest.mark.parametrize("from_hvp", [False, True], ids=["jacobian", "hvp"])
+def test_unprofiled_batch_equals_the_single_api(from_hvp):
     with tempfile.TemporaryDirectory() as tmp:
         f = _fitter(tmp, "bbb_full")
-        X = _points(f)
-        val, grad = f.loss_val_grad_batched(X, profile=False)
-
-        def one(b):
-            with tf.GradientTape() as t:
-                v = f._compute_loss(profile=False)
-            return v, t.gradient(v, f.x)
-
-        single = _single(f, X, one)
-        for k, got in enumerate((val, grad)):
-            _close(np.stack([np.asarray(s[k]) for s in single], axis=-1), got)
-        assert not np.allclose(val, f.loss_val_batched(X))
+        f.hessian_from_hvp = from_hvp
+        f.hvp_batch = 3
+        X, P = _points(f), _directions(f)
+        got = f.loss_val_grad_hessp_batched(X, P, profile=False)
+        hess = f.loss_val_grad_hess_batched(X, profile=False)[2]
+        # the implementations at the own point, unprofiled
+        single = _single(
+            f,
+            X,
+            lambda b: f._val_grad_hessp_revrev(tf.constant(P[:, b]), profile=False)
+            + f._val_grad_hess(profile=False)[2:],
+        )
+        for k, g in enumerate(got + (hess,)):
+            _close(np.stack([np.asarray(s[k]) for s in single], axis=-1), g)
+        assert not np.allclose(got[0], f.loss_val_batched(X))
+        _close(got[0], f.loss_val_batched(X, profile=False))
+        _close(got[1], f.loss_val_grad_batched(X, profile=False)[1])
 
 
 def test_chisq_observations_with_variances():
@@ -222,8 +216,15 @@ def test_multi_device_fitters_refuse_the_batched_api():
     from rabbit.sharding import MultiDeviceFitter
 
     stub = MultiDeviceFitter.__new__(MultiDeviceFitter)
-    with pytest.raises(NotImplementedError, match="multi-device"):
-        stub.loss_val_batched(np.zeros((1, 2)))
+    X = np.zeros((1, 2))
+    for call in (
+        lambda: stub.loss_val_batched(X),
+        lambda: stub.loss_val_grad_batched(X),
+        lambda: stub.loss_val_grad_hessp_batched(X, X),
+        lambda: stub.loss_val_grad_hess_batched(X),
+    ):
+        with pytest.raises(NotImplementedError, match="multi-device"):
+            call()
 
 
 def test_hessians_without_parameters_keep_the_batch_axis():
@@ -232,7 +233,7 @@ def test_hessians_without_parameters_keep_the_batch_axis():
         f.hessian_from_hvp = True
         X = np.zeros((0, 3))
         # the loss itself needs the parameters; only the assembly is tested
-        f._batched_tf_fns["val_grad"] = lambda *a: (tf.zeros([3], tf.float64), X)
+        f._batched_tf_fns["val_grad"] = lambda *a, **k: (tf.zeros([3], tf.float64), X)
         f.x = tf.Variable(tf.zeros([0], tf.float64))
         assert f.loss_val_grad_hess_batched(X)[2].shape == (0, 0, 3)
 
@@ -243,5 +244,7 @@ def test_deepcopy_after_use():
         X = _points(f)
         val = f.loss_val_batched(X)
         g = copy.deepcopy(f)
-        assert g._batched_tf_fns == {}
+        # the copy has its own traced functions, traced on first use
+        assert g._batched_fn("val") is not f._batched_fn("val")
+        assert g._batched_fn("val").experimental_get_tracing_count() == 0
         _close(val, g.loss_val_batched(X))

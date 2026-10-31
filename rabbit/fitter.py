@@ -4773,6 +4773,71 @@ class Fitter:
     # unbound methods onto them shares the yields/NLL mathematics -- both
     # interpolation forms, both systematic types, the BBB machinery -- with
     # the single-device path by construction.
+    # The loss and its derivatives, at the fitter's own point (x=None: self.x
+    # and its observations, constraint centres and bin-by-bin stat centres)
+    # or for B independent likelihoods at the columns of x [npar, B], each
+    # with its own per-element inputs data, x0, beta0 (see
+    # _compute_nll_components). At the own point the value is the scalar
+    # loss, regularizers and MC-stat de-biasing included, differentiated by
+    # self.x; at a batch it is [B], differentiated by x, and the regularizers
+    # and the de-biasing are refused. The likelihoods of a batch share no
+    # parameters, so the gradient of their sum is every element's gradient,
+    # and one HVP with a [npar, B] tangent gives the B HVPs.
+    # _make_tf_functions wraps each of these twice: at the own point
+    # (loss_val, loss_val_grad, ...) and batched (loss_val_batched, ...).
+
+    def _loss_at(self, x, data, x0, beta0, profile):
+        if x is None:
+            return self._compute_loss(profile=profile)
+        return self._compute_nll_batched(
+            x, data=data, x0=x0, beta0=beta0, profile=profile
+        )
+
+    def _val(self, x=None, data=None, x0=None, beta0=None, profile=True):
+        return self._loss_at(x, data, x0, beta0, profile)
+
+    def _val_grad(self, x=None, data=None, x0=None, beta0=None, profile=True):
+        with tf.GradientTape() as t:
+            if x is not None:
+                t.watch(x)
+            val = self._loss_at(x, data, x0, beta0, profile)
+        return val, t.gradient(val, self.x if x is None else x)
+
+    def _val_grad_hessp_fwdrev(
+        self, p, x=None, data=None, x0=None, beta0=None, profile=True
+    ):
+        p = tf.stop_gradient(p)
+        with tf.autodiff.ForwardAccumulator(self.x if x is None else x, p) as acc:
+            val, grad = self._val_grad(x, data, x0, beta0, profile)
+        return val, grad, acc.jvp(grad)
+
+    def _val_grad_hessp_revrev(
+        self, p, x=None, data=None, x0=None, beta0=None, profile=True
+    ):
+        p = tf.stop_gradient(p)
+        with tf.GradientTape() as t2:
+            if x is not None:
+                t2.watch(x)
+            val, grad = self._val_grad(x, data, x0, beta0, profile)
+        hessp = t2.gradient(grad, self.x if x is None else x, output_gradients=p)
+        return val, grad, hessp
+
+    def _val_grad_hess(self, x=None, data=None, x0=None, beta0=None, profile=True):
+        """Value, gradient and Hessian: [npar, npar] by one tape.jacobian at
+        the own point, [npar, npar, B] by one batch_jacobian at a batch."""
+        if x is None:
+            with tf.GradientTape() as t2:
+                val, grad = self._val_grad(profile=profile)
+            return val, grad, t2.jacobian(grad, self.x)
+        # batch_jacobian wants the batch axis first
+        xT = tf.transpose(x)
+        with tf.GradientTape() as t2:
+            t2.watch(xT)
+            val, grad = self._val_grad(tf.transpose(xT), data, x0, beta0, profile)
+            gradT = tf.transpose(grad)
+        hess = t2.batch_jacobian(gradT, xT)  # [B, npar, npar]
+        return val, grad, tf.transpose(hess, [1, 2, 0])
+
     def _make_tf_functions(self):
         # Build tf.function wrappers at instance construction time so that
         # jit_compile and the HVP autodiff mode can be controlled via fit
@@ -4784,48 +4849,15 @@ class Fitter:
         # the kept set of the other de-biasing setting is now stale
         self._mcstat_tf_standby = None
 
-        def _loss_val(self):
-            return self._compute_loss()
-
-        def _loss_val_grad(self):
-            with tf.GradientTape() as t:
-                val = self._compute_loss()
-            grad = t.gradient(val, self.x)
-            return val, grad
-
-        def _loss_val_grad_hessp_fwdrev(self, p):
-            p = tf.stop_gradient(p)
-            with tf.autodiff.ForwardAccumulator(self.x, p) as acc:
-                with tf.GradientTape() as grad_tape:
-                    val = self._compute_loss()
-                grad = grad_tape.gradient(val, self.x)
-            hessp = acc.jvp(grad)
-            return val, grad, hessp
-
-        def _loss_val_grad_hessp_revrev(self, p):
-            p = tf.stop_gradient(p)
-            with tf.GradientTape() as t2:
-                with tf.GradientTape() as t1:
-                    val = self._compute_loss()
-                grad = t1.gradient(val, self.x)
-            hessp = t2.gradient(grad, self.x, output_gradients=p)
-            return val, grad, hessp
-
-        self.loss_val = tf.function(jit_compile=jit)(
-            _loss_val.__get__(self, type(self))
-        )
-        self.loss_val_grad = tf.function(jit_compile=jit)(
-            _loss_val_grad.__get__(self, type(self))
-        )
+        self.loss_val = tf.function(jit_compile=jit)(self._val)
+        self.loss_val_grad = tf.function(jit_compile=jit)(self._val_grad)
         # NOTE: fwdrev HVP is NOT jit-compiled. tf.autodiff.ForwardAccumulator
         # does not propagate JVPs through XLA-compiled subgraphs (the JVP
         # comes back as zero), regardless of inner/outer placement. The
         # loss/grad and revrev HVP wrappers are unaffected.
-        self.loss_val_grad_hessp_fwdrev = tf.function(
-            _loss_val_grad_hessp_fwdrev.__get__(self, type(self))
-        )
+        self.loss_val_grad_hessp_fwdrev = tf.function(self._val_grad_hessp_fwdrev)
         self.loss_val_grad_hessp_revrev = tf.function(jit_compile=jit)(
-            _loss_val_grad_hessp_revrev.__get__(self, type(self))
+            self._val_grad_hessp_revrev
         )
         # Called eagerly, vectorized_map retraces its pfor graph on every
         # batch, which on a large model costs more than the HVPs themselves.
@@ -4833,8 +4865,6 @@ class Fitter:
         self._hessp_batch_graph = tf.function(self._hessp_batch)
         # traced Hessians of the auxiliary scalars (_scalar_hessian)
         self._scalar_hessian_fns = {}
-        # traced functions of the batched API (_batched_fn)
-        self._batched_tf_fns = {}
         # tf.autodiff.ForwardAccumulator does not support tangent
         # propagation through SparseMatrixMatMul (no JVP rule for the
         # CSR variant), so the fwdrev HVP cannot be used in sparse mode.
@@ -4845,40 +4875,58 @@ class Fitter:
                 "(tf.autodiff.ForwardAccumulator cannot trace through "
                 "tf.linalg.sparse's CSR matmul); falling back to revrev."
             )
-            self.loss_val_grad_hessp = self.loss_val_grad_hessp_revrev
-        elif self.hvp_method == "fwdrev":
-            self.loss_val_grad_hessp = self.loss_val_grad_hessp_fwdrev
+            self._hvp_mode = "revrev"
         else:
-            self.loss_val_grad_hessp = self.loss_val_grad_hessp_revrev
+            self._hvp_mode = "fwdrev" if self.hvp_method == "fwdrev" else "revrev"
+        self.loss_val_grad_hessp = getattr(
+            self, f"loss_val_grad_hessp_{self._hvp_mode}"
+        )
+        # The same implementations batched (loss_val_batched and friends).
+        # reduce_retracing generalizes the batch width after a second one, so
+        # a stream of batch widths does not retrace each time. Not
+        # XLA-compiled: under XLA the gradient through tf.vectorized_map is
+        # recompiled whenever the values of the batched inputs change (~1 s
+        # for a dense tensor with 190 parameters), and runs slower than
+        # without XLA afterwards; a minimizer changes them on every call.
+        self._batched_tf_fns = {
+            name: tf.function(fn, jit_compile=False, reduce_retracing=True)
+            for name, fn in (
+                ("val", self._val),
+                ("val_grad", self._val_grad),
+                ("val_grad_hessp_fwdrev", self._val_grad_hessp_fwdrev),
+                ("val_grad_hessp_revrev", self._val_grad_hessp_revrev),
+                ("val_grad_hess", self._val_grad_hess),
+                ("hessp_batch", self._hessp_batch),
+            )
+        }
+        # --hvpMethod as for loss_val_grad_hessp
+        self._batched_tf_fns["val_grad_hessp"] = self._batched_tf_fns[
+            f"val_grad_hessp_{self._hvp_mode}"
+        ]
 
     # Batched API: the loss, gradient, Hessian-vector products and Hessians of
-    # B independent likelihoods at the columns of X [npar, B], each with its
-    # own per-element inputs (see _compute_nll_components). The likelihoods
-    # share no parameters, so the gradient of their sum is every element's
-    # gradient, and one HVP with a [npar, B] tangent gives the B HVPs. The
-    # fitter's own state (self.x, its observations) is left unchanged.
-    # Regularizers and the MC-stat de-biasing are only defined at the
-    # fitter's own point and are refused.
+    # B independent likelihoods at the columns of X [npar, B] (see the
+    # implementations above). The fitter's own state (self.x, its
+    # observations) is left unchanged.
 
     def loss_val_batched(self, X, data=None, x0=None, beta0=None, profile=True):
         """Loss [B] at the B columns of X [npar, B]."""
-        return self._batched_fn("val")(*self._batched_args(X, data, x0, beta0), profile)
+        fn = self._batched_fn("val")
+        return fn(*self._batched_args(X, data, x0, beta0), profile=profile)
 
     def loss_val_grad_batched(self, X, data=None, x0=None, beta0=None, profile=True):
         """Loss [B] and gradients [npar, B] at the B columns of X [npar, B]."""
-        return self._batched_fn("val_grad")(
-            *self._batched_args(X, data, x0, beta0), profile
-        )
+        fn = self._batched_fn("val_grad")
+        return fn(*self._batched_args(X, data, x0, beta0), profile=profile)
 
     def loss_val_grad_hessp_batched(
         self, X, P, data=None, x0=None, beta0=None, profile=True
     ):
         """Loss [B], gradients [npar, B] and the HVPs [npar, B] H_b P[:, b] at
         the B columns of X [npar, B] (--hvpMethod as loss_val_grad_hessp)."""
+        fn = self._batched_fn("val_grad_hessp")
         P = tf.convert_to_tensor(P, dtype=self.indata.dtype)
-        return self._batched_fn(f"val_grad_hessp_{self._batched_hvp_method()}")(
-            *self._batched_args(X, data, x0, beta0), P, profile
-        )
+        return fn(P, *self._batched_args(X, data, x0, beta0), profile=profile)
 
     def loss_val_grad_hess_batched(
         self, X, data=None, x0=None, beta0=None, profile=True
@@ -4887,19 +4935,21 @@ class Fitter:
         columns of X [npar, B]. Like loss_val_grad_hess: one batch_jacobian, or
         with --hvpBatch assembled from batches of that many HVPs (each of
         width B), which bounds the memory by the batch."""
+        fn = self._batched_fn("val_grad_hess")
         args = self._batched_args(X, data, x0, beta0)
         if not self.hessian_from_hvp:
-            return self._batched_fn("val_grad_hess")(*args, profile)
-        val, grad = self._batched_fn("val_grad")(*args, profile)
+            return fn(*args, profile=profile)
+        val, grad = self._batched_fn("val_grad")(*args, profile=profile)
         n = int(self.x.shape[0])
         if n == 0:
             # no HVP to assemble from, and none would carry the batch axis
             return val, grad, tf.zeros([0, 0, tf.shape(val)[0]], self.indata.dtype)
-        hessp = self._batched_fn("hessp_basis")
+        hessp = self._batched_fn("hessp_batch")
         hess = self._hessian_from_hvp_batches(
-            lambda basis: hessp(*args, basis, profile),
+            lambda P: hessp(P, *args, profile=profile),
             np.arange(n),
             max(1, self.hvp_batch),
+            width=int(args[0].shape[1]),
         )
         return val, grad, tf.constant(hess, dtype=self.indata.dtype)
 
@@ -4915,84 +4965,10 @@ class Fitter:
             data = tensor(data)
         return tensor(X), data, tensor(x0), tensor(beta0)
 
-    def _batched_hvp_method(self):
-        # as loss_val_grad_hessp: the fwdrev HVP has no CSR matmul JVP
-        if self.hvp_method == "fwdrev" and not self.indata.sparse:
-            return "fwdrev"
-        return "revrev"
-
     def _batched_fn(self, name):
-        """The traced function `name` of the batched API, built on first use.
-        reduce_retracing generalizes the batch width after a second one, so a
-        stream of batch widths does not retrace each time.
-
-        Not XLA-compiled: under XLA the gradient through tf.vectorized_map is
-        recompiled whenever the values of the batched inputs change (~1 s for
-        a dense tensor with 190 parameters), and runs slower than without XLA
-        afterwards; a minimizer changes them on every call."""
-        fns = self.__dict__.setdefault("_batched_tf_fns", {})
-        if name not in fns:
-            impl = getattr(self, f"_batched_{name}")
-            fns[name] = tf.function(impl, jit_compile=False, reduce_retracing=True)
-        return fns[name]
-
-    def _batched_nll(self, X, data, x0, beta0, profile):
-        return self._compute_nll_batched(
-            X, data=data, x0=x0, beta0=beta0, profile=profile
-        )
-
-    def _batched_val(self, X, data, x0, beta0, profile):
-        return self._batched_nll(X, data, x0, beta0, profile)
-
-    def _batched_val_grad(self, X, data, x0, beta0, profile):
-        with tf.GradientTape() as t:
-            t.watch(X)
-            val = self._batched_nll(X, data, x0, beta0, profile)
-        # the gradient of the sum: element b depends on column b only
-        return val, t.gradient(val, X)
-
-    def _batched_val_grad_hessp_revrev(self, X, data, x0, beta0, P, profile):
-        P = tf.stop_gradient(P)
-        with tf.GradientTape() as t2:
-            t2.watch(X)
-            with tf.GradientTape() as t1:
-                t1.watch(X)
-                val = self._batched_nll(X, data, x0, beta0, profile)
-            grad = t1.gradient(val, X)
-        return val, grad, t2.gradient(grad, X, output_gradients=P)
-
-    def _batched_val_grad_hessp_fwdrev(self, X, data, x0, beta0, P, profile):
-        P = tf.stop_gradient(P)
-        with tf.autodiff.ForwardAccumulator(X, P) as acc:
-            with tf.GradientTape() as t:
-                t.watch(X)
-                val = self._batched_nll(X, data, x0, beta0, profile)
-            grad = t.gradient(val, X)
-        return val, grad, acc.jvp(grad)
-
-    def _batched_val_grad_hess(self, X, data, x0, beta0, profile):
-        # batch_jacobian wants the batch axis first
-        XT = tf.transpose(X)
-        with tf.GradientTape() as t2:
-            t2.watch(XT)
-            with tf.GradientTape() as t1:
-                t1.watch(XT)
-                val = self._batched_nll(tf.transpose(XT), data, x0, beta0, profile)
-            gradT = t1.gradient(val, XT)
-        hess = t2.batch_jacobian(gradT, XT)  # [B, npar, npar]
-        return val, tf.transpose(gradT), tf.transpose(hess, [1, 2, 0])
-
-    def _batched_hessp_basis(self, X, data, x0, beta0, basis, profile):
-        """HVPs [k, npar, B] of every element along each of the k directions
-        basis [k, npar] (the columns of the B Hessians, as _hessp_batch)."""
-
-        def one(p):
-            P = tf.broadcast_to(p[:, None], tf.shape(X))
-            return self._batched_val_grad_hessp_revrev(X, data, x0, beta0, P, profile)[
-                2
-            ]
-
-        return tf.vectorized_map(one, basis)
+        """The batched wrapper of the implementation `name` (see
+        _make_tf_functions)."""
+        return self._batched_tf_fns[name]
 
     def loss_val_grad_hess(self, profile=True):
         """Value, gradient and dense Hessian.
@@ -5011,19 +4987,13 @@ class Fitter:
 
     @tf.function
     def _loss_val_grad_hess_jacobian(self, profile=True):
-        with tf.GradientTape() as t2:
-            with tf.GradientTape() as t1:
-                val = self._compute_loss(profile=profile)
-            grad = t1.gradient(val, self.x)
-        hess = t2.jacobian(grad, self.x)
-        return val, grad, hess
+        return self._val_grad_hess(profile=profile)
 
     @tf.function
     def _loss_val_grad_profile(self, profile=True):
-        with tf.GradientTape() as t:
-            val = self._compute_loss(profile=profile)
-        grad = t.gradient(val, self.x)
-        return val, grad
+        # not loss_val_grad: without XLA, as _loss_val_grad_hess_jacobian, so
+        # both Hessian paths return the same value and gradient
+        return self._val_grad(profile=profile)
 
     @tf.function
     def loss_val_grad_hess_beta(self, profile=True):
@@ -5091,8 +5061,10 @@ class Fitter:
         _, _, hess = self.loss_val_grad_hess()
         return hess.__array__()
 
-    def _hessp_batch(self, P, profile=True):
-        """Hessian-vector products for a batch of directions P: [k, npar].
+    def _hessp_batch(self, P, x=None, data=None, x0=None, beta0=None, profile=True):
+        """Hessian-vector products for a batch of directions P: [k, npar], at
+        the own point, or [k, npar, B] at the columns of x [npar, B] (each
+        direction for every element: the columns of the B Hessians).
 
         vectorized_map is a pfor of width k, not the while_loop that
         tape.jacobian's non-pfor path builds -- so XLA compiles it without the
@@ -5102,12 +5074,9 @@ class Fitter:
         """
 
         def one(p):
-            p = tf.stop_gradient(p)
-            with tf.GradientTape() as t2:
-                with tf.GradientTape() as t1:
-                    val = self._compute_loss(profile=profile)
-                grad = t1.gradient(val, self.x)
-            return t2.gradient(grad, self.x, output_gradients=p)
+            if x is not None:
+                p = tf.broadcast_to(p[:, None], tf.shape(x))
+            return self._val_grad_hessp_revrev(p, x, data, x0, beta0, profile)[2]
 
         return tf.vectorized_map(one, P)
 
@@ -5149,11 +5118,11 @@ class Fitter:
             v[j] = 0.0
         return out
 
-    def _hessian_from_hvp_batches(self, hessp_batch, idx, k):
+    def _hessian_from_hvp_batches(self, hessp_batch, idx, k, width=1):
         """Columns `idx` of a dense Hessian from `hessp_batch(P)`, the HVPs of a
         [k', npar] batch of directions, k columns at a time (halving k if the
         device runs out of memory). HVPs [k', npar, B] give B Hessians,
-        [npar, len(idx), B]."""
+        [npar, len(idx), B]; width is B, as each direction then costs B HVPs."""
         n = int(self.x.shape[0])
         out = None
         s0 = 0
@@ -5179,8 +5148,9 @@ class Fitter:
                 # preconditioner rebuild in the restart loop would otherwise
                 # re-discover it -- paying the same compile, allocate and
                 # unwind each time. min() so an explicit oversized batch=
-                # that shrinks cannot raise a lower standing default.
-                self.hvp_batch = min(self.hvp_batch, k)
+                # that shrinks cannot raise a lower standing default. In HVPs:
+                # a batch of B Hessians spends B per direction.
+                self.hvp_batch = min(self.hvp_batch, k * width)
                 logger.warning(
                     f"HVP batch too large for the device; retrying with "
                     f"--hvpBatch {k}"
