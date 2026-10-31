@@ -167,11 +167,15 @@ class BinByBinStat:
                     self.varbeta = self.indata.sumw2
                     self.sumw = self.indata.sumw
 
-            # sqrt(varbeta), computed once: a sqrt inside the likelihood is
-            # differentiated along with it, and its derivative is infinite
-            # where varbeta == 0 (a process without MC-stat uncertainty in a
-            # bin). Reverse-over-reverse through tf.vectorized_map (a batch of
-            # likelihoods) then turned that into NaN Hessians.
+            # sqrt(varbeta), computed once, outside the likelihood. This only
+            # matters under XLA: with jit_compile=True, tf.vectorized_map
+            # wraps its loop in a nested tf.function whose gradient is built
+            # for all of its inputs, captured constants included, so a sqrt
+            # of varbeta in the likelihood is differentiated. Its derivative
+            # is infinite where varbeta == 0 (a process without MC-stat
+            # uncertainty in a bin), and the Hessians come out NaN. The
+            # batched functions are not XLA-compiled; #216 describes native
+            # batching, which would let them be.
             self.sbeta = tf.math.sqrt(self.varbeta)
             self.betamask = (self.varbeta == 0.0) | (self.sumw == 0.0)
             if self.minBBKstat > 0.0:
