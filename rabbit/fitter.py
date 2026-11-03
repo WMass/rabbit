@@ -5712,11 +5712,21 @@ class Fitter:
                 # bought nothing: a round can never end above where it started
                 # (the trust region accepts improving steps only), so "not below
                 # the previous round" means the descent is genuinely exhausted.
+                # A non-finite loss never counts as an improvement (inf - inf is
+                # NaN, and every comparison with NaN is False: the loop would
+                # never stop); a finite one always improves on a non-finite one.
                 if (
                     prev_loss is not None
                     and last_loss is not None
-                    and last_loss
-                    >= prev_loss - RESTART_MIN_IMPROVEMENT * max(1.0, abs(prev_loss))
+                    and not (
+                        np.isfinite(last_loss)
+                        and (
+                            not np.isfinite(prev_loss)
+                            or last_loss
+                            < prev_loss
+                            - RESTART_MIN_IMPROVEMENT * max(1.0, abs(prev_loss))
+                        )
+                    )
                 ):
                     logger.info(
                         f"Restart did not reduce the loss further ({prev_loss} -> "

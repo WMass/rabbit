@@ -746,3 +746,33 @@ def test_the_cli_fails_when_the_minimizer_fails_at_the_first_call(tmp_path):
         assert "results" not in res
     with h5py.File(snap, "r") as s:
         assert s.attrs["reason"] == "minimizer-failed"
+
+
+def test_a_fit_whose_loss_is_never_finite_ends(monkeypatch, tmp_path):
+    """A loss pinned at +inf (a non-positive prediction with data) stalls
+    every round. The restarts used to go on forever under the default
+    --maxRestarts -1: inf - inf is NaN, and no comparison with NaN is True."""
+    f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=3)
+    real = f.loss_val_grad
+
+    def loss_val_grad():
+        _, grad = real()
+        return np.asarray(np.inf), grad
+
+    f.loss_val_grad = loss_val_grad
+    builds = []
+    build = f._build_preconditioner
+
+    def counting_build():
+        builds.append(1)
+        if len(builds) > 5:
+            raise AssertionError("the restart loop does not end")
+        return build()
+
+    monkeypatch.setattr(f, "_build_preconditioner", counting_build)
+    f.minimize()
+    st = f.minimizer_status()
+    assert st["status"] == STATUS_STOPPED_EARLY and st["restarts"] == 1
+    assert st["message"].endswith(
+        "The last restart did not reduce the loss further (inf -> inf)."
+    )
