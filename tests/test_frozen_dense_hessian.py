@@ -216,3 +216,37 @@ def test_contour_frozen_hessian_mode_keeps_the_frozen_parameter():
     # signed [down, up], and freezing the degenerate normalisation narrows it
     assert exact[0] < 0 < exact[1]
     assert np.all(np.abs(exact) < 0.5 * np.abs(free_exact))
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_minimizer_result_in_full_coordinates(tensor, method):
+    """minimizer_result is in the full parameter vector, like the callback and
+    the snapshots, also with a frozen parameter between floating ones."""
+    indata_obj = inputdata.FitInputData(tensor)
+    param_model = load_model("Mu", indata_obj)
+    f = fitter.Fitter(
+        indata_obj,
+        param_model,
+        make_options(
+            minimizerMethod=method, earlyStopping=20, freezeParameters=["bkg_norm"]
+        ),
+    )
+    f.set_nobs(indata_obj.data_obs)
+    idx = int(np.where(f.parms.astype(str) == "bkg_norm")[0][0])
+    npar = len(f.parms)
+    assert 0 < idx < npar - 1
+    x = f.x.numpy().copy()
+    x[idx] = 0.5
+    f.x.assign(x)
+    f.minimize()
+
+    res = f.minimizer_result
+    assert np.shape(res.x) == (npar,)
+    # internal coordinates: without --precondition, the offset from the start
+    np.testing.assert_allclose(res.x, f.x.numpy() - x, rtol=0, atol=1e-12)
+    assert res.x[idx] == 0.0
+    assert np.shape(res.jac) == (npar,)
+    assert res.jac[idx] == 0.0
+    if res.get("hess") is not None:
+        assert np.shape(res.hess) == (npar, npar)
+        assert not np.any(res.hess[idx]) and not np.any(res.hess[:, idx])

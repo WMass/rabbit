@@ -193,6 +193,25 @@ class FloatingCoordinates:
             return tf.gather(tf.gather(hess, self.idx, axis=0), self.idx, axis=1)
         return np.asarray(hess)[np.ix_(self.idx, self.idx)]
 
+    def embed_result(self, res):
+        """A minimizer's OptimizeResult -> the full vector: x embedded as by
+        embed(), jac and hess zero in the frozen entries, rows and columns (as
+        stop_gradient makes them)."""
+        if self.idx is None:
+            return res
+        res = scipy.optimize.OptimizeResult(res)
+        res.x = self.embed(res.x)
+        n = len(self.anchor)
+        if res.get("jac") is not None:
+            jac = np.zeros(n)
+            jac[self.idx] = np.asarray(res.jac)
+            res.jac = jac
+        if res.get("hess") is not None:
+            hess = np.zeros((n, n))
+            hess[np.ix_(self.idx, self.idx)] = np.asarray(res.hess)
+            res.hess = hess
+        return res
+
     def callback(self, cb):
         """``cb`` called with the iterate embedded in the full vector."""
         if self.idx is None or cb is None:
@@ -5751,7 +5770,7 @@ class Fitter:
                     logger.debug(ex)
                 else:
                     xval = floating.embed(res["x"])
-                    self.minimizer_result = res
+                    self.minimizer_result = floating.embed_result(res)
                     logger.debug(res)
 
                 callback = merge_callbacks(callback, cb)
