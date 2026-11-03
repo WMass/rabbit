@@ -250,3 +250,81 @@ def test_minimizer_result_in_full_coordinates(tensor, method):
     if res.get("hess") is not None:
         assert np.shape(res.hess) == (npar, npar)
         assert not np.any(res.hess[idx]) and not np.any(res.hess[:, idx])
+
+
+@pytest.mark.parametrize("precondition", [False, True], ids=["plain", "precondition"])
+@pytest.mark.parametrize("method", METHODS)
+def test_several_frozen_parameters(method, precondition):
+    """Two frozen parameters away from their best fit, and with --precondition
+    one block over several floating parameters: the frozen values stay
+    exactly, the floating ones reach their profile minimum."""
+    frozen_names = ["sig_norm", "bkg_norm"]
+    opts = dict(minimizerMethod=method, earlyStopping=20, freezeParameters=frozen_names)
+    if precondition:
+        opts.update(
+            precondition=True, preconditionParams=[".*"], preconditionBlocks="none"
+        )
+    with tempfile.TemporaryDirectory() as outdir:
+        indata_obj = inputdata.FitInputData(_tensor_with_signal_norm(outdir))
+        param_model = load_model("Mu", indata_obj)
+        f = fitter.Fitter(indata_obj, param_model, make_options(**opts))
+        f.set_nobs(indata_obj.data_obs)
+        names = f.parms.astype(str)
+        frozen = [int(np.where(names == p)[0][0]) for p in frozen_names]
+        x = f.x.numpy().copy()
+        x[frozen] = [0.5, -0.5]
+        f.x.assign(x)
+        if precondition:
+            # one block, over every floating parameter and nothing else
+            (block,) = f._build_preconditioner().blocks
+            np.testing.assert_array_equal(np.sort(block.idx), f.floating_indices)
+            assert block.idx.size >= 2
+        f.minimize()
+
+        np.testing.assert_array_equal(f.x.numpy()[frozen], [0.5, -0.5])
+        _, grad = f.loss_val_grad()
+        assert np.max(np.abs(grad.numpy()[f.floating_indices])) < 1e-4
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_restarts_keep_the_frozen_parameter(tensor, method, monkeypatch):
+    """A stall restart rebuilds the preconditioner where the fit stopped and
+    re-anchors the minimizer's coordinates there (set_anchor); the frozen
+    value stays exactly through the restarts."""
+    indata_obj = inputdata.FitInputData(tensor)
+    param_model = load_model("Mu", indata_obj)
+    f = fitter.Fitter(
+        indata_obj,
+        param_model,
+        make_options(
+            minimizerMethod=method,
+            freezeParameters=["bkg_norm"],
+            precondition=True,
+            preconditionParams=[".*"],
+            preconditionBlocks="none",
+            # every round counts as stalled after its second iteration
+            earlyStopping=1,
+            stallRelTol=1e6,
+            maxRestarts=4,
+        ),
+    )
+    f.set_nobs(indata_obj.data_obs)
+    builds = []
+    build = f._build_preconditioner
+
+    def counting_build():
+        builds.append(1)
+        return build()
+
+    monkeypatch.setattr(f, "_build_preconditioner", counting_build)
+    idx = int(np.where(f.parms.astype(str) == "bkg_norm")[0][0])
+    x = f.x.numpy().copy()
+    x[idx] = 0.5
+    # the floating parameters away from their best fit, so the rounds have work
+    x[f.floating_indices] += 1.0
+    f.x.assign(x)
+    f.minimize()
+
+    # the leg's transform, then one per restart
+    assert len(builds) >= 2
+    assert f.x.numpy()[idx] == 0.5
