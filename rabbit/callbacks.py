@@ -24,11 +24,20 @@ logger = logging.child_logger(__name__)
 
 # minimizer_status() codes for a round that ends because the minimizer raised,
 # where scipy returns no result of its own. scipy's codes are >= 0 and
-# method-specific (0 is success for the trust-region methods, 1 and 2 are for
-# trust-constr), and -1 is minimizer_status()'s placeholder for a result
-# without one, so these are negative.
+# method-specific (the trust-region methods: 0 success, 1 maxiter, 2 bad
+# approximation, 3 linalg error; trust-constr: 0 evaluation limit, 1 and 2
+# success, 3 callback stop, 4 constraint violation), and -1 is
+# minimizer_status()'s placeholder for a result without one, so these are
+# negative.
 STATUS_STOPPED_EARLY = -2  # --earlyStopping declared a stall
 STATUS_MINIMIZER_RAISED = -3  # a genuine failure; the fit keeps the last iterate
+
+
+class NoAcceptedStepError(RuntimeError):
+    """A fit whose minimizer raised before accepting a single step, so there
+    is no result to keep (Fitter._fit_leg). The fitter is left at its start
+    and minimizer_status() has status -3. Callers that run many fits (scans,
+    impacts, the saturated test) catch it and record NaN for that fit."""
 
 
 class FitterCallback:

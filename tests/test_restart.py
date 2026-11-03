@@ -24,6 +24,7 @@ from rabbit.callbacks import (
     STATUS_MINIMIZER_RAISED,
     STATUS_STOPPED_EARLY,
     FitterCallback,
+    NoAcceptedStepError,
     merge_callbacks,
 )
 from rabbit.param_models.helpers import load_model
@@ -553,7 +554,7 @@ def test_a_minimizer_that_fails_at_the_first_call_raises(tmp_path):
         raise _Injected("cannot evaluate the loss")
 
     f.loss_val_grad = fails
-    with pytest.raises(RuntimeError, match="never accepted a step") as err:
+    with pytest.raises(NoAcceptedStepError, match="never accepted a step") as err:
         f.minimize()
     assert isinstance(err.value.__cause__, _Injected)
     assert str(err.value) == (
@@ -579,7 +580,7 @@ def test_raising_after_rejected_steps_only_is_an_error_too(monkeypatch, tmp_path
     f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=20)
     x0 = _reject_every_step(f)
     monkeypatch.setattr(fitter, "FitterCallback", _failing_after(3))
-    with pytest.raises(RuntimeError, match="never accepted a step"):
+    with pytest.raises(NoAcceptedStepError, match="never accepted a step"):
         f.minimize()
     assert f.minimizer_status()["nit"] == 3
     np.testing.assert_array_equal(f.x.numpy(), x0)
@@ -739,7 +740,7 @@ def test_the_cli_fails_when_the_minimizer_fails_at_the_first_call(tmp_path):
     )
     assert proc.returncode != 0, proc.stderr[-2000:]
     assert (
-        "RuntimeError: Minimizer raised InjectedError: injected first-call "
+        "NoAcceptedStepError: Minimizer raised InjectedError: injected first-call "
         "failure; it never accepted a step, so the fit has no result."
     ) in proc.stderr, proc.stderr[-2000:]
     with h5py.File(out / "fitresults.hdf5", "r") as res:
@@ -776,3 +777,53 @@ def test_a_fit_whose_loss_is_never_finite_ends(monkeypatch, tmp_path):
     assert st["message"].endswith(
         "The last restart did not reduce the loss further (inf -> inf)."
     )
+
+
+def test_a_later_leg_that_fails_at_once_keeps_the_earlier_legs(tmp_path):
+    """A leg after the first (the trust-constr warm start runs several) starts
+    where the earlier ones ended, a result: failing before its first step
+    keeps it. The first leg raises."""
+    f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=20)
+    x0 = f.x.numpy().copy()
+
+    def fails():
+        raise _Injected("cannot evaluate the loss")
+
+    f.loss_val_grad = fails
+    f._fit_leg("cold", first_leg=False)
+    st = f.minimizer_status()
+    assert st["status"] == STATUS_MINIMIZER_RAISED and st["success"] is False
+    assert st["message"].endswith("; kept the last accepted iterate.")
+    np.testing.assert_array_equal(f.x.numpy(), x0)
+    with pytest.raises(NoAcceptedStepError):
+        f._fit_leg("cold")
+
+
+@pytest.mark.parametrize(
+    "release_step, legs",
+    [
+        (True, [("warm", True), ("warm", False)]),
+        (False, [("warm", True), ("release", False)]),
+    ],
+)
+def test_only_the_first_warm_start_leg_is_the_first(
+    monkeypatch, tmp_path, release_step, legs
+):
+    """fit() tells _fit_leg which leg comes first: after a warm leg that
+    stopped on a face to release, neither the next warm leg nor the release
+    leg is."""
+    f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=20)
+    calls = []
+    releasing = [[("row", 1.0, 0.1)], []]
+    monkeypatch.setattr(f, "_use_warm_start", lambda warm_start: True)
+    monkeypatch.setattr(f, "_constraint_kkt_inputs", lambda: (None,) * 7)
+    monkeypatch.setattr(fitter.tc_warm, "centred_barrier", lambda *a, **k: 1.0)
+    monkeypatch.setattr(f, "releasing_constraint_rows", lambda: releasing.pop(0))
+    monkeypatch.setattr(f, "_release_step", lambda: release_step)
+    monkeypatch.setattr(
+        f,
+        "_fit_leg",
+        lambda tc_start="cold", first_leg=True: calls.append((tc_start, first_leg)),
+    )
+    f.fit(warm_start=True)
+    assert calls == legs

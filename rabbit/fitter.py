@@ -14,7 +14,12 @@ from rabbit import preconditioner as precond
 from rabbit import tfhelpers as tfh
 from rabbit.bbstat.bbstat import BinByBinStat
 from rabbit.blinding import Blinding
-from rabbit.callbacks import RESTART_MIN_IMPROVEMENT, FitterCallback, merge_callbacks
+from rabbit.callbacks import (
+    RESTART_MIN_IMPROVEMENT,
+    FitterCallback,
+    NoAcceptedStepError,
+    merge_callbacks,
+)
 from rabbit.common import match_regexp_params
 from rabbit.constraints import postfit as constraints_postfit
 from rabbit.constraints import scipy_adapter
@@ -5255,7 +5260,11 @@ class Fitter:
                 "--minimizerInitialBarrier* override it), slacks from the "
                 "constraint values, no row held feasible"
             )
-            callback = merge_callbacks(callback, self._fit_leg("warm"))
+            # a later leg starts where the earlier ones got to: theirs is a
+            # result, which a leg failing at its first step does not discard
+            callback = merge_callbacks(
+                callback, self._fit_leg("warm", first_leg=rnd == 0)
+            )
             info["legs"].append("warm")
             bad = self.releasing_constraint_rows()
             if not bad:
@@ -5273,7 +5282,9 @@ class Fitter:
                     "[minimize] no release step; continuing from scipy's own "
                     "interior-point start (expect a detour)"
                 )
-                callback = merge_callbacks(callback, self._fit_leg("release"))
+                callback = merge_callbacks(
+                    callback, self._fit_leg("release", first_leg=False)
+                )
                 info["legs"].append("release")
                 bad = self.releasing_constraint_rows()
                 if bad:
@@ -5338,7 +5349,7 @@ class Fitter:
         self.x.assign(x0)
         return False
 
-    def _fit_leg(self, tc_start="cold"):
+    def _fit_leg(self, tc_start="cold", first_leg=True):
         """One minimisation from self.x. tc_start (trust-constr + --constraints
         only): "cold" = scipy's interior-point start with rabbit's
         keep_feasible rule; "warm" = no row held, slacks at c - lb, centred
@@ -5346,8 +5357,10 @@ class Fitter:
 
         A minimizer that raises leaves the fit at the last accepted iterate,
         or where an earlier round stalled (status -3). Only if the first round
-        raises before accepting a step is there nothing to keep: this raises
-        RuntimeError then, chained to the error, with self.x at the start."""
+        of the fit's first leg raises before accepting a step is there nothing
+        to keep: this raises NoAcceptedStepError then, chained to the error,
+        with self.x at the start. first_leg=False: an earlier leg of the same
+        fit (the trust-constr warm start) ended with a result, kept instead."""
         logger.info("Perform iterative fit")
 
         # Optional reparameterisation. Built once at the starting point, it is
@@ -5670,23 +5683,32 @@ class Fitter:
                             cb.xval, "minimizer-failed", error=str(ex)[:200]
                         )
                         # A later round keeps what the earlier ones reached
-                        # (they ended by a stall, a result in itself). The
-                        # first one has nothing to keep if it never accepted
-                        # a step -- not if it merely iterated: the callback
-                        # also runs on rejected steps, but its x only moves on
-                        # accepted ones. Carrying on would then report the
-                        # start point as the fit result, with no error, and an
-                        # error before the first step is almost always
-                        # systematic (an op the backend cannot run, a loss
-                        # that cannot be evaluated at the start).
-                        if attempt == 0 and np.array_equal(xval, xval_start):
+                        # (they ended by a stall, a result in itself), and so
+                        # does a later leg (the earlier legs ended with one).
+                        # The first round of the first leg has nothing to keep
+                        # if it never accepted a step -- not if it merely
+                        # iterated: the callback also runs on rejected steps,
+                        # but its x only moves on accepted ones. Carrying on
+                        # would then report the start point as the fit result,
+                        # with no error. For a single fit an error before the
+                        # first step is almost always systematic (an op the
+                        # backend cannot run, a loss that cannot be evaluated
+                        # at the start); the loops over many fits catch
+                        # NoAcceptedStepError and record NaN for that one.
+                        if (
+                            first_leg
+                            and attempt == 0
+                            and np.array_equal(xval, xval_start)
+                        ):
                             self.minimizer_result.message += (
                                 "; it never accepted a step, so the fit has no "
                                 "result."
                             )
                             self.minimizer_result.restarts = attempt
                             self.x.assign(pc_cell[0].to_physical(xval))
-                            raise RuntimeError(self.minimizer_result.message) from ex
+                            raise NoAcceptedStepError(
+                                self.minimizer_result.message
+                            ) from ex
                         self.minimizer_result.message += (
                             "; kept the last accepted iterate."
                         )
@@ -5801,9 +5823,10 @@ class Fitter:
         says how the restarts ended) or -3 for a minimizer that raised, with
         nit (and nfev where the method reports it, else -1) at the last
         accepted iterate. If the first round raised before accepting a step
-        there is no result, and :meth:`fit` raises instead; the status -3 is
-        still recorded. ``restarts`` counts the rounds before the last one,
-        each ended by a stall; nit and nfev cover the last round only.
+        there is no result, and :meth:`fit` raises NoAcceptedStepError
+        instead; the status -3 is still recorded. ``restarts`` counts the
+        rounds before the last one, each ended by a stall; nit and nfev cover
+        the last round only.
         """
         res = self.minimizer_result
         if res is None:
