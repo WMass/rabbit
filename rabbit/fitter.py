@@ -4945,11 +4945,13 @@ class Fitter:
             # no HVP to assemble from, and none would carry the batch axis
             return val, grad, tf.zeros([0, 0, tf.shape(val)[0]], self.indata.dtype)
         hessp = self._batched_fn("hessp_batch")
+        width = int(args[0].shape[1])
         hess = self._hessian_from_hvp_batches(
             lambda P: hessp(P, *args, profile=profile),
             np.arange(n),
-            max(1, self.hvp_batch),
-            width=int(args[0].shape[1]),
+            # hvp_batch counts HVPs, and each direction here costs B of them
+            max(1, self.hvp_batch // width),
+            width=width,
         )
         return val, grad, tf.constant(hess, dtype=self.indata.dtype)
 

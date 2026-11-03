@@ -50,8 +50,9 @@ def _directions(f, seed=2):
 @pytest.mark.parametrize("case", CASES)
 def test_batched_val_grad_hessp_equal_the_single_api(case, hvp_method):
     with tempfile.TemporaryDirectory() as tmp:
-        f = _fitter(tmp, case)
-        f.hvp_method = hvp_method
+        # through the options: the HVP mode is chosen when the fitter is built
+        f = _fitter(tmp, case, hvpMethod=hvp_method)
+        assert f._hvp_mode == ("revrev" if f.indata.sparse else hvp_method)
         X, P = _points(f), _directions(f)
         x = f.x.numpy()
         val, grad, hessp = f.loss_val_grad_hessp_batched(X, P)
@@ -79,7 +80,7 @@ def test_batched_hessians_equal_the_single_api(case, from_hvp):
     with tempfile.TemporaryDirectory() as tmp:
         f = _fitter(tmp, case)
         f.hessian_from_hvp = from_hvp
-        f.hvp_batch = 3  # several basis batches
+        f.hvp_batch = 2 * NBATCH  # two directions per batch, several batches
         X = _points(f)
         val, grad, hess = f.loss_val_grad_hess_batched(X)
         n = f.x.shape[0]
@@ -88,6 +89,24 @@ def test_batched_hessians_equal_the_single_api(case, from_hvp):
         single = _single(f, X, lambda b: f.loss_val_grad_hess())
         for k, got in enumerate((val, grad, hess)):
             _close(np.stack([np.asarray(s[k]) for s in single], axis=-1), got)
+
+
+def test_batched_hessian_batches_count_hvps():
+    """--hvpBatch counts HVPs: a direction at a batch of B costs B of them."""
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitter(tmp, "dense")
+        f.hessian_from_hvp = True
+        f.hvp_batch = 2 * NBATCH
+        seen = []
+        build = f._hessian_from_hvp_batches
+
+        def spy(hessp_batch, idx, k, width=1):
+            seen.append((k, width))
+            return build(hessp_batch, idx, k, width=width)
+
+        f._hessian_from_hvp_batches = spy
+        f.loss_val_grad_hess_batched(_points(f))
+        assert seen == [(2, NBATCH)]
 
 
 # not gamma in full mode: a toy can draw a zero constraint centre, where that

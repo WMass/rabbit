@@ -147,14 +147,14 @@ CASES = {
 }
 
 
-def _fitter(outdir, case):
+def _fitter(outdir, case, **options):
     spec = CASES[case]
     indata = inputdata.FitInputData(_tensor(outdir, **spec.get("tensor", {})))
     model = load_model("Mu", indata, expectSignal=[("sig", 1.3)])
     f = fitter.Fitter(
         indata,
         model,
-        make_options(**spec.get("options", {})),
+        make_options(**{**spec.get("options", {}), **options}),
         do_blinding=spec.get("blinded", False),
     )
     f.set_nobs(indata.data_obs)
