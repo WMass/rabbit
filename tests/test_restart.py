@@ -827,3 +827,217 @@ def test_only_the_first_warm_start_leg_is_the_first(
     )
     f.fit(warm_start=True)
     assert calls == legs
+
+
+# Loops over many fits used to survive a fit that could not take a step, by
+# keeping its start point as a result. They catch NoAcceptedStepError now and
+# record NaN for that fit; a single fit still raises.
+
+
+def _fitted_with_cov(filename, **kw):
+    """A fit and its covariance, which nll_scan reads to place the points."""
+    from rabbit.tfhelpers import edmval_cov
+
+    f = _fitter(filename, **kw)
+    f.minimize()
+    _, grad, hess = f.loss_val_grad_hess()
+    _, cov = edmval_cov(grad, hess)
+    f.cov.assign(cov)
+    return f
+
+
+def _fails_beyond(f, idx, limit):
+    """Make the loss impossible to evaluate wherever x[idx] > limit, as
+    negative yields under --allowNegativeParam can."""
+    real = f.loss_val_grad
+
+    def loss_val_grad():
+        if f.x.numpy()[idx] > limit:
+            raise _Injected("cannot evaluate the loss here")
+        return real()
+
+    f.loss_val_grad = loss_val_grad
+
+
+def _index(f, name):
+    return int(np.where(f.parms.astype(str) == name)[0][0])
+
+
+def test_a_scan_records_nan_where_the_fit_never_starts():
+    """The scan points above a limit cannot be fitted: they get NaN, with
+    their status and message in the detail, the others are fitted, and the
+    scan restores the fitter."""
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitted_with_cov(make_test_tensor(tmp), earlyStopping=20)
+        idx = _index(f, "sig")
+        xbest = f.x.numpy().copy()
+        sigma = float(np.sqrt(f.cov[idx, idx]))
+        limit = xbest[idx] + 1.5 * sigma
+        _fails_beyond(f, idx, limit)
+        vals, dnlls, detail = f.nll_scan("sig", 3.0, 7, save_detail=True)
+
+        beyond = vals > limit
+        assert beyond.sum() == 2  # the +2 and +3 sigma points
+        assert np.all(np.isnan(dnlls[beyond]))
+        assert np.all(np.isfinite(dnlls[~beyond]))
+        # every point keeps its value, the failed ones included
+        np.testing.assert_allclose(np.diff(vals), sigma, rtol=1e-10)
+        fields = list(f.SCAN_DETAIL_FIELDS)
+        diag = detail["diagnostics"]
+        assert np.all(diag[beyond, fields.index("status")] == STATUS_MINIMIZER_RAISED)
+        assert np.all(np.isnan(diag[beyond, fields.index("edmval")]))
+        for i in np.flatnonzero(beyond):
+            assert "never accepted a step" in detail["messages"][i]
+        # back at the caller's minimum, with sig floating again
+        np.testing.assert_array_equal(f.x.numpy(), xbest)
+        assert idx in f.floating_indices
+
+
+def test_a_2d_scan_records_nan_where_the_fit_never_starts():
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitted_with_cov(make_test_tensor(tmp), earlyStopping=20)
+        i0, i1 = _index(f, "sig"), _index(f, "bkg_norm")
+        xbest = f.x.numpy().copy()
+        limit = xbest[i0] + 0.5 * float(np.sqrt(f.cov[i0, i0]))
+        _fails_beyond(f, i0, limit)
+        xs, _, dnlls = f.nll_scan2D(("sig", "bkg_norm"), 1.0, 3)
+
+        beyond = np.asarray(xs) > limit
+        assert beyond.sum() == 1
+        assert np.all(np.isnan(dnlls[beyond]))
+        assert np.all(np.isfinite(dnlls[~beyond]))
+        np.testing.assert_array_equal(f.x.numpy(), xbest)
+        assert i0 in f.floating_indices and i1 in f.floating_indices
+
+
+def test_a_scan_restores_the_fitter_when_a_fit_raises_otherwise():
+    """Any other error propagates, but the scan still leaves the fitter as it
+    found it: at the caller's point, with the parameter floating again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitted_with_cov(make_test_tensor(tmp), earlyStopping=20)
+        idx = _index(f, "sig")
+        xbest = f.x.numpy().copy()
+        real_fit = f.fit
+        calls = []
+
+        def fit(warm_start=False):
+            calls.append(warm_start)
+            if len(calls) == 2:
+                raise _Injected("something else")
+            return real_fit(warm_start=warm_start)
+
+        f.fit = fit
+        with pytest.raises(_Injected):
+            f.nll_scan("sig", 2.0, 5)
+        np.testing.assert_array_equal(f.x.numpy(), xbest)
+        assert idx in f.floating_indices
+
+
+def test_asymmetric_impacts_are_nan_for_a_refit_that_never_starts():
+    """Not zero, which would read as no impact and enter the group totals as
+    such: NaN for that impact, and for the groups and the total with it."""
+    from rabbit.impacts.global_asym_impacts import global_asym_impacts_parms
+
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitter(make_test_tensor(tmp), earlyStopping=20)
+        f.minimize()
+        inorm, ishape = _index(f, "bkg_norm"), _index(f, "bkg_shape")
+        x_nom, x0_nom = f.x.numpy().copy(), f.x0.numpy().copy()
+        real = f.minimize
+
+        def minimize(*args, **kwargs):
+            # the refit with bkg_norm's centre shifted down cannot take a step
+            if f.x0.numpy()[inorm] < x0_nom[inorm]:
+                raise NoAcceptedStepError("injected")
+            return real(*args, **kwargs)
+
+        f.minimize = minimize
+        _, impacts, groups, grouped = global_asym_impacts_parms(
+            f,
+            [inorm, ishape],
+            [b"bkg_norm", b"bkg_shape"],
+            group_members={b"bkg": [inorm, ishape], b"shape": [ishape]},
+        )
+        np.testing.assert_array_equal(f.x.numpy(), x_nom)
+        np.testing.assert_array_equal(f.x0.numpy(), x0_nom)
+
+    assert np.all(np.isnan(impacts[0, 0]))
+    assert np.all(np.isfinite(impacts[0, 1])) and np.all(np.isfinite(impacts[1]))
+    groups = list(groups)
+    assert np.all(np.isnan(grouped[groups.index(b"bkg")]))
+    assert np.all(np.isnan(grouped[groups.index(b"Total")]))
+    assert np.all(np.isfinite(grouped[groups.index(b"shape")]))
+
+
+_SATURATED_FIT_FAILS = """
+import runpy
+import sys
+
+from rabbit import fitter
+
+
+class InjectedError(Exception):
+    pass
+
+
+def fails():
+    raise InjectedError("injected saturated-fit failure")
+
+
+make_tf_functions = fitter.Fitter._make_tf_functions
+
+
+def make_failing_tf_functions(self):
+    make_tf_functions(self)
+    # only the composite fitter of --computeSaturatedProjectionTests
+    if type(self.param_model).__name__ == "CompositeParamModel":
+        self.loss_val_grad = fails
+
+
+fitter.Fitter._make_tf_functions = make_failing_tf_functions
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+def test_the_cli_keeps_the_fit_when_the_saturated_test_cannot_start(tmp_path):
+    """End to end: a saturated sub-fit that cannot take a step no longer takes
+    the main fit's results with it. Its statistic is NaN, and its status says
+    why."""
+    filename = make_test_tensor(str(tmp_path))
+    rabbit_fit = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bin",
+        "rabbit_fit.py",
+    )
+    out = tmp_path / "out"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _SATURATED_FIT_FAILS,
+            rabbit_fit,
+            filename,
+            "-o",
+            str(out),
+            "-t",
+            "0",
+            "--saveHists",
+            "--computeSaturatedProjectionTests",
+            "-m",
+            "Project",
+            "ch0",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    res = io_tools.get_fitresult(str(out / "fitresults.hdf5"))
+    (sat,) = res["mappings"].values()
+    assert np.isnan(sat["chi2_saturated"])
+    st = sat["saturated_fit"]["minimizer_status"]
+    assert st["status"] == STATUS_MINIMIZER_RAISED
+    assert "never accepted a step" in st["message"]
+    # the main fit is there
+    assert res["minimizer_status"]["status"] != STATUS_MINIMIZER_RAISED
+    assert np.all(np.isfinite(res["parms"].get().values()))

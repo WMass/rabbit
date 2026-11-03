@@ -6029,9 +6029,6 @@ class Fitter:
         # make a likelihood scan for a single parameter
         # assuming the likelihood is minimized
 
-        # freeze minimize which mean to not update it in the fit
-        self.freeze_params(param)
-
         idx = np.where(self.parms.astype(str) == param)[0][0]
 
         # store current state of x temporarily
@@ -6055,29 +6052,34 @@ class Fitter:
         else:
             detail = None
 
-        def _record(islot, wall_s):
+        def _record(islot, wall_s, fitted=True):
             """Per-point parameter vector and convergence diagnostics.
 
             Costs one gradient evaluation plus one CG solve against the
             Hessian -- small next to the point's own profile minimisation
             (tens of trust-region iterations), but not free, which is why it
-            is opt-in.
+            is opt-in. A point whose fit never accepted a step (fitted=False)
+            keeps its minimizer status and message; the measures that would
+            evaluate the loss there are NaN.
             """
             detail["x"][islot] = self.x.numpy()
-            _, grad = self.loss_val_grad()
-            # frozen parameters enter the loss through tf.stop_gradient, so
-            # their gradient entries and Hessian rows/columns are exactly zero:
-            # both numbers below only see the parameters that were minimised
-            try:
-                edmval = self.edmval_cov_rows_hessfree(grad, [])[0]
-            except ValueError as e:
-                # one bad point should not lose the scan
-                logger.warning(f"{e}; reporting NaN edmval for this scan point")
-                edmval = float("nan")
+            edmval = grad_max_abs = float("nan")
+            if fitted:
+                _, grad = self.loss_val_grad()
+                # frozen parameters enter the loss through tf.stop_gradient, so
+                # their gradient entries and Hessian rows/columns are exactly
+                # zero: both numbers below only see the parameters that were
+                # minimised
+                try:
+                    edmval = self.edmval_cov_rows_hessfree(grad, [])[0]
+                except ValueError as e:
+                    # one bad point should not lose the scan
+                    logger.warning(f"{e}; reporting NaN edmval for this scan point")
+                grad_max_abs = float(np.max(np.abs(grad.numpy()), initial=0.0))
             status = self.minimizer_status() or {}
             values = {
                 "edmval": edmval,
-                "grad_max_abs": float(np.max(np.abs(grad.numpy()), initial=0.0)),
+                "grad_max_abs": grad_max_abs,
                 "success": float(status.get("success", np.nan)),
                 "status": float(status.get("status", np.nan)),
                 "nit": float(status.get("nit", np.nan)),
@@ -6088,49 +6090,61 @@ class Fitter:
                 detail["diagnostics"][islot, k] = values[field]
             detail["messages"][islot] = str(status.get("message", ""))
 
-        # save delta nll w.r.t. global minimum
-        nll_best = self.reduced_nll().numpy()
-        # set central point
-        dnlls[nscans // 2] = 0
-        scan_vals[nscans // 2] = xval[idx].numpy()
-        if save_detail:
-            # no fit runs here: the caller's minimum IS the central point, so
-            # its minimizer_status belongs to whatever fit produced it
-            _record(nscans // 2, float("nan"))
-        # scan positive side and negative side independently to profit from previous step
-        for sign in [-1, 1]:
-            param_scan_values = xval[idx].numpy() + sign * param_offsets
-            for i, ixval in enumerate(param_scan_values):
-                if i == 0:
-                    continue
+        # freeze minimize which mean to not update it in the fit
+        self.freeze_params(param)
+        try:
+            # save delta nll w.r.t. global minimum
+            nll_best = self.reduced_nll().numpy()
+            # set central point
+            dnlls[nscans // 2] = 0
+            scan_vals[nscans // 2] = xval[idx].numpy()
+            if save_detail:
+                # no fit runs here: the caller's minimum IS the central point,
+                # so its minimizer_status belongs to whatever fit produced it
+                _record(nscans // 2, float("nan"))
+            # scan positive side and negative side independently to profit from previous step
+            for sign in [-1, 1]:
+                param_scan_values = xval[idx].numpy() + sign * param_offsets
+                for i, ixval in enumerate(param_scan_values):
+                    if i == 0:
+                        continue
 
-                logger.debug(f"Now at i={i} x={ixval}")
-                self.x.assign(tf.tensor_scatter_nd_update(self.x, [[idx]], [ixval]))
+                    logger.debug(f"Now at i={i} x={ixval}")
+                    islot = nscans // 2 + sign * i
+                    scan_vals[islot] = ixval
+                    self.x.assign(tf.tensor_scatter_nd_update(self.x, [[idx]], [ixval]))
 
-                _t0 = time.perf_counter()
-                self.fit(warm_start=True)
-                _wall = time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+                    try:
+                        self.fit(warm_start=True)
+                        fitted = True
+                    except NoAcceptedStepError as e:
+                        # a point the model cannot be fitted at (e.g. negative
+                        # yields with --allowNegativeParam) should not lose the
+                        # scan: NaN there, and the next point starts from here
+                        logger.warning(
+                            f"Scan of {param} at {ixval}: {e} Recording NaN."
+                        )
+                        fitted = False
+                    _wall = time.perf_counter() - _t0
 
-                islot = nscans // 2 + sign * i
-                dnlls[islot] = self.reduced_nll().numpy() - nll_best
+                    if fitted:
+                        dnlls[islot] = self.reduced_nll().numpy() - nll_best
 
-                scan_vals[islot] = ixval
+                    if save_detail:
+                        _record(islot, _wall, fitted)
 
-                if save_detail:
-                    _record(islot, _wall)
-
-            # reset x to original state
+                # reset x to original state
+                self.x.assign(xval)
+        finally:
+            # the caller's state again, whatever a fit raised
             self.x.assign(xval)
-
-        # let the parameter be free again
-        self.defreeze_params(param)
+            # let the parameter be free again
+            self.defreeze_params(param)
 
         return scan_vals, dnlls, detail
 
     def nll_scan2D(self, param_tuple, scan_range, scan_points, use_prefit=False):
-
-        # freeze minimize which mean to not update it in the fit
-        self.freeze_params(param_tuple)
 
         idx0 = np.where(self.parms.astype(str) == param_tuple[0])[0][0]
         idx1 = np.where(self.parms.astype(str) == param_tuple[1])[0][0]
@@ -6147,55 +6161,66 @@ class Fitter:
 
         best_fit = (scan_points + 1) // 2 - 1
         dnlls = np.full((len(x_scans), len(y_scans)), np.nan)
-        nll_best = self.reduced_nll().numpy()
-        dnlls[best_fit, best_fit] = 0
-        # scan in a spiral around the best fit point
-        dcol = -1
-        drow = 0
-        i = 0
-        j = 0
-        r = 1
-        while r - 1 < best_fit:
-            if i == r and drow == 1:
-                drow = 0
-                dcol = 1
-            if j == r and dcol == 1:
-                dcol = 0
-                drow = -1
-            elif i == -r and drow == -1:
-                dcol = -1
-                drow = 0
-            elif j == -r and dcol == -1:
-                drow = 1
-                dcol = 0
 
-            i += drow
-            j += dcol
+        # freeze minimize which mean to not update it in the fit
+        self.freeze_params(param_tuple)
+        try:
+            nll_best = self.reduced_nll().numpy()
+            dnlls[best_fit, best_fit] = 0
+            # scan in a spiral around the best fit point
+            dcol = -1
+            drow = 0
+            i = 0
+            j = 0
+            r = 1
+            while r - 1 < best_fit:
+                if i == r and drow == 1:
+                    drow = 0
+                    dcol = 1
+                if j == r and dcol == 1:
+                    dcol = 0
+                    drow = -1
+                elif i == -r and drow == -1:
+                    dcol = -1
+                    drow = 0
+                elif j == -r and dcol == -1:
+                    drow = 1
+                    dcol = 0
 
-            if i == -r and j == -r:
-                r += 1
+                i += drow
+                j += dcol
 
-            ix = best_fit - i
-            iy = best_fit + j
+                if i == -r and j == -r:
+                    r += 1
 
-            logger.debug(
-                f"Now at (ix,iy) = ({ix},{iy}) (x,y)= ({x_scans[ix]},{y_scans[iy]})"
-            )
+                ix = best_fit - i
+                iy = best_fit + j
 
-            self.x.assign(
-                tf.tensor_scatter_nd_update(
-                    self.x, [[idx0], [idx1]], [x_scans[ix], y_scans[iy]]
+                logger.debug(
+                    f"Now at (ix,iy) = ({ix},{iy}) (x,y)= ({x_scans[ix]},{y_scans[iy]})"
                 )
-            )
 
-            self.fit(warm_start=True)
+                self.x.assign(
+                    tf.tensor_scatter_nd_update(
+                        self.x, [[idx0], [idx1]], [x_scans[ix], y_scans[iy]]
+                    )
+                )
 
-            dnlls[ix, iy] = self.reduced_nll().numpy() - nll_best
+                try:
+                    self.fit(warm_start=True)
+                except NoAcceptedStepError as e:
+                    # as in nll_scan: NaN at this point, the scan goes on
+                    logger.warning(
+                        f"Scan of {param_tuple} at ({float(x_scans[ix])}, "
+                        f"{float(y_scans[iy])}): {e} Recording NaN."
+                    )
+                    continue
 
-        self.x.assign(xval)
-
-        # let the parameter be free again
-        self.defreeze_params(param_tuple)
+                dnlls[ix, iy] = self.reduced_nll().numpy() - nll_best
+        finally:
+            self.x.assign(xval)
+            # let the parameter be free again
+            self.defreeze_params(param_tuple)
 
         return x_scans, y_scans, dnlls
 

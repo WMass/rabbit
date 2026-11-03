@@ -26,6 +26,7 @@ import numpy as np
 from scipy.stats import chi2
 
 from rabbit import fitter, inputdata, parsing, snapshot, workspace
+from rabbit.callbacks import NoAcceptedStepError
 from rabbit.constraints import helpers as ch
 from rabbit.constraints import postfit as cpostfit
 from rabbit.mappings import helpers as mh
@@ -595,9 +596,34 @@ def save_hists(args, mappings, fitter, ws, prefit=True, profile=False, blind=Fal
                     # the start above is already the main (de-biased) fit's
                     # minimum, which q >= 0 relies on: warm (trust-constr only),
                     # no MC-stat ordinary-likelihood leg
-                    cb = fitter_saturated.minimize(
-                        warm_start=True, mcstat_warm_start=False
-                    )
+                    try:
+                        cb = fitter_saturated.minimize(
+                            warm_start=True, mcstat_warm_start=False
+                        )
+                    except NoAcceptedStepError as e:
+                        # the main fit's results stand without this test: NaN
+                        # for its statistic, and its status says why
+                        logger.warning(
+                            f"Skipping the saturated test of '{mapping.key}': {e}"
+                        )
+                        ws.add_chi2(
+                            float("nan"),
+                            saturated_model.npou,
+                            prefit,
+                            mapping,
+                            saturated=True,
+                        )
+                        if fitter_saturated.mcstat_debias_active:
+                            ws.add_value(
+                                float("nan"), "mcstat_pvalue_saturated", mapping.key
+                            )
+                        ws.add_minimizer_status(
+                            fitter_saturated.minimizer_status(),
+                            mapping_key=mapping.key,
+                            group="saturated_fit",
+                        )
+                        saturated_ok = False
+                if saturated_ok:
                     cov_saturated = None
                     edmval = None
                     if not args.noHessian:
