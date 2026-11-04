@@ -147,14 +147,14 @@ CASES = {
 }
 
 
-def _fitter(outdir, case):
+def _fitter(outdir, case, **options):
     spec = CASES[case]
     indata = inputdata.FitInputData(_tensor(outdir, **spec.get("tensor", {})))
     model = load_model("Mu", indata, expectSignal=[("sig", 1.3)])
     f = fitter.Fitter(
         indata,
         model,
-        make_options(**spec.get("options", {})),
+        make_options(**{**spec.get("options", {}), **options}),
         do_blinding=spec.get("blinded", False),
     )
     f.set_nobs(indata.data_obs)
@@ -172,13 +172,13 @@ def _points(f, seed=1):
 
 
 def _single(f, X, fn):
-    """fn() at each column of X, with self.x restored afterwards."""
+    """fn(b) at each column b of X, with self.x restored afterwards."""
     xsave = f.x.numpy()
     try:
         out = []
         for b in range(X.shape[-1]):
             f.x.assign(X[:, b])
-            out.append(fn())
+            out.append(fn(b))
         return out
     finally:
         f.x.assign(xsave)
@@ -194,12 +194,14 @@ def test_batch_equals_single_evaluations(case, full_nll):
             pytest.skip("BinByBinStat.lbeta has no full_nll for normal-multiplicative")
         X = _points(f)
         batched = f._compute_nll_batched(tf.constant(X), full_nll=full_nll).numpy()
-        single = _single(f, X, lambda: float(f._compute_nll(full_nll=full_nll).numpy()))
+        single = _single(
+            f, X, lambda b: float(f._compute_nll(full_nll=full_nll).numpy())
+        )
         assert batched.shape == (NBATCH,)
         np.testing.assert_allclose(batched, single, rtol=RTOL, atol=0)
         if not full_nll:
             # and the traced (jit-compiled where enabled) loss agrees too
-            traced = _single(f, X, lambda: float(f.loss_val().numpy()))
+            traced = _single(f, X, lambda b: float(f.loss_val().numpy()))
             np.testing.assert_allclose(batched, traced, rtol=1e-11, atol=0)
 
 
@@ -215,7 +217,7 @@ def test_gradient_of_the_sum_is_the_per_point_gradient(case):
             tape.watch(X)
             total = tf.reduce_sum(f._compute_nll_batched(X))
         grads = tape.gradient(total, X).numpy()
-        single = _single(f, X.numpy(), lambda: f.loss_val_grad()[1].numpy())
+        single = _single(f, X.numpy(), lambda b: f.loss_val_grad()[1].numpy())
         for b in range(NBATCH):
             np.testing.assert_allclose(grads[:, b], single[b], rtol=1e-9, atol=1e-10)
 
@@ -237,7 +239,9 @@ def _fits_to(f, X, assign, restore):
     try:
         for b in range(X.shape[-1]):
             assign(b)
-            single.append(_single(f, X[:, b : b + 1], f._compute_nll)[0].numpy())
+            single.append(
+                _single(f, X[:, b : b + 1], lambda b: f._compute_nll())[0].numpy()
+            )
     finally:
         restore()
     return np.array(single)
@@ -428,7 +432,9 @@ def test_per_element_constraint_centres():
         try:
             for b in range(NBATCH):
                 f.x0.assign(x0[:, b])
-                single.append(_single(f, X[:, b : b + 1], f._compute_nll)[0].numpy())
+                single.append(
+                    _single(f, X[:, b : b + 1], lambda b: f._compute_nll())[0].numpy()
+                )
         finally:
             f.x0.assign(x00)
         np.testing.assert_allclose(batched, single, rtol=RTOL, atol=0)
@@ -440,7 +446,7 @@ def test_unprofiled_batch_equals_single_evaluations(case):
         f = _fitter(tmp, case)
         X = _points(f)
         batched = f._compute_nll_batched(tf.constant(X), profile=False).numpy()
-        single = _single(f, X, lambda: float(f._compute_nll(profile=False).numpy()))
+        single = _single(f, X, lambda b: float(f._compute_nll(profile=False).numpy()))
         np.testing.assert_allclose(batched, single, rtol=RTOL, atol=0)
 
 
@@ -475,7 +481,7 @@ def test_sparse_yields_broadcast_rates_like_dense(rate_shape, masked):
             f.set_nobs(indata.data_obs)
             X = _points(f)
             nlls[sparse] = f._compute_nll_batched(tf.constant(X)).numpy()
-            single = _single(f, X, lambda: float(f._compute_nll().numpy()))
+            single = _single(f, X, lambda b: float(f._compute_nll().numpy()))
             np.testing.assert_allclose(nlls[sparse], single, rtol=RTOL, atol=0)
         np.testing.assert_allclose(nlls[True], nlls[False], rtol=1e-12, atol=0)
 
