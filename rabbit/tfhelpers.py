@@ -151,7 +151,7 @@ def tf_edmval(grad, hess):
     # Compute EDM = 0.5 * g^T x
     edm = 0.5 * tf.squeeze(tf.matmul(tf.transpose(grad), x))
 
-    return edmval
+    return edm
 
 
 def edmval(grad, hess):
@@ -164,7 +164,9 @@ def edmval(grad, hess):
 
 def cond_number(hess):
     if is_on_gpu(hess):
-        return tf.linalg.cond(hess)
+        # 2-norm condition number, as numpy.linalg.cond (tf has no cond)
+        s = tf.linalg.svd(hess, compute_uv=False)
+        return s[0] / s[-1]
     else:
         return scipy_cond_number(hess.__array__())
 
