@@ -24,6 +24,7 @@ from rabbit.common import match_regexp_params
 from rabbit.constraints import postfit as constraints_postfit
 from rabbit.constraints import scipy_adapter
 from rabbit.constraints import warm_start as tc_warm
+from rabbit.floating_coordinates import FloatingCoordinates
 from rabbit.impacts import (
     asym_impacts,
     global_asym_impacts,
@@ -71,6 +72,10 @@ def make_fitter(indata, param_model, options, **kwargs):
 # scipy methods that honour hard constraints (--constraints,
 # rabbit.constraints.Constraints).
 CONSTRAINED_METHODS = ("trust-constr",)
+
+# Minimizers that solve their subproblem with the dense Hessian. With frozen
+# parameters they iterate over the floating ones only (FloatingCoordinates).
+DENSE_HESSIAN_METHODS = ("trust-exact", "dogleg", "tf-trust-exact")
 
 # Options from --minimizerMaxiter/--minimizerGtol/--minimizerFtol that each
 # native minimizer actually reads. Anything else passed for these methods is
@@ -3645,6 +3650,7 @@ class Fitter:
             self.x,
             self.x0,
             self.frozen_indices,
+            self.floating_indices,
             self.frozen_params,
             self.cw,
             self.indata.systgroups,
@@ -5487,9 +5493,21 @@ class Fitter:
         # below must pick the new one up.
         pc_cell = [self._build_preconditioner()]
 
+        # With frozen parameters the dense-Hessian minimizers iterate over the
+        # floating ones only (see FloatingCoordinates): scipy_loss, scipy_hess,
+        # native_loss and native_closure take and return their coordinates.
+        # The identity for every other minimizer, and with nothing frozen.
+        floating = FloatingCoordinates(
+            self.floating_indices
+            if self.minimizer_method in DENSE_HESSIAN_METHODS
+            and len(self.frozen_indices)
+            and len(self.floating_indices)
+            else None
+        )
+
         def scipy_loss(yval):
             pc = pc_cell[0]
-            self.x.assign(pc.to_physical(yval))
+            self.x.assign(pc.to_physical(floating.embed(yval)))
             val, grad = self.loss_val_grad()
             val = val.__array__()
             if not np.isfinite(val):
@@ -5503,7 +5521,7 @@ class Fitter:
                 # shrinks, as in the native minimizers (rabbit.minimizer.base).
                 return np.inf, np.zeros_like(yval)
             grad_y = pc.grad_to_internal(grad.__array__())
-            return val, grad_y
+            return val, floating.restrict(grad_y)
 
         def scipy_hessp(yval, pval):
             pc = pc_cell[0]
@@ -5515,16 +5533,21 @@ class Fitter:
 
             return pc.hessp_to_internal(np.asarray(pval, dtype=np.float64), hvp)
 
+        def log_diagnostics(grad, hess):
+            # on the floating block: a frozen parameter's zero row and column
+            # make the full Hessian singular, and the solve in edmval would
+            # raise and end the fit at its start point
+            grad, hess = floating.restrict(grad), floating.restrict_hess(hess)
+            logger.info(f"  - Condition number: {tfh.cond_number(hess)}")
+            logger.info(f"  - edmval: {tfh.edmval(grad, hess)}")
+
         def scipy_hess(yval):
             pc = pc_cell[0]
-            self.x.assign(pc.to_physical(yval))
+            self.x.assign(pc.to_physical(floating.embed(yval)))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
-            return pc.hess_to_internal(hess.__array__())
+                log_diagnostics(grad, hess)
+            return floating.restrict_hess(pc.hess_to_internal(hess.__array__()))
 
         # Native (TF) minimizer counterparts of the callbacks above. Same
         # contract and the same internal coordinates, but the gradient and
@@ -5532,22 +5555,19 @@ class Fitter:
         # the device, and the subproblem factorizes there either way.
         def native_loss(yval):
             pc = pc_cell[0]
-            self.x.assign(pc.to_physical(yval))
+            self.x.assign(pc.to_physical(floating.embed(yval)))
             return float(self.loss_val())
 
         def native_closure(yval):
             pc = pc_cell[0]
-            self.x.assign(pc.to_physical(yval))
+            self.x.assign(pc.to_physical(floating.embed(yval)))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
+                log_diagnostics(grad, hess)
             if pc.enabled:
                 grad = tf.constant(pc.grad_to_internal(grad.__array__()))
                 hess = tf.constant(pc.hess_to_internal(hess.__array__()))
-            return float(val), grad, hess
+            return float(val), floating.restrict(grad), floating.restrict_hess(hess)
 
         def native_grad_closure(yval):
             pc = pc_cell[0]
@@ -5585,6 +5605,7 @@ class Fitter:
         # scipy works in internal coordinates throughout; y = 0 at the point the
         # transform was built.
         xval = pc_cell[0].from_physical(self.x.numpy())
+        floating.set_anchor(xval)
 
         if len(self.constraints) and self.minimizer_method not in CONSTRAINED_METHODS:
             raise ValueError(
@@ -5733,10 +5754,10 @@ class Fitter:
                         res = minimize_trust_exact(
                             native_loss,
                             native_closure,
-                            xval,
+                            floating.restrict(xval),
                             gtol=sci_opts.get("gtol", 0.0),
                             maxiter=sci_opts.get("maxiter"),
-                            callback=cb,
+                            callback=floating.callback(cb),
                         )
                     elif self.minimizer_method == "tf-trust-ncg":
                         res = minimize_trust_ncg(
@@ -5771,11 +5792,11 @@ class Fitter:
                         ):
                             res = scipy.optimize.minimize(
                                 scipy_loss,
-                                xval,
+                                floating.restrict(xval),
                                 method=self.minimizer_method,
                                 jac=True,
                                 tol=0.0,
-                                callback=cb,
+                                callback=floating.callback(cb),
                                 options=sci_opts,
                                 **info_minimize,
                             )
@@ -5835,8 +5856,8 @@ class Fitter:
                         )
                     logger.debug(ex)
                 else:
-                    xval = res["x"]
-                    self.minimizer_result = res
+                    xval = floating.embed(res["x"])
+                    self.minimizer_result = floating.embed_result(res)
                     logger.debug(res)
 
                 callback = merge_callbacks(callback, cb)
@@ -5902,6 +5923,7 @@ class Fitter:
                 self.x.assign(pc_cell[0].to_physical(xval))
                 pc_cell[0] = self._build_preconditioner()
                 xval = pc_cell[0].from_physical(self.x.numpy())
+                floating.set_anchor(xval)
 
         # The status describes the last round only: its nit and nfev leave out
         # the rounds before it (each ended by a stall), so say how many there were.
@@ -6067,6 +6089,15 @@ class Fitter:
                 # no need to do a minimization, simple matrix solve is sufficient
                 val, grad, hess = self.loss_val_grad_hess()
 
+                # A frozen parameter's Hessian row and column are exactly zero
+                # (tf.stop_gradient), so no Cholesky of the full matrix exists:
+                # solve on the floating block (see FloatingCoordinates).
+                floating = FloatingCoordinates(
+                    self.floating_indices if len(self.frozen_params) else None
+                )
+                grad = floating.restrict(grad)
+                hess = floating.restrict_hess(hess)
+
                 # use a Cholesky decomposition to easily detect the non-positive-definite case
                 chol = tf.linalg.cholesky(hess)
 
@@ -6081,6 +6112,10 @@ class Fitter:
                 dx = tf.linalg.cholesky_solve(chol, -gradv)[:, 0]
                 del chol
 
+                if floating.idx is not None:
+                    dx = tf.scatter_nd(
+                        floating.idx[:, None], dx, tf.shape(self.x, out_type=tf.int64)
+                    )
                 self.x.assign_add(dx)
             else:
                 # --noHessian: we must not allocate the dense [npar, npar]
@@ -6402,6 +6437,13 @@ class Fitter:
 
         elif hess_mode == "frozen":
             postfit_hess = np.linalg.inv(self.cov.numpy())
+            # Frozen rows and columns zero, as in the exact Hessian
+            # (stop_gradient). cov^-1 couples a frozen parameter to the
+            # floating ones, and trust-constr's projected CG would move it
+            # through that coupling: its constraint-Jacobian column is zero, so
+            # nothing holds it back.
+            self._zero_frozen_columns(postfit_hess, axis=0)
+            self._zero_frozen_columns(postfit_hess, axis=1)
 
             def scipy_hess(x, v):
                 return v[0] * postfit_hess

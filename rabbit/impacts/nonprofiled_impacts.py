@@ -24,6 +24,7 @@ def nonprofiled_impacts_parms(
     x,
     x0,
     frozen_indices,
+    floating_indices,
     frozen_params,
     cw,
     systgroups,
@@ -38,6 +39,8 @@ def nonprofiled_impacts_parms(
         x: TF Variable holding all fit parameters (POIs + nuisances).
         x0: TF Variable of constraint centers, index-aligned with x.
         frozen_indices: indices (into x) of the frozen parameters.
+        floating_indices: indices (into x) of the other parameters; the
+            diagnostic EDM is taken on their block of the Hessian.
         frozen_params: names of the frozen parameters.
         cw: constraint weights, index-aligned with x.
         systgroups: systematic group names.
@@ -75,8 +78,12 @@ def nonprofiled_impacts_parms(
             minimize_fn()
             if diagnostics:
                 _, grad, hess = loss_val_grad_hess_fn()
-                edmval, _ = tfh.edmval_cov(grad, hess)
-                logger.info(f"edmval: {edmval}")
+                # on the floating block: the frozen parameters' Hessian rows
+                # and columns are zero (stop_gradient)
+                grad = tf.gather(grad, floating_indices)
+                hess = tf.gather(hess, floating_indices)
+                hess = tf.gather(hess, floating_indices, axis=1)
+                logger.info(f"edmval: {tfh.edmval(grad, hess)}")
             # difference w.r.t. nominal fit
             diff = x_tmp - x.value()
             nonprofiled_impacts[i, j].assign(diff)
