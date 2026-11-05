@@ -5490,15 +5490,20 @@ class Fitter:
 
             return pc.hessp_to_internal(np.asarray(pval, dtype=np.float64), hvp)
 
+        def log_diagnostics(grad, hess):
+            # on the floating block: a frozen parameter's zero row and column
+            # make the full Hessian singular, and the solve in edmval would
+            # raise and end the fit at its start point
+            grad, hess = floating.restrict(grad), floating.restrict_hess(hess)
+            logger.info(f"  - Condition number: {tfh.cond_number(hess)}")
+            logger.info(f"  - edmval: {tfh.edmval(grad, hess)}")
+
         def scipy_hess(yval):
             pc = pc_cell[0]
             self.x.assign(pc.to_physical(floating.embed(yval)))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
+                log_diagnostics(grad, hess)
             return floating.restrict_hess(pc.hess_to_internal(hess.__array__()))
 
         # Native (TF) minimizer counterparts of the callbacks above. Same
@@ -5515,10 +5520,7 @@ class Fitter:
             self.x.assign(pc.to_physical(floating.embed(yval)))
             val, grad, hess = self.loss_val_grad_hess()
             if self.diagnostics:
-                cond_number = tfh.cond_number(hess)
-                logger.info(f"  - Condition number: {cond_number}")
-                edmval = tfh.edmval(grad, hess)
-                logger.info(f"  - edmval: {edmval}")
+                log_diagnostics(grad, hess)
             if pc.enabled:
                 grad = tf.constant(pc.grad_to_internal(grad.__array__()))
                 hess = tf.constant(pc.hess_to_internal(hess.__array__()))

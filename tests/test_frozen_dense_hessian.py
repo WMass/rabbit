@@ -96,8 +96,12 @@ def test_scan_keeps_the_frozen_parameter(
     assert dnlls[0] > 1.0 and dnlls[-1] > 1.0, dnlls
 
 
+# --diagnostics: the condition number and edmval are taken on the floating
+# block; on the full, singular Hessian the solve raised and the fit ended at
+# its start point
+@pytest.mark.parametrize("diagnostics", [False, True])
 @pytest.mark.parametrize("method", METHODS)
-def test_freeze_parameters_option(tensor, method):
+def test_freeze_parameters_option(tensor, method, diagnostics):
     """--freezeParameters: a fit from a displaced frozen value keeps it."""
     indata_obj = inputdata.FitInputData(tensor)
     param_model = load_model("Mu", indata_obj)
@@ -105,7 +109,10 @@ def test_freeze_parameters_option(tensor, method):
         indata_obj,
         param_model,
         make_options(
-            minimizerMethod=method, earlyStopping=20, freezeParameters=["sig"]
+            minimizerMethod=method,
+            earlyStopping=20,
+            freezeParameters=["sig"],
+            diagnostics=diagnostics,
         ),
     )
     f.set_nobs(indata_obj.data_obs)
