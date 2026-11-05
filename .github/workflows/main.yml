@@ -719,6 +719,15 @@ jobs:
         run: |
           echo "RABBIT_OUTDIR=${RABBIT_OUTDIR}" >> $GITHUB_ENV
 
+      - name: setup kerberos
+        # copy-clean uploads to EOS from the bare runner, so it needs its own
+        # credential: the runner's ambient ccache is not ours to rely on
+        run: |
+          mkdir -p ~/.krb5ccdir
+          KRB5CCNAME=DIR:$HOME/.krb5ccdir kinit -kt ~/private/.keytab cmsmwbot@CERN.CH
+          KRB5CCNAME=DIR:$HOME/.krb5ccdir klist
+          echo "KRB5CCNAME=DIR:$HOME/.krb5ccdir" >> $GITHUB_ENV
+
       - name: copy clean plots
         run: |
           echo "xrdcp --parallel 4 -R -f $RABBIT_OUTDIR/$LOCAL_WEB_DIR/* root://eosuser.cern.ch//$EOS_DIR/$LOCAL_WEB_DIR"
