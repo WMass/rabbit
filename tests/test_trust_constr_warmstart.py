@@ -301,11 +301,11 @@ def test_warm_leg_stopped_on_a_releasing_face_is_released_warm(monkeypatch):
         orig = fitter.Fitter._fit_leg
         calls = []
 
-        def leg(self, tc_start="cold"):
+        def leg(self, tc_start="cold", first_leg=True):
             calls.append(tc_start)
             if len(calls) == 1:  # the stalled warm leg
                 return None
-            return orig(self, tc_start)
+            return orig(self, tc_start, first_leg=first_leg)
 
         monkeypatch.setattr(fitter.Fitter, "_fit_leg", leg)
         cb = f.minimize(warm_start=True)

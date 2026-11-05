@@ -22,6 +22,23 @@ from wums import logging
 
 logger = logging.child_logger(__name__)
 
+# minimizer_status() codes for a round that ends because the minimizer raised,
+# where scipy returns no result of its own. scipy's codes are >= 0 and
+# method-specific (the trust-region methods: 0 success, 1 maxiter, 2 bad
+# approximation, 3 linalg error; trust-constr: 0 evaluation limit, 1 and 2
+# success, 3 callback stop, 4 constraint violation), and -1 is
+# minimizer_status()'s placeholder for a result without one, so these are
+# negative.
+STATUS_STOPPED_EARLY = -2  # --earlyStopping declared a stall
+STATUS_MINIMIZER_RAISED = -3  # a genuine failure; the fit keeps the last iterate
+
+
+class NoAcceptedStepError(RuntimeError):
+    """A fit whose minimizer raised before accepting a single step, so there
+    is no result to keep (Fitter._fit_leg). The fitter is left at its start
+    and minimizer_status() has status -3. Callers that run many fits (scans,
+    impacts, the saturated test) catch it and record NaN for that fit."""
+
 
 class FitterCallback:
     def __init__(self, xv, early_stopping=-1, snapshotter=None, stall_rel_tol=0.0):
@@ -74,6 +91,8 @@ class FitterCallback:
         # set just before raising, so fit() can tell a recoverable stall apart
         # from a genuine error and restart instead of giving up
         self.stopped_early = False
+        # trust-constr only: the KKT measures of the last accepted iterate
+        self.last_state = None
 
     def __call__(self, intermediate_result):
         loss = intermediate_result.fun
@@ -137,13 +156,10 @@ class FitterCallback:
         # trust-constr's state carries the KKT measures (optimality,
         # constr_violation, multipliers v). scipy discards its result when the
         # callback raises (early stopping), so keep a copy for the iterate
-        # whose x is kept. Copied, not referenced: scipy mutates the state.
+        # whose x is kept (see stopped_result). Copied, not referenced: scipy
+        # mutates the state.
         if getattr(intermediate_result, "optimality", None) is not None:
             self.last_state = SimpleNamespace(
-                success=False,
-                status=-2,
-                message="stopped by FitterCallback; KKT measures of the last "
-                "accepted iterate",
                 nit=int(getattr(intermediate_result, "nit", -1)),
                 nfev=int(getattr(intermediate_result, "nfev", -1)),
                 optimality=float(intermediate_result.optimality),
@@ -173,6 +189,33 @@ class FitterCallback:
             self.snapshotter.maybe_save(
                 self.xval, elapsed, iteration=self.iiter, loss=float(loss)
             )
+
+    def stopped_result(self, ex):
+        """The result of a round the minimizer did not finish because ``ex``
+        was raised, with the attributes of a scipy result.
+
+        scipy returns nothing when the callback (or anything else) raises, so
+        without this a fit that ends by early stopping has no minimizer status
+        at all -- and with --earlyStopping on by default, that is a common way
+        for a converged trust-region fit to end. The fitter keeps the last
+        accepted iterate, so nit (and for trust-constr nfev and the KKT
+        measures) are those of that iterate. The other methods pass the
+        callback no evaluation count: nfev is -1, unknown. The message says
+        what stopped the round; the fitter appends what it did about it.
+        """
+        if self.stopped_early:
+            status, message = STATUS_STOPPED_EARLY, str(ex)
+        else:
+            status = STATUS_MINIMIZER_RAISED
+            text = str(ex)[:200]
+            what = f"{type(ex).__name__}: {text}" if text else type(ex).__name__
+            message = f"Minimizer raised {what}"
+        if self.last_state is None:
+            state = dict(nit=self.iiter, nfev=-1)
+        else:
+            state = dict(vars(self.last_state))
+        state.update(success=False, status=status, message=message)
+        return SimpleNamespace(**state)
 
 
 # Relative loss improvement below which a restart counts as having bought

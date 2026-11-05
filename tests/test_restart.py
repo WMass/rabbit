@@ -8,14 +8,25 @@ resumes. These tests cover the plumbing that turns that stall into a restart
 instead of a give-up.
 """
 
+import logging
+import os
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 import pytest
 
-from rabbit import fitter, inputdata
-from rabbit.callbacks import FitterCallback, merge_callbacks
+from rabbit import fitter, inputdata, io_tools
+from rabbit.callbacks import (
+    STATUS_MINIMIZER_RAISED,
+    STATUS_STOPPED_EARLY,
+    FitterCallback,
+    NoAcceptedStepError,
+    merge_callbacks,
+)
 from rabbit.param_models.helpers import load_model
 
 from .test_preconditioner import make_polynomial_tensor
@@ -332,3 +343,701 @@ def test_negative_stall_rel_tol_is_rejected():
 
     with pytest.raises(SystemExit):
         parsing.common_parser().parse_args(["d.hdf5", "--stallRelTol", "-1e-4"])
+
+
+# -- the minimizer status of a fit that does not return normally ------------
+#
+# scipy returns no result when the callback raises, which is how early
+# stopping ends a round, so the fitter has to describe such a round itself.
+# It used to keep the callback's trust-constr state, which every other method
+# leaves unset: a fit ended by early stopping had no minimizer status, and
+# fitresults.hdf5 no "minimizer_status". With --earlyStopping 20 on by default
+# that is a common end for a converged fit, not a corner case.
+
+# A --stallRelTol far above any relative gain declares a stall at the first
+# check, the third callback of every round under --earlyStopping 1, whatever
+# the loss does. A real stall turns on the last bits of the loss, which TF's
+# multithreaded CPU reductions do not reproduce, so a test keyed on one is flaky.
+FORCED_STALL = dict(earlyStopping=1, stallRelTol=1e10)
+
+
+def test_stopped_result_describes_the_kept_iterate():
+    """An early stop under trust-constr keeps scipy's counts and KKT measures
+    of the last accepted iterate; a failure names the exception."""
+
+    def state(fun, nit):
+        return SimpleNamespace(
+            fun=fun, x=np.zeros(2), nit=nit, nfev=nit + 1, optimality=0.5 / nit
+        )
+
+    cb = FitterCallback(np.zeros(2), early_stopping=1)
+    with pytest.raises(ValueError) as stall:
+        for nit, fun in enumerate([3.0, 2.0, 2.0], start=1):
+            cb(state(fun, nit))
+    st = cb.stopped_result(stall.value)
+    assert (st.success, st.status) == (False, STATUS_STOPPED_EARLY)
+    assert st.message == str(stall.value)
+    assert (st.nit, st.nfev, st.optimality) == (2, 3, 0.25)
+
+    st = FitterCallback(np.zeros(2)).stopped_result(RuntimeError())
+    assert (st.success, st.status) == (False, STATUS_MINIMIZER_RAISED)
+    assert (st.nit, st.nfev) == (0, -1)
+    assert st.message == "Minimizer raised RuntimeError"
+
+
+def _fitter(filename, **kw):
+    indata_obj = inputdata.FitInputData(filename)
+    f = fitter.Fitter(indata_obj, load_model("Mu", indata_obj), make_options(**kw))
+    f.set_nobs(indata_obj.data_obs)
+    return f
+
+
+def _status_fit(filename, **kw):
+    f = _fitter(filename, **kw)
+    cb = f.minimize()
+    return f, cb, f.minimizer_status()
+
+
+def _failing_after(n):
+    """A FitterCallback that raises a genuine error (not a stall) on its
+    (n+1)-th call, after n iterations."""
+
+    class Fails(FitterCallback):
+        def __call__(self, intermediate_result):
+            if self.iiter >= n:
+                raise RuntimeError("simulated failure")
+            super().__call__(intermediate_result)
+
+    return Fails
+
+
+@pytest.mark.parametrize("max_restarts", [0, 2])
+def test_a_fit_ended_by_early_stopping_has_a_status(max_restarts):
+    """No restarts allowed, and restarts that run out while the loss still
+    falls (the hard model is far from its minimum after 2 iterations)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        filename = make_polynomial_tensor(tmp, order=6)
+        f, cb, st = _status_fit(filename, maxRestarts=max_restarts, **FORCED_STALL)
+    assert cb.stopped_early
+    assert st is not None, "a fit ended by early stopping has no minimizer status"
+    assert st["success"] is False
+    assert st["status"] == STATUS_STOPPED_EARLY
+    assert st["restarts"] == max_restarts
+    # the last round, up to the iterate the fit keeps; no evaluation count
+    assert st["nit"] == 2 and st["nfev"] == -1
+    # the callback's reason, then how the restarts ended
+    assert st["message"].startswith("Loss improved only"), st["message"]
+    assert "early stopping" in st["message"]
+    if max_restarts == 0:
+        assert st["message"].endswith("Restarting is disabled (--maxRestarts 0).")
+    else:
+        assert "The last restart still reduced the loss" in st["message"]
+        assert st["message"].endswith("--maxRestarts 2 allows no more.")
+
+
+def test_a_restart_that_buys_nothing_ends_the_fit_with_a_status(monkeypatch):
+    """The other stall exit: the restart loop gives up because the last
+    restart did not lower the loss (here every round ends at the same one)."""
+
+    class FlatStall(FitterCallback):
+        def __call__(self, intermediate_result):
+            if self.iiter >= 2:
+                self.stopped_early = True
+                raise ValueError("forced stall.")
+            self.iiter += 1
+            self.loss_history.append(1.0)
+            self.time_history.append(float(self.iiter))
+            self.xval = intermediate_result.x
+
+    monkeypatch.setattr(fitter, "FitterCallback", FlatStall)
+    with tempfile.TemporaryDirectory() as tmp:
+        f, cb, st = _status_fit(make_polynomial_tensor(tmp, order=6), earlyStopping=20)
+    assert st["status"] == STATUS_STOPPED_EARLY and st["success"] is False
+    assert st["restarts"] == 1 and st["nit"] == 2
+    assert st["message"] == (
+        "forced stall. The last restart did not reduce the loss further (1.0 -> 1.0)."
+    )
+
+
+@pytest.mark.parametrize("method", ["trust-krylov", "trust-constr"])
+def test_a_minimizer_that_raises_after_a_step_keeps_the_last_iterate(
+    monkeypatch, caplog, method
+):
+    """A genuine error, not a stall, once the fit has moved: the fit carries
+    on from the last accepted iterate, with status -3 and a warning in the log.
+    trust-constr used to report it as an early stop (status -2), the others
+    not at all."""
+    monkeypatch.setattr(fitter, "FitterCallback", _failing_after(3))
+    with tempfile.TemporaryDirectory() as tmp, caplog.at_level(logging.WARNING):
+        f, cb, st = _status_fit(
+            make_polynomial_tensor(tmp, order=6),
+            earlyStopping=20,
+            minimizerMethod=method,
+        )
+    assert not cb.stopped_early
+    assert st["status"] == STATUS_MINIMIZER_RAISED and st["success"] is False
+    assert st["message"] == (
+        "Minimizer raised RuntimeError: simulated failure; kept the last "
+        "accepted iterate."
+    )
+    assert st["restarts"] == 0
+    assert any(
+        r.levelno == logging.WARNING
+        and "its EDM tells whether it is a minimum" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+    # the fit keeps the last accepted iterate, and the status describes it
+    assert np.isclose(float(f.loss_val()), cb.loss_history[-1], rtol=1e-10)
+    if method == "trust-constr":
+        assert st["nit"] >= 1 and "optimality" in st  # scipy's count, KKT kept
+    else:
+        assert st["nit"] == 3 and st["nfev"] == -1
+
+
+# -- a minimizer that raises before accepting a step -------------------------
+#
+# There is nothing to recover then: carrying on reported the start point as
+# the fit result, with exit code 0 (seen: an op XLA cannot compile, raised by
+# the first loss evaluation). It is an error now, raised with the status kept.
+
+
+class _Injected(Exception):
+    pass
+
+
+def _reject_every_step(f):
+    """Make every point but the start infinitely bad, so the minimizer
+    rejects every step it proposes. Returns the start point."""
+    x0 = f.x.numpy().copy()
+    real = f.loss_val_grad
+
+    def only_finite_at_the_start():
+        val, grad = real()
+        if not np.array_equal(f.x.numpy(), x0):
+            val = np.asarray(np.inf)
+        return val, grad
+
+    f.loss_val_grad = only_finite_at_the_start
+    return x0
+
+
+def _stall_then_fail(rounds):
+    """A callback that stalls after two iterations in the first round and
+    raises a genuine error at once in the next; ``rounds`` collects them."""
+
+    class StallThenFail(FitterCallback):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            rounds.append(self)
+
+        def __call__(self, intermediate_result):
+            if len(rounds) > 1:
+                raise RuntimeError("the restart fails")
+            if self.iiter >= 2:
+                self.stopped_early = True
+                raise ValueError("forced stall.")
+            super().__call__(intermediate_result)
+
+    return StallThenFail
+
+
+def test_a_minimizer_that_fails_at_the_first_call_raises(tmp_path):
+    snap = str(tmp_path / "snapshot.hdf5")
+    f = _fitter(
+        make_polynomial_tensor(str(tmp_path), order=6),
+        earlyStopping=20,
+        snapshotFile=snap,
+    )
+    x0 = f.x.numpy().copy()
+
+    def fails():
+        raise _Injected("cannot evaluate the loss")
+
+    f.loss_val_grad = fails
+    with pytest.raises(NoAcceptedStepError, match="never accepted a step") as err:
+        f.minimize()
+    assert isinstance(err.value.__cause__, _Injected)
+    assert str(err.value) == (
+        "Minimizer raised _Injected: cannot evaluate the loss; it never accepted "
+        "a step, so the fit has no result."
+    )
+    st = f.minimizer_status()
+    assert st["status"] == STATUS_MINIMIZER_RAISED and st["success"] is False
+    assert st["message"] == str(err.value) and st["nit"] == 0
+    # left where it started, not at a trial point of the failed minimizer
+    np.testing.assert_array_equal(f.x.numpy(), x0)
+    # and the failure snapshot is still written
+    with h5py.File(snap, "r") as s:
+        assert s.attrs["reason"] == "minimizer-failed"
+        assert s.attrs["error"] == "cannot evaluate the loss"
+        np.testing.assert_array_equal(s["x"][...], x0)
+
+
+def test_raising_after_rejected_steps_only_is_an_error_too(monkeypatch, tmp_path):
+    """The callback runs once per iteration, rejected steps included, so the
+    iteration count is not what decides: three iterations that never left the
+    start point are no more a result than none."""
+    f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=20)
+    x0 = _reject_every_step(f)
+    monkeypatch.setattr(fitter, "FitterCallback", _failing_after(3))
+    with pytest.raises(NoAcceptedStepError, match="never accepted a step"):
+        f.minimize()
+    assert f.minimizer_status()["nit"] == 3
+    np.testing.assert_array_equal(f.x.numpy(), x0)
+
+
+def test_a_restart_that_fails_at_once_keeps_the_earlier_rounds(monkeypatch):
+    """Only the first round can leave nothing to keep: a restart follows a
+    stall, a result in itself, so one that fails before its first step
+    leaves the fit where the previous round stalled."""
+    rounds = []
+    monkeypatch.setattr(fitter, "FitterCallback", _stall_then_fail(rounds))
+    with tempfile.TemporaryDirectory() as tmp:
+        f, cb, st = _status_fit(make_polynomial_tensor(tmp, order=6), earlyStopping=20)
+    assert len(rounds) == 2
+    assert st["status"] == STATUS_MINIMIZER_RAISED and st["restarts"] == 1
+    assert st["nit"] == 0
+    assert st["message"].endswith("; kept the last accepted iterate.")
+    assert np.isclose(float(f.loss_val()), rounds[0].loss_history[-1], rtol=1e-10)
+
+
+def test_a_stall_in_place_is_kept_when_the_restart_fails(monkeypatch, tmp_path):
+    """A first round that stalls without moving -- as a fit started at its
+    minimum does -- has a result, its stall point, so a restart that then
+    fails keeps it rather than raising."""
+    f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=20)
+    x0 = _reject_every_step(f)
+    rounds = []
+    monkeypatch.setattr(fitter, "FitterCallback", _stall_then_fail(rounds))
+    f.minimize()
+    st = f.minimizer_status()
+    assert len(rounds) == 2
+    assert st["status"] == STATUS_MINIMIZER_RAISED and st["restarts"] == 1
+    np.testing.assert_array_equal(f.x.numpy(), x0)
+
+
+def test_a_fit_that_returns_keeps_scipys_status(monkeypatch):
+    """The normal exit is scipy's result unchanged, before and after restarts
+    (forced here by a stall in the first round only)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        filename = make_polynomial_tensor(tmp, order=6)
+        f, cb, st = _status_fit(filename, minimizerMaxiter=30)
+        rounds = []
+
+        class StallsInTheFirstRound(FitterCallback):
+            def __call__(self, intermediate_result):
+                if self.iiter >= 2 and len(rounds) == 0:
+                    rounds.append(self.iiter)
+                    self.stopped_early = True
+                    raise ValueError("forced stall")
+                super().__call__(intermediate_result)
+
+        monkeypatch.setattr(fitter, "FitterCallback", StallsInTheFirstRound)
+        g, _, st_restarted = _status_fit(filename, minimizerMaxiter=30)
+
+    for fit, status, restarts in ((f, st, 0), (g, st_restarted, 1)):
+        res = fit.minimizer_result
+        assert status["status"] == res.status >= 0
+        assert status["message"] == res.message
+        assert (status["nit"], status["nfev"]) == (res.nit, res.nfev)
+        assert status["restarts"] == restarts
+
+
+def test_the_cli_writes_the_status_of_a_fit_ended_by_early_stopping(tmp_path):
+    """End to end: such a fit used to leave fitresults.hdf5 without a
+    minimizer_status."""
+    filename = make_polynomial_tensor(str(tmp_path), order=6)
+    rabbit_fit = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bin",
+        "rabbit_fit.py",
+    )
+    out = tmp_path / "out"
+    subprocess.run(
+        [
+            sys.executable,
+            rabbit_fit,
+            filename,
+            "-o",
+            str(out),
+            "-t",
+            "0",
+            "--earlyStopping",
+            str(FORCED_STALL["earlyStopping"]),
+            "--stallRelTol",
+            str(FORCED_STALL["stallRelTol"]),
+            "--maxRestarts",
+            "0",
+        ],
+        check=True,
+    )
+    res = io_tools.get_fitresult(str(out / "fitresults.hdf5"))
+    assert "minimizer_status" in res, "fitresults.hdf5 has no minimizer_status"
+    st = res["minimizer_status"]
+    assert st["status"] == STATUS_STOPPED_EARLY and not st["success"]
+    assert st["restarts"] == 0 and st["nit"] == 2
+    assert st["message"].endswith("Restarting is disabled (--maxRestarts 0).")
+
+
+# runs bin/rabbit_fit.py with the loss made to raise at its first evaluation
+_FAILING_RABBIT_FIT = """
+import runpy
+import sys
+
+from rabbit import fitter
+
+
+class InjectedError(Exception):
+    pass
+
+
+def fails():
+    raise InjectedError("injected first-call failure")
+
+
+make_tf_functions = fitter.Fitter._make_tf_functions
+
+
+def make_failing_tf_functions(self):
+    make_tf_functions(self)  # binds the tf.functions per instance
+    self.loss_val_grad = fails
+
+
+fitter.Fitter._make_tf_functions = make_failing_tf_functions
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+def test_the_cli_fails_when_the_minimizer_fails_at_the_first_call(tmp_path):
+    """End to end: such a fit used to write the start point as its result
+    and exit 0. Now it exits non-zero, writes no result and still leaves the
+    failure snapshot."""
+    filename = make_polynomial_tensor(str(tmp_path), order=6)
+    rabbit_fit = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bin",
+        "rabbit_fit.py",
+    )
+    out = tmp_path / "out"
+    snap = tmp_path / "snapshot.hdf5"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _FAILING_RABBIT_FIT,
+            rabbit_fit,
+            filename,
+            "-o",
+            str(out),
+            "-t",
+            "0",
+            "--snapshotFile",
+            str(snap),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode != 0, proc.stderr[-2000:]
+    assert (
+        "NoAcceptedStepError: Minimizer raised InjectedError: injected first-call "
+        "failure; it never accepted a step, so the fit has no result."
+    ) in proc.stderr, proc.stderr[-2000:]
+    with h5py.File(out / "fitresults.hdf5", "r") as res:
+        assert "results" not in res
+    with h5py.File(snap, "r") as s:
+        assert s.attrs["reason"] == "minimizer-failed"
+
+
+def test_a_fit_whose_loss_is_never_finite_ends(monkeypatch, tmp_path):
+    """A loss pinned at +inf (a non-positive prediction with data) stalls
+    every round. The restarts used to go on forever under the default
+    --maxRestarts -1: inf - inf is NaN, and no comparison with NaN is True."""
+    f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=3)
+    real = f.loss_val_grad
+
+    def loss_val_grad():
+        _, grad = real()
+        return np.asarray(np.inf), grad
+
+    f.loss_val_grad = loss_val_grad
+    builds = []
+    build = f._build_preconditioner
+
+    def counting_build():
+        builds.append(1)
+        if len(builds) > 5:
+            raise AssertionError("the restart loop does not end")
+        return build()
+
+    monkeypatch.setattr(f, "_build_preconditioner", counting_build)
+    f.minimize()
+    st = f.minimizer_status()
+    assert st["status"] == STATUS_STOPPED_EARLY and st["restarts"] == 1
+    assert st["message"].endswith(
+        "The last restart did not reduce the loss further (inf -> inf)."
+    )
+
+
+def test_a_later_leg_that_fails_at_once_keeps_the_earlier_legs(tmp_path):
+    """A leg after the first (the trust-constr warm start runs several) starts
+    where the earlier ones ended, a result: failing before its first step
+    keeps it. The first leg raises."""
+    f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=20)
+    x0 = f.x.numpy().copy()
+
+    def fails():
+        raise _Injected("cannot evaluate the loss")
+
+    f.loss_val_grad = fails
+    f._fit_leg("cold", first_leg=False)
+    st = f.minimizer_status()
+    assert st["status"] == STATUS_MINIMIZER_RAISED and st["success"] is False
+    assert st["message"].endswith("; kept the last accepted iterate.")
+    np.testing.assert_array_equal(f.x.numpy(), x0)
+    with pytest.raises(NoAcceptedStepError):
+        f._fit_leg("cold")
+
+
+@pytest.mark.parametrize(
+    "release_step, legs",
+    [
+        (True, [("warm", True), ("warm", False)]),
+        (False, [("warm", True), ("release", False)]),
+    ],
+)
+def test_only_the_first_warm_start_leg_is_the_first(
+    monkeypatch, tmp_path, release_step, legs
+):
+    """fit() tells _fit_leg which leg comes first: after a warm leg that
+    stopped on a face to release, neither the next warm leg nor the release
+    leg is."""
+    f = _fitter(make_polynomial_tensor(str(tmp_path), order=6), earlyStopping=20)
+    calls = []
+    releasing = [[("row", 1.0, 0.1)], []]
+    monkeypatch.setattr(f, "_use_warm_start", lambda warm_start: True)
+    monkeypatch.setattr(f, "_constraint_kkt_inputs", lambda: (None,) * 7)
+    monkeypatch.setattr(fitter.tc_warm, "centred_barrier", lambda *a, **k: 1.0)
+    monkeypatch.setattr(f, "releasing_constraint_rows", lambda: releasing.pop(0))
+    monkeypatch.setattr(f, "_release_step", lambda: release_step)
+    monkeypatch.setattr(
+        f,
+        "_fit_leg",
+        lambda tc_start="cold", first_leg=True: calls.append((tc_start, first_leg)),
+    )
+    f.fit(warm_start=True)
+    assert calls == legs
+
+
+# Loops over many fits used to survive a fit that could not take a step, by
+# keeping its start point as a result. They catch NoAcceptedStepError now and
+# record NaN for that fit; a single fit still raises.
+
+
+def _fitted_with_cov(filename, **kw):
+    """A fit and its covariance, which nll_scan reads to place the points."""
+    from rabbit.tfhelpers import edmval_cov
+
+    f = _fitter(filename, **kw)
+    f.minimize()
+    _, grad, hess = f.loss_val_grad_hess()
+    _, cov = edmval_cov(grad, hess)
+    f.cov.assign(cov)
+    return f
+
+
+def _fails_beyond(f, idx, limit):
+    """Make the loss impossible to evaluate wherever x[idx] > limit, as
+    negative yields under --allowNegativeParam can."""
+    real = f.loss_val_grad
+
+    def loss_val_grad():
+        if f.x.numpy()[idx] > limit:
+            raise _Injected("cannot evaluate the loss here")
+        return real()
+
+    f.loss_val_grad = loss_val_grad
+
+
+def _index(f, name):
+    return int(np.where(f.parms.astype(str) == name)[0][0])
+
+
+def test_a_scan_records_nan_where_the_fit_never_starts():
+    """The scan points above a limit cannot be fitted: they get NaN, with
+    their status and message in the detail, the others are fitted, and the
+    scan restores the fitter."""
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitted_with_cov(make_test_tensor(tmp), earlyStopping=20)
+        idx = _index(f, "sig")
+        xbest = f.x.numpy().copy()
+        sigma = float(np.sqrt(f.cov[idx, idx]))
+        limit = xbest[idx] + 1.5 * sigma
+        _fails_beyond(f, idx, limit)
+        vals, dnlls, detail = f.nll_scan("sig", 3.0, 7, save_detail=True)
+
+        beyond = vals > limit
+        assert beyond.sum() == 2  # the +2 and +3 sigma points
+        assert np.all(np.isnan(dnlls[beyond]))
+        assert np.all(np.isfinite(dnlls[~beyond]))
+        # every point keeps its value, the failed ones included
+        np.testing.assert_allclose(np.diff(vals), sigma, rtol=1e-10)
+        fields = list(f.SCAN_DETAIL_FIELDS)
+        diag = detail["diagnostics"]
+        assert np.all(diag[beyond, fields.index("status")] == STATUS_MINIMIZER_RAISED)
+        assert np.all(np.isnan(diag[beyond, fields.index("edmval")]))
+        for i in np.flatnonzero(beyond):
+            assert "never accepted a step" in detail["messages"][i]
+        # back at the caller's minimum, with sig floating again
+        np.testing.assert_array_equal(f.x.numpy(), xbest)
+        assert idx in f.floating_indices
+
+
+def test_a_2d_scan_records_nan_where_the_fit_never_starts():
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitted_with_cov(make_test_tensor(tmp), earlyStopping=20)
+        i0, i1 = _index(f, "sig"), _index(f, "bkg_norm")
+        xbest = f.x.numpy().copy()
+        limit = xbest[i0] + 0.5 * float(np.sqrt(f.cov[i0, i0]))
+        _fails_beyond(f, i0, limit)
+        xs, _, dnlls = f.nll_scan2D(("sig", "bkg_norm"), 1.0, 3)
+
+        beyond = np.asarray(xs) > limit
+        assert beyond.sum() == 1
+        assert np.all(np.isnan(dnlls[beyond]))
+        assert np.all(np.isfinite(dnlls[~beyond]))
+        np.testing.assert_array_equal(f.x.numpy(), xbest)
+        assert i0 in f.floating_indices and i1 in f.floating_indices
+
+
+def test_a_scan_restores_the_fitter_when_a_fit_raises_otherwise():
+    """Any other error propagates, but the scan still leaves the fitter as it
+    found it: at the caller's point, with the parameter floating again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitted_with_cov(make_test_tensor(tmp), earlyStopping=20)
+        idx = _index(f, "sig")
+        xbest = f.x.numpy().copy()
+        real_fit = f.fit
+        calls = []
+
+        def fit(warm_start=False):
+            calls.append(warm_start)
+            if len(calls) == 2:
+                raise _Injected("something else")
+            return real_fit(warm_start=warm_start)
+
+        f.fit = fit
+        with pytest.raises(_Injected):
+            f.nll_scan("sig", 2.0, 5)
+        np.testing.assert_array_equal(f.x.numpy(), xbest)
+        assert idx in f.floating_indices
+
+
+def test_asymmetric_impacts_are_nan_for_a_refit_that_never_starts():
+    """Not zero, which would read as no impact and enter the group totals as
+    such: NaN for that impact, and for the groups and the total with it."""
+    from rabbit.impacts.global_asym_impacts import global_asym_impacts_parms
+
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fitter(make_test_tensor(tmp), earlyStopping=20)
+        f.minimize()
+        inorm, ishape = _index(f, "bkg_norm"), _index(f, "bkg_shape")
+        x_nom, x0_nom = f.x.numpy().copy(), f.x0.numpy().copy()
+        real = f.minimize
+
+        def minimize(*args, **kwargs):
+            # the refit with bkg_norm's centre shifted down cannot take a step
+            if f.x0.numpy()[inorm] < x0_nom[inorm]:
+                raise NoAcceptedStepError("injected")
+            return real(*args, **kwargs)
+
+        f.minimize = minimize
+        _, impacts, groups, grouped = global_asym_impacts_parms(
+            f,
+            [inorm, ishape],
+            [b"bkg_norm", b"bkg_shape"],
+            group_members={b"bkg": [inorm, ishape], b"shape": [ishape]},
+        )
+        np.testing.assert_array_equal(f.x.numpy(), x_nom)
+        np.testing.assert_array_equal(f.x0.numpy(), x0_nom)
+
+    assert np.all(np.isnan(impacts[0, 0]))
+    assert np.all(np.isfinite(impacts[0, 1])) and np.all(np.isfinite(impacts[1]))
+    groups = list(groups)
+    assert np.all(np.isnan(grouped[groups.index(b"bkg")]))
+    assert np.all(np.isnan(grouped[groups.index(b"Total")]))
+    assert np.all(np.isfinite(grouped[groups.index(b"shape")]))
+
+
+_SATURATED_FIT_FAILS = """
+import runpy
+import sys
+
+from rabbit import fitter
+
+
+class InjectedError(Exception):
+    pass
+
+
+def fails():
+    raise InjectedError("injected saturated-fit failure")
+
+
+make_tf_functions = fitter.Fitter._make_tf_functions
+
+
+def make_failing_tf_functions(self):
+    make_tf_functions(self)
+    # only the composite fitter of --computeSaturatedProjectionTests
+    if type(self.param_model).__name__ == "CompositeParamModel":
+        self.loss_val_grad = fails
+
+
+fitter.Fitter._make_tf_functions = make_failing_tf_functions
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+
+def test_the_cli_keeps_the_fit_when_the_saturated_test_cannot_start(tmp_path):
+    """End to end: a saturated sub-fit that cannot take a step no longer takes
+    the main fit's results with it. Its statistic is NaN, and its status says
+    why."""
+    filename = make_test_tensor(str(tmp_path))
+    rabbit_fit = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bin",
+        "rabbit_fit.py",
+    )
+    out = tmp_path / "out"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _SATURATED_FIT_FAILS,
+            rabbit_fit,
+            filename,
+            "-o",
+            str(out),
+            "-t",
+            "0",
+            "--saveHists",
+            "--computeSaturatedProjectionTests",
+            "-m",
+            "Project",
+            "ch0",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    res = io_tools.get_fitresult(str(out / "fitresults.hdf5"))
+    (sat,) = res["mappings"].values()
+    assert np.isnan(sat["chi2_saturated"])
+    st = sat["saturated_fit"]["minimizer_status"]
+    assert st["status"] == STATUS_MINIMIZER_RAISED
+    assert "never accepted a step" in st["message"]
+    # the main fit is there
+    assert res["minimizer_status"]["status"] != STATUS_MINIMIZER_RAISED
+    assert np.all(np.isfinite(res["parms"].get().values()))

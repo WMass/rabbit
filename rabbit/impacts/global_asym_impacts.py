@@ -88,7 +88,9 @@ def global_asym_impacts_parms(
     Returns:
         parms: np.ndarray of bytes, the impact-axis labels.
         impacts: np.ndarray of shape (n_scanned, 2, n_total_params).
-            Axis 1 is [down, up] matching axis_downUpVar.
+            Axis 1 is [down, up] matching axis_downUpVar. NaN for a refit
+            that failed (e.g. the minimizer raised before accepting a step),
+            and so for the groups and total containing it.
         group_names: np.ndarray of bytes for groups containing scanned
             sources (plus a trailing "Total").
         impacts_grouped: np.ndarray of shape (n_groups, 2, n_total_params).
@@ -180,9 +182,12 @@ def global_asym_impacts_parms(
                     fitter._profile_beta()
                 impacts[k, j] = (fitter.x.value() - x_nom).numpy()
             except Exception as e:
+                # NaN, not zero: a zero would read as "no impact" and go into
+                # the group totals as such
+                impacts[k, j] = np.nan
                 logger.warning(
                     f"    refit for {name_str} sign={sign:+d} failed: {e}; "
-                    "leaving impact at zero"
+                    "recording NaN for this impact"
                 )
 
         t_per[k] = time.perf_counter() - t0

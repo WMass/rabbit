@@ -14,7 +14,12 @@ from rabbit import preconditioner as precond
 from rabbit import tfhelpers as tfh
 from rabbit.bbstat.bbstat import BinByBinStat
 from rabbit.blinding import Blinding
-from rabbit.callbacks import RESTART_MIN_IMPROVEMENT, FitterCallback, merge_callbacks
+from rabbit.callbacks import (
+    RESTART_MIN_IMPROVEMENT,
+    FitterCallback,
+    NoAcceptedStepError,
+    merge_callbacks,
+)
 from rabbit.common import match_regexp_params
 from rabbit.constraints import postfit as constraints_postfit
 from rabbit.constraints import scipy_adapter
@@ -5369,7 +5374,11 @@ class Fitter:
                 "--minimizerInitialBarrier* override it), slacks from the "
                 "constraint values, no row held feasible"
             )
-            callback = merge_callbacks(callback, self._fit_leg("warm"))
+            # a later leg starts where the earlier ones got to: theirs is a
+            # result, which a leg failing at its first step does not discard
+            callback = merge_callbacks(
+                callback, self._fit_leg("warm", first_leg=rnd == 0)
+            )
             info["legs"].append("warm")
             bad = self.releasing_constraint_rows()
             if not bad:
@@ -5387,7 +5396,9 @@ class Fitter:
                     "[minimize] no release step; continuing from scipy's own "
                     "interior-point start (expect a detour)"
                 )
-                callback = merge_callbacks(callback, self._fit_leg("release"))
+                callback = merge_callbacks(
+                    callback, self._fit_leg("release", first_leg=False)
+                )
                 info["legs"].append("release")
                 bad = self.releasing_constraint_rows()
                 if bad:
@@ -5452,11 +5463,18 @@ class Fitter:
         self.x.assign(x0)
         return False
 
-    def _fit_leg(self, tc_start="cold"):
+    def _fit_leg(self, tc_start="cold", first_leg=True):
         """One minimisation from self.x. tc_start (trust-constr + --constraints
         only): "cold" = scipy's interior-point start with rabbit's
         keep_feasible rule; "warm" = no row held, slacks at c - lb, centred
-        barrier; "release" = no row held, scipy's start (last resort)."""
+        barrier; "release" = no row held, scipy's start (last resort).
+
+        A minimizer that raises leaves the fit at the last accepted iterate,
+        or where an earlier round stalled (status -3). Only if the first round
+        of the fit's first leg raises before accepting a step is there nothing
+        to keep: this raises NoAcceptedStepError then, chained to the error,
+        with self.x at the start. first_leg=False: an earlier leg of the same
+        fit (the trust-constr warm start) ended with a result, kept instead."""
         logger.info("Perform iterative fit")
 
         # Optional reparameterisation. Built once at the starting point, it is
@@ -5683,6 +5701,11 @@ class Fitter:
         callback = None
         prev_loss = None
         attempt = 0
+        # how the loop ended on a stall, for the minimizer status message
+        stall_exit = None
+        # where the first round starts: a minimizer that raises there, before
+        # accepting a step, leaves nothing to keep
+        xval_start = xval
 
         # to_physical is the whole reason this is built here rather than in the
         # callback: under preconditioning the minimiser's iterate is in internal
@@ -5760,18 +5783,55 @@ class Fitter:
                     # minimizer could have called the loss or hessp functions with "random" values, so restore the
                     # state from the end of the last iteration before the exception
                     xval = cb.xval
-                    # An early stop throws scipy's result away; for a
-                    # constrained fit keep the KKT measures of the last
-                    # accepted iterate (the one xval holds) instead.
-                    self.minimizer_result = getattr(cb, "last_state", None)
+                    # scipy returns no result when the minimizer raises, so
+                    # describe the round from the callback instead, at the last
+                    # accepted iterate (the one xval holds): an early stop is
+                    # status -2, a genuine failure -3. Every exit of this loop
+                    # thus leaves a minimizer status, as a normal return does.
+                    self.minimizer_result = cb.stopped_result(ex)
                     if not cb.stopped_early:
-                        # a real failure, not a stall: surface it rather than
-                        # letting a broken callback look like a converged fit
-                        logger.warning(f"Minimizer raised: {ex}")
-                        # the expensive case: a failure here used to discard the
-                        # whole fit, however close to the minimum it had got
+                        # a real failure, not a stall. Snapshot first: a failure
+                        # here used to discard the whole fit, however close to
+                        # the minimum it had got.
                         snapshotter.save(
                             cb.xval, "minimizer-failed", error=str(ex)[:200]
+                        )
+                        # A later round keeps what the earlier ones reached
+                        # (they ended by a stall, a result in itself), and so
+                        # does a later leg (the earlier legs ended with one).
+                        # The first round of the first leg has nothing to keep
+                        # if it never accepted a step -- not if it merely
+                        # iterated: the callback also runs on rejected steps,
+                        # but its x only moves on accepted ones. Carrying on
+                        # would then report the start point as the fit result,
+                        # with no error. For a single fit an error before the
+                        # first step is almost always systematic (an op the
+                        # backend cannot run, a loss that cannot be evaluated
+                        # at the start); the loops over many fits catch
+                        # NoAcceptedStepError and record NaN for that one.
+                        if (
+                            first_leg
+                            and attempt == 0
+                            and np.array_equal(xval, xval_start)
+                        ):
+                            self.minimizer_result.message += (
+                                "; it never accepted a step, so the fit has no "
+                                "result."
+                            )
+                            self.minimizer_result.restarts = attempt
+                            self.x.assign(pc_cell[0].to_physical(xval))
+                            raise NoAcceptedStepError(
+                                self.minimizer_result.message
+                            ) from ex
+                        self.minimizer_result.message += (
+                            "; kept the last accepted iterate."
+                        )
+                        # recover, but say so: the postfit is computed at that
+                        # iterate, and its EDM tells whether it is a minimum
+                        logger.warning(
+                            f"{self.minimizer_result.message} The results are "
+                            "computed there; its EDM tells whether it is a "
+                            "minimum."
                         )
                     logger.debug(ex)
                 else:
@@ -5788,15 +5848,29 @@ class Fitter:
                 # bought nothing: a round can never end above where it started
                 # (the trust region accepts improving steps only), so "not below
                 # the previous round" means the descent is genuinely exhausted.
+                # A non-finite loss never counts as an improvement (inf - inf is
+                # NaN, and every comparison with NaN is False: the loop would
+                # never stop); a finite one always improves on a non-finite one.
                 if (
                     prev_loss is not None
                     and last_loss is not None
-                    and last_loss
-                    >= prev_loss - RESTART_MIN_IMPROVEMENT * max(1.0, abs(prev_loss))
+                    and not (
+                        np.isfinite(last_loss)
+                        and (
+                            not np.isfinite(prev_loss)
+                            or last_loss
+                            < prev_loss
+                            - RESTART_MIN_IMPROVEMENT * max(1.0, abs(prev_loss))
+                        )
+                    )
                 ):
                     logger.info(
                         f"Restart did not reduce the loss further ({prev_loss} -> "
                         f"{last_loss}); stopping after {attempt} restart(s)."
+                    )
+                    stall_exit = (
+                        "The last restart did not reduce the loss further "
+                        f"({prev_loss} -> {last_loss})."
                     )
                     break
                 if 0 <= self.max_restarts <= attempt:
@@ -5804,6 +5878,13 @@ class Fitter:
                         f"Minimizer still stalling at loss {last_loss} after "
                         f"{self.max_restarts} restart(s) and the loss was still "
                         "coming down; raise --maxRestarts to let it continue."
+                    )
+                    stall_exit = (
+                        "Restarting is disabled (--maxRestarts 0)."
+                        if attempt == 0
+                        else "The last restart still reduced the loss "
+                        f"({prev_loss} -> {last_loss}), but --maxRestarts "
+                        f"{self.max_restarts} allows no more."
                     )
                     break
                 attempt += 1
@@ -5822,6 +5903,12 @@ class Fitter:
                 pc_cell[0] = self._build_preconditioner()
                 xval = pc_cell[0].from_physical(self.x.numpy())
 
+        # The status describes the last round only: its nit and nfev leave out
+        # the rounds before it (each ended by a stall), so say how many there were.
+        self.minimizer_result.restarts = attempt
+        if stall_exit is not None:
+            self.minimizer_result.message += f" {stall_exit}"
+
         # xval (and callback.xval) are internal coordinates; everything outside
         # fit() expects physical parameters.
         self.x.assign(pc_cell[0].to_physical(xval))
@@ -5836,10 +5923,24 @@ class Fitter:
         return callback
 
     def minimizer_status(self):
-        """Convergence outcome of the last :meth:`fit`, or None if none ran.
+        """The minimizer's outcome of the last :meth:`fit`, or None if none ran.
 
-        NB ``success`` is scipy's flag, not a convergence test on its own:
-        BFGS reports False ("precision loss") at points with EDM ~1e-17.
+        A diagnostic, not the fit's convergence verdict, which is the EDM: the
+        default tolerances (gtol 0) run the minimizer until it cannot improve,
+        so at a converged point it usually reports a failure (trust-krylov
+        status 2, "A bad approximation caused failure to predict
+        improvement"). Likewise ``success`` is scipy's flag: BFGS reports False
+        ("precision loss") at points with EDM ~1e-17.
+
+        A round the minimizer did not finish has no scipy result; it reports
+        success False and status -2 for an --earlyStopping stop (the message
+        says how the restarts ended) or -3 for a minimizer that raised, with
+        nit (and nfev where the method reports it, else -1) at the last
+        accepted iterate. If the first round raised before accepting a step
+        there is no result, and :meth:`fit` raises NoAcceptedStepError
+        instead; the status -3 is still recorded. ``restarts`` counts the
+        rounds before the last one, each ended by a stall; nit and nfev cover
+        the last round only.
         """
         res = self.minimizer_result
         if res is None:
@@ -5851,6 +5952,9 @@ class Fitter:
             "nfev": int(getattr(res, "nfev", -1)),
             "message": str(getattr(res, "message", "")),
         }
+        restarts = getattr(res, "restarts", None)
+        if restarts is not None:
+            out["restarts"] = int(restarts)
         # Constrained runs: at an active constraint grad f is balanced by the
         # constraint forces, so EDM says nothing. scipy's own test is
         #     optimality < gtol and constr_violation < gtol  ->  status 1
@@ -6039,9 +6143,6 @@ class Fitter:
         # make a likelihood scan for a single parameter
         # assuming the likelihood is minimized
 
-        # freeze minimize which mean to not update it in the fit
-        self.freeze_params(param)
-
         idx = np.where(self.parms.astype(str) == param)[0][0]
 
         # store current state of x temporarily
@@ -6065,29 +6166,34 @@ class Fitter:
         else:
             detail = None
 
-        def _record(islot, wall_s):
+        def _record(islot, wall_s, fitted=True):
             """Per-point parameter vector and convergence diagnostics.
 
             Costs one gradient evaluation plus one CG solve against the
             Hessian -- small next to the point's own profile minimisation
             (tens of trust-region iterations), but not free, which is why it
-            is opt-in.
+            is opt-in. A point whose fit never accepted a step (fitted=False)
+            keeps its minimizer status and message; the measures that would
+            evaluate the loss there are NaN.
             """
             detail["x"][islot] = self.x.numpy()
-            _, grad = self.loss_val_grad()
-            # frozen parameters enter the loss through tf.stop_gradient, so
-            # their gradient entries and Hessian rows/columns are exactly zero:
-            # both numbers below only see the parameters that were minimised
-            try:
-                edmval = self.edmval_cov_rows_hessfree(grad, [])[0]
-            except ValueError as e:
-                # one bad point should not lose the scan
-                logger.warning(f"{e}; reporting NaN edmval for this scan point")
-                edmval = float("nan")
+            edmval = grad_max_abs = float("nan")
+            if fitted:
+                _, grad = self.loss_val_grad()
+                # frozen parameters enter the loss through tf.stop_gradient, so
+                # their gradient entries and Hessian rows/columns are exactly
+                # zero: both numbers below only see the parameters that were
+                # minimised
+                try:
+                    edmval = self.edmval_cov_rows_hessfree(grad, [])[0]
+                except ValueError as e:
+                    # one bad point should not lose the scan
+                    logger.warning(f"{e}; reporting NaN edmval for this scan point")
+                grad_max_abs = float(np.max(np.abs(grad.numpy()), initial=0.0))
             status = self.minimizer_status() or {}
             values = {
                 "edmval": edmval,
-                "grad_max_abs": float(np.max(np.abs(grad.numpy()), initial=0.0)),
+                "grad_max_abs": grad_max_abs,
                 "success": float(status.get("success", np.nan)),
                 "status": float(status.get("status", np.nan)),
                 "nit": float(status.get("nit", np.nan)),
@@ -6098,49 +6204,61 @@ class Fitter:
                 detail["diagnostics"][islot, k] = values[field]
             detail["messages"][islot] = str(status.get("message", ""))
 
-        # save delta nll w.r.t. global minimum
-        nll_best = self.reduced_nll().numpy()
-        # set central point
-        dnlls[nscans // 2] = 0
-        scan_vals[nscans // 2] = xval[idx].numpy()
-        if save_detail:
-            # no fit runs here: the caller's minimum IS the central point, so
-            # its minimizer_status belongs to whatever fit produced it
-            _record(nscans // 2, float("nan"))
-        # scan positive side and negative side independently to profit from previous step
-        for sign in [-1, 1]:
-            param_scan_values = xval[idx].numpy() + sign * param_offsets
-            for i, ixval in enumerate(param_scan_values):
-                if i == 0:
-                    continue
+        # freeze minimize which mean to not update it in the fit
+        self.freeze_params(param)
+        try:
+            # save delta nll w.r.t. global minimum
+            nll_best = self.reduced_nll().numpy()
+            # set central point
+            dnlls[nscans // 2] = 0
+            scan_vals[nscans // 2] = xval[idx].numpy()
+            if save_detail:
+                # no fit runs here: the caller's minimum IS the central point,
+                # so its minimizer_status belongs to whatever fit produced it
+                _record(nscans // 2, float("nan"))
+            # scan positive side and negative side independently to profit from previous step
+            for sign in [-1, 1]:
+                param_scan_values = xval[idx].numpy() + sign * param_offsets
+                for i, ixval in enumerate(param_scan_values):
+                    if i == 0:
+                        continue
 
-                logger.debug(f"Now at i={i} x={ixval}")
-                self.x.assign(tf.tensor_scatter_nd_update(self.x, [[idx]], [ixval]))
+                    logger.debug(f"Now at i={i} x={ixval}")
+                    islot = nscans // 2 + sign * i
+                    scan_vals[islot] = ixval
+                    self.x.assign(tf.tensor_scatter_nd_update(self.x, [[idx]], [ixval]))
 
-                _t0 = time.perf_counter()
-                self.fit(warm_start=True)
-                _wall = time.perf_counter() - _t0
+                    _t0 = time.perf_counter()
+                    try:
+                        self.fit(warm_start=True)
+                        fitted = True
+                    except NoAcceptedStepError as e:
+                        # a point the model cannot be fitted at (e.g. negative
+                        # yields with --allowNegativeParam) should not lose the
+                        # scan: NaN there, and the next point starts from here
+                        logger.warning(
+                            f"Scan of {param} at {ixval}: {e} Recording NaN."
+                        )
+                        fitted = False
+                    _wall = time.perf_counter() - _t0
 
-                islot = nscans // 2 + sign * i
-                dnlls[islot] = self.reduced_nll().numpy() - nll_best
+                    if fitted:
+                        dnlls[islot] = self.reduced_nll().numpy() - nll_best
 
-                scan_vals[islot] = ixval
+                    if save_detail:
+                        _record(islot, _wall, fitted)
 
-                if save_detail:
-                    _record(islot, _wall)
-
-            # reset x to original state
+                # reset x to original state
+                self.x.assign(xval)
+        finally:
+            # the caller's state again, whatever a fit raised
             self.x.assign(xval)
-
-        # let the parameter be free again
-        self.defreeze_params(param)
+            # let the parameter be free again
+            self.defreeze_params(param)
 
         return scan_vals, dnlls, detail
 
     def nll_scan2D(self, param_tuple, scan_range, scan_points, use_prefit=False):
-
-        # freeze minimize which mean to not update it in the fit
-        self.freeze_params(param_tuple)
 
         idx0 = np.where(self.parms.astype(str) == param_tuple[0])[0][0]
         idx1 = np.where(self.parms.astype(str) == param_tuple[1])[0][0]
@@ -6157,55 +6275,66 @@ class Fitter:
 
         best_fit = (scan_points + 1) // 2 - 1
         dnlls = np.full((len(x_scans), len(y_scans)), np.nan)
-        nll_best = self.reduced_nll().numpy()
-        dnlls[best_fit, best_fit] = 0
-        # scan in a spiral around the best fit point
-        dcol = -1
-        drow = 0
-        i = 0
-        j = 0
-        r = 1
-        while r - 1 < best_fit:
-            if i == r and drow == 1:
-                drow = 0
-                dcol = 1
-            if j == r and dcol == 1:
-                dcol = 0
-                drow = -1
-            elif i == -r and drow == -1:
-                dcol = -1
-                drow = 0
-            elif j == -r and dcol == -1:
-                drow = 1
-                dcol = 0
 
-            i += drow
-            j += dcol
+        # freeze minimize which mean to not update it in the fit
+        self.freeze_params(param_tuple)
+        try:
+            nll_best = self.reduced_nll().numpy()
+            dnlls[best_fit, best_fit] = 0
+            # scan in a spiral around the best fit point
+            dcol = -1
+            drow = 0
+            i = 0
+            j = 0
+            r = 1
+            while r - 1 < best_fit:
+                if i == r and drow == 1:
+                    drow = 0
+                    dcol = 1
+                if j == r and dcol == 1:
+                    dcol = 0
+                    drow = -1
+                elif i == -r and drow == -1:
+                    dcol = -1
+                    drow = 0
+                elif j == -r and dcol == -1:
+                    drow = 1
+                    dcol = 0
 
-            if i == -r and j == -r:
-                r += 1
+                i += drow
+                j += dcol
 
-            ix = best_fit - i
-            iy = best_fit + j
+                if i == -r and j == -r:
+                    r += 1
 
-            logger.debug(
-                f"Now at (ix,iy) = ({ix},{iy}) (x,y)= ({x_scans[ix]},{y_scans[iy]})"
-            )
+                ix = best_fit - i
+                iy = best_fit + j
 
-            self.x.assign(
-                tf.tensor_scatter_nd_update(
-                    self.x, [[idx0], [idx1]], [x_scans[ix], y_scans[iy]]
+                logger.debug(
+                    f"Now at (ix,iy) = ({ix},{iy}) (x,y)= ({x_scans[ix]},{y_scans[iy]})"
                 )
-            )
 
-            self.fit(warm_start=True)
+                self.x.assign(
+                    tf.tensor_scatter_nd_update(
+                        self.x, [[idx0], [idx1]], [x_scans[ix], y_scans[iy]]
+                    )
+                )
 
-            dnlls[ix, iy] = self.reduced_nll().numpy() - nll_best
+                try:
+                    self.fit(warm_start=True)
+                except NoAcceptedStepError as e:
+                    # as in nll_scan: NaN at this point, the scan goes on
+                    logger.warning(
+                        f"Scan of {param_tuple} at ({float(x_scans[ix])}, "
+                        f"{float(y_scans[iy])}): {e} Recording NaN."
+                    )
+                    continue
 
-        self.x.assign(xval)
-
-        # let the parameter be free again
-        self.defreeze_params(param_tuple)
+                dnlls[ix, iy] = self.reduced_nll().numpy() - nll_best
+        finally:
+            self.x.assign(xval)
+            # let the parameter be free again
+            self.defreeze_params(param_tuple)
 
         return x_scans, y_scans, dnlls
 
