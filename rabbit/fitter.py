@@ -3733,6 +3733,7 @@ class Fitter:
             self.x,
             self.x0,
             self.frozen_indices,
+            self.floating_indices,
             self.frozen_params,
             self.cw,
             self.indata.systgroups,
