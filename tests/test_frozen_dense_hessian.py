@@ -357,7 +357,13 @@ def test_nonprofiled_impacts_diagnostics(tensor, method):
         )
         f.set_nobs(indata_obj.data_obs)
         f.minimize()
-        return [np.asarray(v) for v in f.nonprofiled_impacts_parms()[1:]]
+        _, parms, names, groups = f.nonprofiled_impacts_parms()
+        return np.asarray(parms), np.asarray(names), np.asarray(groups)
 
-    for a, b in zip(impacts(True), impacts(False)):
-        np.testing.assert_array_equal(a, b)
+    parms, names, groups = impacts(True)
+    parms_ref, names_ref, groups_ref = impacts(False)
+    np.testing.assert_array_equal(names, names_ref)
+    # to rounding, not bit for bit: with many threads, two identical fit
+    # sequences already differ by up to ~1e-15
+    np.testing.assert_allclose(parms, parms_ref, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(groups, groups_ref, rtol=0, atol=1e-12)
