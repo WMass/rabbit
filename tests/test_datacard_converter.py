@@ -14,9 +14,11 @@ import sys
 import hist
 import numpy as np
 import pytest
-import uproot
 
 from rabbit.datacard_converter import DatacardConverter
+
+# uproot writes the test ROOT files and is not installed on every runner
+uproot = pytest.importorskip("uproot")
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
