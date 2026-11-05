@@ -723,10 +723,10 @@ jobs:
         # copy-clean uploads to EOS from the bare runner, so it needs its own
         # credential: the runner's ambient ccache is not ours to rely on
         run: |
-          mkdir -p ~/.krb5ccdir
-          KRB5CCNAME=DIR:$HOME/.krb5ccdir kinit -kt ~/private/.keytab cmsmwbot@CERN.CH
-          KRB5CCNAME=DIR:$HOME/.krb5ccdir klist
-          echo "KRB5CCNAME=DIR:$HOME/.krb5ccdir" >> $GITHUB_ENV
+          mkdir -p /run/user/$UID/krb5ccdir
+          KRB5CCNAME=DIR:/run/user/$UID/krb5ccdir kinit -kt ~/private/.keytab cmsmwbot@CERN.CH
+          KRB5CCNAME=DIR:/run/user/$UID/krb5ccdir klist
+          echo "KRB5CCNAME=DIR:/run/user/$UID/krb5ccdir" >> $GITHUB_ENV
 
       - name: copy clean plots
         run: |
