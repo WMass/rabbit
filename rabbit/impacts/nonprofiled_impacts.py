@@ -2,6 +2,7 @@
 Nonprofiled impacts of varying frozen parameters and repeating the fit.
 """
 
+import numpy as np
 import tensorflow as tf
 from wums import logging
 
@@ -53,6 +54,10 @@ def nonprofiled_impacts_parms(
 
     x0_tmp = tf.identity(x0.value())
 
+    # the frozen parameters' Hessian rows and columns are zero (stop_gradient),
+    # so the diagnostic EDM is taken on the floating block
+    floating = np.setdiff1d(np.arange(x.shape[0]), frozen_indices)
+
     # prefit sigma = 1/sqrt(cw); the distinction from the variance 1/cw
     # matters since ParamModel priors introduce genuinely non-unit cw
     err_x0 = tf.where(
@@ -75,8 +80,9 @@ def nonprofiled_impacts_parms(
             minimize_fn()
             if diagnostics:
                 _, grad, hess = loss_val_grad_hess_fn()
-                edmval, _ = tfh.edmval_cov(grad, hess)
-                logger.info(f"edmval: {edmval}")
+                grad = tf.gather(grad, floating)
+                hess = tf.gather(tf.gather(hess, floating), floating, axis=1)
+                logger.info(f"edmval: {tfh.edmval(grad, hess)}")
             # difference w.r.t. nominal fit
             diff = x_tmp - x.value()
             nonprofiled_impacts[i, j].assign(diff)

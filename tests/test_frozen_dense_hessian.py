@@ -335,3 +335,29 @@ def test_restarts_keep_the_frozen_parameter(tensor, method, monkeypatch):
     # the leg's transform, then one per restart
     assert len(builds) >= 2
     assert f.x.numpy()[idx] == 0.5
+
+
+@pytest.mark.parametrize("method", ["trust-krylov", *METHODS])
+def test_nonprofiled_impacts_diagnostics(tensor, method):
+    """--nonProfiledImpacts --diagnostics: the EDM after each refit is taken on
+    the floating block. On the full Hessian, whose frozen rows and columns are
+    zero, its Cholesky raised. The impacts do not depend on --diagnostics."""
+
+    def impacts(diagnostics):
+        indata_obj = inputdata.FitInputData(tensor)
+        f = fitter.Fitter(
+            indata_obj,
+            load_model("Mu", indata_obj),
+            make_options(
+                minimizerMethod=method,
+                earlyStopping=20,
+                freezeParameters=["bkg_norm"],
+                diagnostics=diagnostics,
+            ),
+        )
+        f.set_nobs(indata_obj.data_obs)
+        f.minimize()
+        return [np.asarray(v) for v in f.nonprofiled_impacts_parms()[1:]]
+
+    for a, b in zip(impacts(True), impacts(False)):
+        np.testing.assert_array_equal(a, b)
