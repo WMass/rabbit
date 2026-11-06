@@ -18,7 +18,11 @@ class Mapping:
     )
     need_processes = False  # if observables are required by process in compute_flat
 
-    ndf_reduction = 0  # how much will be subtracted from the ndf / number of bins, e.g. for chi2 calculation
+    # Exact linear identities the outputs obey, e.g. 1 for a distribution
+    # normalized to its integral. The ndf of their chi2 is the rank of the
+    # residual covariance, which finds them: this count only cross-checks it
+    # (rabbit.fitter.chi2_pseudo_inverse, a debug message).
+    ndf_reduction = 0
 
     def __init__(self, indata, key):
         # The result of a mapping in the output dictionary is stored under 'result = fitresult[cls.name]'
