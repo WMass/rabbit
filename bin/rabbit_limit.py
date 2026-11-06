@@ -94,7 +94,15 @@ def _mcstat_contour_factor(fitter, idx=None, fun=None):
     return float(var_curv / var_reported)
 
 
-def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=False):
+def do_asymptotic_limits(
+    args,
+    fitter,
+    ws,
+    data_values,
+    mapping=None,
+    fit_data=False,
+    data_variances=None,
+):
     if fit_data:
         logger.info("Perform background only fit")
         # set process to zero and freeze
@@ -125,7 +133,7 @@ def do_asymptotic_limits(args, fitter, ws, data_values, mapping=None, fit_data=F
     if fit_data:
         logger.info("Unconditional fit to real data")
         fitter.set_mcstat_asimov(False)
-        fitter.set_nobs(data_values)
+        fitter.set_nobs(data_values, data_variances)
         fitter.minimize()
 
     # asymptotic limits (CLs)
@@ -404,7 +412,9 @@ def main():
                     ifitter.set_nobs(ifitter.expected_yield())
                 else:
                     if ifit == 0:
-                        ifitter.set_nobs(data_values)
+                        # with its data variances, as the toys: the chi2
+                        # variances of --chisqVariance data (None: Poisson)
+                        ifitter.set_nobs(data_values, data_variances)
                     elif ifit >= 1:
                         group.append(f"toy{ifit}")
                         ifitter.toyassign(
@@ -441,6 +451,7 @@ def main():
                     data_values=observations,
                     mapping=mapping,
                     fit_data=ifit >= 0,
+                    data_variances=data_variances if ifit >= 0 else None,
                 )
                 fit_time.append(time.time())
 
