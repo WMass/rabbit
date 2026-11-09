@@ -14,11 +14,9 @@ import sys
 import hist
 import numpy as np
 import pytest
+import uproot
 
 from rabbit.datacard_converter import DatacardConverter
-
-# uproot writes the test ROOT files and is not installed on every runner
-uproot = pytest.importorskip("uproot")
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -40,6 +38,16 @@ process      0     1     1
 rate         10    40    50
 r_sig rateParam * sig 1.0
 r_bkg rateParam ch* bkg 1.0
+"""
+
+MULTI_PROCESS_CARD = """\
+bin          ch
+observation  100
+bin          ch    ch    ch
+process      sig   bkgA  bkgB
+process      0     1     2
+rate         10    40    50
+r_bkg rateParam ch bkg* 1.0
 """
 
 SHAPES_CARD = """\
@@ -101,6 +109,20 @@ def test_rate_param_wildcards_skip_bins_without_process(tmp_path):
     assert list(writer.dict_logkavg["ch1"]["bkg"]) == ["r_bkg"]
     assert list(writer.dict_logkavg["ch2"]["bkg"]) == ["r_bkg"]
     assert "sig" not in writer.dict_logkavg["ch2"]
+
+
+def test_rate_param_matching_several_processes_books_each(tmp_path):
+    writer = convert(tmp_path, MULTI_PROCESS_CARD)
+
+    # one rateParam on both matched processes in the channel, each with the
+    # same kappa, and none on the process it does not match
+    kappa = np.log(1.01)
+    for process in ("bkgA", "bkgB"):
+        assert list(writer.dict_logkavg["ch"][process]) == ["r_bkg"]
+        np.testing.assert_allclose(
+            writer.dict_logkavg["ch"][process]["r_bkg"], kappa, rtol=1e-12
+        )
+    assert "r_bkg" not in writer.dict_logkavg["ch"].get("sig", {})
 
 
 @pytest.mark.parametrize(

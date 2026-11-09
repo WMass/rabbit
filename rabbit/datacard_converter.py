@@ -320,8 +320,13 @@ class DatacardConverter:
                 if not processes:
                     continue
                 matched = True
+                # one kappa per process: a scalar is booked on the first only
                 writer.add_norm_systematic(
-                    name, processes, channel, self.rate_param_kappa, constrained=False
+                    name,
+                    processes,
+                    channel,
+                    [self.rate_param_kappa] * len(processes),
+                    constrained=False,
                 )
 
             if not matched:
