@@ -191,10 +191,14 @@ def main():
             h_param = fitresult["parms"].get()
             params = np.array([n for n in h_param.axes["parms"]])
 
-            isin = np.isin(args.params, params)
+            requested = np.asarray(args.params)
+            isin = np.isin(requested, params)
             if not np.all(isin):
-                missing = args.params[~isin]
-                raise RuntimeError(f"Parameters {missing} not found")
+                # np.asarray first: args.params is a list, and boolean-mask
+                # indexing a list raises TypeError, so the error path used to
+                # crash instead of naming the parameter that was missing.
+                missing = requested[~isin]
+                raise RuntimeError(f"Parameters {list(missing)} not found")
 
             indices = np.array([np.where(params == val)[0][0] for val in args.params])
 

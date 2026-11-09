@@ -239,11 +239,11 @@ class Fitter:
         # jitCompile accepts "auto" (the default), "on", or "off".
         # True / False from programmatic callers are accepted as
         # aliases for "on" / "off". The tri-state is resolved to the
-        # final boolean self.jit_compile right here, using the only
-        # runtime condition it can depend on: whether the input is
-        # sparse. Sparse mode uses SparseMatrixMatMul which has no
-        # XLA kernel, so "auto" silently disables jit and "on" warns
-        # and falls back.
+        # final boolean self.jit_compile right here, from the input:
+        # SparseMatrixMatMul (the CSR matmul) has no XLA kernel, and the
+        # likelihood calls it for a sparse tensor and for each external
+        # term whose Hessian is stored sparse, with a dense tensor too.
+        # Either way "auto" disables jit and "on" warns and falls back.
         _jit_opt = getattr(options, "jitCompile", "auto")
         if _jit_opt is True:
             _jit_opt = "on"
@@ -253,20 +253,38 @@ class Fitter:
             raise ValueError(
                 f"jitCompile must be one of 'auto', 'on', 'off'; got {_jit_opt!r}"
             )
-        if _jit_opt == "off":
-            self.jit_compile = False
-        elif _jit_opt == "on":
-            if self.indata.sparse:
-                logger.warning(
-                    "--jitCompile=on requested but input data is sparse; "
-                    "XLA has no kernel for the sparse matmul ops used in "
-                    "sparse mode, so jit_compile will be disabled."
+        # only the external terms the loss evaluates: an MC-stat moment term
+        # is dropped unless --mcStatDebias continuousM (see init_fit_parms)
+        continuous_m = getattr(options, "mcStatDebias", "none") == "continuousM"
+        csr_terms = external_likelihood.sparse_hessian_terms(
+            t
+            for t in self.indata.external_terms
+            if continuous_m or not _is_mcstat_term(t)
+        )
+        no_xla = []
+        if self.indata.sparse:
+            no_xla.append("input data is sparse")
+        if csr_terms:
+            no_xla.append(
+                f"external likelihood term(s) {csr_terms} store their Hessian sparse"
+            )
+        self.jit_compile = _jit_opt != "off" and not no_xla
+        if _jit_opt != "off" and no_xla:
+            why = (
+                f"{' and '.join(no_xla)}; XLA has no kernel for the sparse (CSR) "
+                "matmul ops used there, so jit_compile will be disabled"
+            )
+            if _jit_opt == "on":
+                logger.warning(f"--jitCompile=on requested but {why}.")
+            elif not self.indata.sparse:
+                # A sparse tensor runs without jit by design; a dense one
+                # losing it to an external term is not obvious.
+                logger.info(
+                    f"--jitCompile=auto: {why}. A dense Hessian (hist.Hist "
+                    "instead of wums.SparseHist in "
+                    "TensorWriter.add_external_likelihood_term) would keep "
+                    "jit_compile for this dense tensor."
                 )
-                self.jit_compile = False
-            else:
-                self.jit_compile = True
-        else:  # "auto"
-            self.jit_compile = not self.indata.sparse
         # When --noHessian is requested the postfit Hessian is never
         # computed, so the dense [npar, npar] covariance matrix should
         # not be allocated. self.cov is set to None in that case and
@@ -4046,26 +4064,36 @@ class Fitter:
                 # (sliced to nbins when masked channels are excluded).
                 self.rnorm_init = rnorm_init
 
-    def _compute_yields_noBBB(self, full=True, compute_norm=True):
+    def _compute_yields_noBBB(self, full=True, compute_norm=True, forward_mode=False):
         # full: compute yields inclduing masked channels
         # compute_norm: also build the dense [nbins, nproc] normcentral tensor.
         # In sparse mode this is expensive (forward + backward) and is only
         # needed when an external caller requests per-process yields, or for
         # binByBinStat in "full" mode. The default is True for backward
         # compatibility; the NLL/grad/HVP path passes compute_norm=False.
+        # forward_mode: see _compute_yields_noBBB_batched.
         nexpcentral, normcentral = self._compute_yields_noBBB_batched(
-            self.x[:, None], full=full, compute_norm=compute_norm
+            self.x[:, None],
+            full=full,
+            compute_norm=compute_norm,
+            forward_mode=forward_mode,
         )
         if normcentral is not None:
             normcentral = normcentral[..., 0]
         return nexpcentral[:, 0], normcentral
 
-    def _compute_yields_noBBB_batched(self, x, full=True, compute_norm=True):
+    def _compute_yields_noBBB_batched(
+        self, x, full=True, compute_norm=True, forward_mode=False
+    ):
         """Yields without bin-by-bin stat at the B columns of x [npar, B]:
         nexpcentral [nbins, B] and, with compute_norm, normcentral
         [nbins, nproc, B] (else None). The batch axis goes last, so the logk
         contraction is the same [.., nsyst] x [nsyst, B] product for B = 1
-        and reads logk once for all B columns otherwise."""
+        and reads logk once for all B columns otherwise.
+
+        forward_mode: the result is differentiated in forward mode
+        (tf.autodiff.ForwardAccumulator); sparse mode then avoids the CSR
+        matmul, see below. No effect on dense inputs."""
         poi = self.get_poi(x)
         model_nui = self.get_model_nui(x)
         theta = self.get_theta(x)
@@ -4084,7 +4112,20 @@ class Fitter:
             # kernel. NOTE: SparseMatrixMatMul has no XLA kernel, so the
             # enclosing loss/grad/HVP tf.functions are built with
             # jit_compile=False in sparse mode (see _make_tf_functions).
-            logsnorm = tf_sparse_csr.matmul(self.logk_csr, mthetaalpha)  # [nnz, B]
+            #
+            # It cannot be differentiated in forward mode, though: the
+            # ForwardAccumulator gives every input without a tangent a
+            # zeros_like one, the CSRSparseMatrix variant included, and
+            # TensorFlow has no CPU ZEROS_LIKE kernel for that variant
+            # ("No unary variant unary_op function found for op ZEROS_LIKE").
+            # A forward-mode caller (the JVP global impacts) gets the same
+            # contraction from the index/value tensors of logk instead:
+            # slower per call, but off the NLL/grad/HVP path.
+            if forward_mode:
+                logsnorm = tf.sparse.sparse_dense_matmul(self.logk, mthetaalpha)
+            else:
+                logsnorm = tf_sparse_csr.matmul(self.logk_csr, mthetaalpha)
+            # logsnorm: [nnz, B]
 
             # The values of a [nbinsfull, nproc] sparse tensor with the sparsity
             # pattern of self.indata.norm (without the masked channels' entries
@@ -4195,9 +4236,16 @@ class Fitter:
 
         return nexpcentral, normcentral
 
-    def _compute_yields_with_beta(self, profile=True, compute_norm=False, full=True):
+    def _compute_yields_with_beta(
+        self, profile=True, compute_norm=False, full=True, forward_mode=False
+    ):
+        # forward_mode: see _compute_yields_noBBB_batched.
         nexp, norm, beta = self._compute_yields_with_beta_batched(
-            self.x[:, None], profile=profile, compute_norm=compute_norm, full=full
+            self.x[:, None],
+            profile=profile,
+            compute_norm=compute_norm,
+            full=full,
+            forward_mode=forward_mode,
         )
         return tuple(None if t is None else t[..., 0] for t in (nexp, norm, beta))
 
@@ -4210,7 +4258,14 @@ class Fitter:
         )
 
     def _compute_yields_with_beta_batched(
-        self, x, data=None, profile=True, compute_norm=False, full=True, beta0=None
+        self,
+        x,
+        data=None,
+        profile=True,
+        compute_norm=False,
+        full=True,
+        beta0=None,
+        forward_mode=False,
     ):
         """_compute_yields_with_beta at the B columns of x [npar, B]: nexp
         [nbins, B], norm [nbins, nproc, B] or None, beta [.., B] or None.
@@ -4220,7 +4275,8 @@ class Fitter:
         bin-by-bin stat constraint centres, of bbstat.beta_shape (masked
         channels included) plus the batch axis (default the stored ones). Bin-by-bin stat is element-wise in the bins:
         B = 1 calls profile_and_apply directly, larger batches vectorize the
-        same call (tfh.map_batch)."""
+        same call (tfh.map_batch). forward_mode: see
+        _compute_yields_noBBB_batched."""
         # Only materialize the dense [nbins, nproc] normcentral when an
         # external caller requested it, when BBB "full" mode needs per-process
         # yields for the analytic β solution, or when "lite" mode needs to
@@ -4228,7 +4284,7 @@ class Fitter:
         # contributions per bin.
         need_norm = compute_norm or self.bbstat.needs_per_proc_norm()
         nexp, norm = self._compute_yields_noBBB_batched(
-            x, full=full, compute_norm=need_norm
+            x, full=full, compute_norm=need_norm, forward_mode=forward_mode
         )
         if not self.bbstat.enabled:
             return nexp, norm, None
@@ -4854,8 +4910,8 @@ class Fitter:
         # jit_compile and the HVP autodiff mode can be controlled via fit
         # options without redefining the class. self.jit_compile has
         # already been resolved to a plain bool in __init__ (tri-state
-        # "auto"/"on"/"off" collapsed against self.indata.sparse), so
-        # this body just reads it.
+        # "auto"/"on"/"off" collapsed against the sparse tensor and the
+        # sparse external Hessians), so this body just reads it.
         jit = self.jit_compile
         # the kept set of the other de-biasing setting is now stale
         self._mcstat_tf_standby = None
@@ -4878,11 +4934,23 @@ class Fitter:
         self._scalar_hessian_fns = {}
         # tf.autodiff.ForwardAccumulator does not support tangent
         # propagation through SparseMatrixMatMul (no JVP rule for the
-        # CSR variant), so the fwdrev HVP cannot be used in sparse mode.
-        # Fall back to revrev with a warning.
-        if self.hvp_method == "fwdrev" and self.indata.sparse:
+        # CSR variant), so the fwdrev HVP cannot be used in sparse mode,
+        # nor with an external term whose Hessian is stored sparse (also
+        # contracted with it). Fall back to revrev with a warning.
+        csr_terms = [
+            t["name"]
+            for t in self.external_terms + self.mcstat_terms
+            if t["hess_csr"] is not None
+        ]
+        if self.hvp_method == "fwdrev" and (self.indata.sparse or csr_terms):
+            where = (
+                "in sparse mode"
+                if self.indata.sparse
+                else f"with external likelihood term(s) {csr_terms}, whose "
+                "Hessian is stored sparse"
+            )
             logger.warning(
-                "fwdrev HVP is not supported in sparse mode "
+                f"fwdrev HVP is not supported {where} "
                 "(tf.autodiff.ForwardAccumulator cannot trace through "
                 "tf.linalg.sparse's CSR matmul); falling back to revrev."
             )

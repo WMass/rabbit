@@ -47,6 +47,10 @@ def _compute_global_impacts_beta0_jvp(
     e.g. --binByBinStatMode full. With many columns and few beta parameters (impacts
     on many observable bins in lite mode) the backward mode is as fast and uses less
     memory.
+
+    The pass under the ForwardAccumulator calls 'compute_yields_with_beta_fn' with
+    forward_mode=True: a sparse tensor's CSR matmul cannot be differentiated in
+    forward mode (see Fitter._compute_yields_noBBB_batched).
     """
     with tf.GradientTape() as t2:
         t2.watch(ubeta)
@@ -74,7 +78,7 @@ def _compute_global_impacts_beta0_jvp(
         def _tangents(tangent_vector):
             with tf.autodiff.ForwardAccumulator(x, tangent_vector) as acc:
                 *_, beta = compute_yields_with_beta_fn(
-                    profile=True, compute_norm=False, full=False
+                    profile=True, compute_norm=False, full=False, forward_mode=True
                 )
             return acc.jvp(beta)
 
