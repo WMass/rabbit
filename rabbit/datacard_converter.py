@@ -1,3 +1,4 @@
+import fnmatch
 import os
 
 import hist
@@ -254,11 +255,28 @@ class DatacardConverter:
                         process_name,
                         bin_name,
                     )
+
+                    # Combine requires the rate line to agree with the normalization
+                    # of the template, and uses -1 to mean 'take it from the template'
+                    rate = self.parser.rates.get((bin_name, process_name))
+                    if rate is not None and rate > 0:
+                        integral = h_proc.values().sum()
+                        if abs(integral - rate) > 0.01 * max(1.0, rate):
+                            raise ValueError(
+                                f"Mismatch in normalizations for bin {bin_name}, "
+                                f"process {process_name}: rate {rate}, "
+                                f"template integral {integral}"
+                            )
                 else:
-                    # For counting experiments
+                    # For counting experiments the yield of each process is its rate
+                    # from the datacard; only the data yield is the observation
+                    if process_name == "data_obs":
+                        rate = self.parser.observations.get(bin_name, 0)
+                    else:
+                        rate = self.parser.rates[(bin_name, process_name)]
                     h_proc = hist.Hist(
                         self.yield_axis,
-                        data=np.array([self.parser.observations.get(bin_name, 0)]),
+                        data=np.array([rate]),
                         storage=hist.storage.Double(),
                     )
 
@@ -279,8 +297,8 @@ class DatacardConverter:
         #   with 1.01 such rates need |theta| ~ 10-100 and fits with frozen parameters can overflow.
         for parts in self.parser.rate_params:
             name = parts[0]
-            channels = [parts[1]] if parts[1] != "*" else self.parser.bins
-            processes = [parts[2]] if parts[2] != "*" else self.parser.processes
+            channel_pattern = parts[1]
+            process_pattern = parts[2]
             # TODO: set initial value
             value = float(parts[3])
             # TODO: use parameter range
@@ -288,9 +306,33 @@ class DatacardConverter:
                 lo, hi = parts[4][1:-1].split(",")
                 prange = (float(lo), float(hi))
 
-            for c in channels:
+            # Both fields are fnmatch patterns, as in Combine; bins in which the
+            # process does not exist are simply not affected
+            matched = False
+            for channel in self.parser.bins:
+                if not fnmatch.fnmatch(channel, channel_pattern):
+                    continue
+                processes = [
+                    process
+                    for process in self.parser.bin_process_map[channel]
+                    if fnmatch.fnmatch(process, process_pattern)
+                ]
+                if not processes:
+                    continue
+                matched = True
+                # one kappa per process: a scalar is booked on the first only
                 writer.add_norm_systematic(
-                    name, processes, c, self.rate_param_kappa, constrained=False
+                    name,
+                    processes,
+                    channel,
+                    [self.rate_param_kappa] * len(processes),
+                    constrained=False,
+                )
+
+            if not matched:
+                raise ValueError(
+                    f"rateParam {name}: no bin matching '{channel_pattern}' has a "
+                    f"process matching '{process_pattern}'"
                 )
 
         def add_norm_syst(writer, name, process, channel, effect):

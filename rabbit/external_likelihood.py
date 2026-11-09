@@ -225,6 +225,32 @@ def read_external_terms_from_h5(ext_group):
     return terms
 
 
+def sparse_hessian_terms(terms):
+    """Names of the raw terms whose Hessian is stored sparse.
+
+    :func:`build_tf_external_terms` makes each such Hessian a
+    ``CSRSparseMatrix``, which :func:`compute_external_nll` contracts with
+    ``SparseMatrixMatMul``. That op has no XLA kernel, so a ``tf.function``
+    evaluating one of these terms cannot be built with ``jit_compile=True``,
+    whether the tensor is dense or sparse. The Fitter resolves
+    ``--jitCompile`` against this list.
+
+    Parameters
+    ----------
+    terms : iterable of dict
+        Raw per-term dicts as returned by :func:`read_external_terms_from_h5`.
+
+    Returns
+    -------
+    list[str]
+    """
+    return [
+        str(t["name"])
+        for t in terms
+        if t["hess_dense"] is None and t["hess_sparse"] is not None
+    ]
+
+
 def build_tf_external_terms(terms, parms, dtype):
     """Turn raw external-term dicts into tf-side dicts ready for the fitter.
 
@@ -302,7 +328,8 @@ def build_tf_external_terms(terms, parms, dtype):
             # L = 0.5 x_sub^T H x_sub has gradient H @ x_sub and HVP
             # H @ p_sub, each a single sm.matmul call. NOTE:
             # SparseMatrixMatMul has no XLA kernel, so any tf.function
-            # that calls sm.matmul must be built with jit_compile=False.
+            # that calls sm.matmul must be built with jit_compile=False
+            # (the Fitter checks sparse_hessian_terms for this).
             # The TensorWriter sorts the indices into canonical row-major
             # order at write time, so we can feed the SparseTensor
             # straight to the CSR builder without an additional reorder
