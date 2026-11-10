@@ -387,6 +387,8 @@ class Mu(ParamModel):
 
         rnorm = tf.reshape(rnorm, [1, -1])
         return rnorm
+
+
 ## CUSTOM FOR MULTIPLE SIGNAL PROCESSES SHARING 1 SIGNAL STRENGTH (ex. VBS WV)
 class SharedMu(ParamModel):
     """
@@ -406,7 +408,9 @@ class SharedMu(ParamModel):
         procs = args[0].split(",") if args else None
         return cls(indata, procs, **kwargs)
 
-    def __init__(self, indata, procs=None, expectSignal=None, allowNegativeParam=False, **kwargs):
+    def __init__(
+        self, indata, procs=None, expectSignal=None, allowNegativeParam=False, **kwargs
+    ):
         self.indata = indata
 
         if procs is None:
@@ -415,18 +419,23 @@ class SharedMu(ParamModel):
             targets = np.array(procs).astype("S")
             missing = [p for p in targets if p not in self.indata.procs]
             if missing:
-                raise ValueError(f"{missing} not found in processes {self.indata.procs}")
+                raise ValueError(
+                    f"{missing} not found in processes {self.indata.procs}"
+                )
         if len(targets) == 0:
             raise ValueError("SharedMu: no processes to scale")
 
         # 1 for the tied processes, 0 otherwise -- independent of process ordering
         self.mask = tf.constant(
-            np.isin(self.indata.procs, targets).astype(np.float64), dtype=self.indata.dtype
+            np.isin(self.indata.procs, targets).astype(np.float64),
+            dtype=self.indata.dtype,
         )
 
         self.npoi = 1
         self.npou = 0
-        self.params = np.array([b"r"])  # bytes: set_param_default compares signal.encode()
+        self.params = np.array(
+            [b"r"]
+        )  # bytes: set_param_default compares signal.encode()
 
         self.allowNegativeParam = allowNegativeParam
         self.is_linear = self.nparams == 0 or self.allowNegativeParam
@@ -437,6 +446,7 @@ class SharedMu(ParamModel):
         # r on the tied processes, 1 everywhere else
         rnorm = 1.0 + (param[0] - 1.0) * self.mask
         return tf.reshape(rnorm, [1, -1])
+
 
 class Mixture(ParamModel):
     """
