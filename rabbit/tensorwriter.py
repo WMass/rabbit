@@ -730,9 +730,10 @@ class TensorWriter:
     ):
         if not isinstance(process, (list, tuple, np.ndarray)):
             process = [process]
-            # for a single process, a flat [up, down] is one asymmetric uncertainty
-            if np.ndim(uncertainty) == 1 and len(uncertainty) == 2:
-                uncertainty = [uncertainty]
+
+        # for a single process, a flat [up, down] is one asymmetric uncertainty
+        if len(process) == 1 and np.ndim(uncertainty) == 1 and len(uncertainty) == 2:
+            uncertainty = [uncertainty]
 
         if not isinstance(uncertainty, (list, tuple, np.ndarray)):
             uncertainty = [uncertainty]

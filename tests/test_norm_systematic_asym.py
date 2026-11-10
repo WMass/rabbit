@@ -82,10 +82,11 @@ def test_asymmetric_norm_systematic_per_process(sparse_input, symmetrize):
             )
 
 
+@pytest.mark.parametrize("process", ["bkg", ["bkg"], ("bkg",)])
 @pytest.mark.parametrize("sparse_input", [False, True])
-def test_asymmetric_norm_systematic_single_process(sparse_input):
+def test_asymmetric_norm_systematic_single_process(sparse_input, process):
     writer = make_writer(sparse_input)
-    writer.add_norm_systematic("x", "bkg", "ch0", [1.05, 0.97], symmetrize=None)
+    writer.add_norm_systematic("x", process, "ch0", [1.05, 0.97], symmetrize=None)
     np.testing.assert_allclose(
         booked(writer.dict_logkhalfdiff["ch0"]["bkg"]["x"]),
         [0.5 * (np.log(1.05) + np.log(0.97))],
