@@ -4,6 +4,7 @@ from rabbit import common
 baseline_models = {
     "Ones": "param_model",
     "Mu": "param_model",
+    "SharedMu": "param_model",
     "Mixture": "param_model",
     "AxisNormModel": "param_model",
     "AxisExpModel": "param_model",

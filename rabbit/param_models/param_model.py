@@ -387,7 +387,56 @@ class Mu(ParamModel):
 
         rnorm = tf.reshape(rnorm, [1, -1])
         return rnorm
+## CUSTOM FOR MULTIPLE SIGNAL PROCESSES SHARING 1 SIGNAL STRENGTH (ex. VBS WV)
+class SharedMu(ParamModel):
+    """
+    one unconstrained parameter 'r' multiplying ALL signal processes
+    (or only the processes given as a comma-separated argument), and ones otherwise
 
+        --paramModel SharedMu                 # every signal process shares r
+        --paramModel SharedMu procA,procB     # only these processes
+    """
+
+    @classmethod
+    def parse_args(cls, indata, *args, **kwargs):
+        if len(args) > 1:
+            raise ValueError(
+                f"SharedMu takes at most 1 argument (comma-separated processes), got {args}"
+            )
+        procs = args[0].split(",") if args else None
+        return cls(indata, procs, **kwargs)
+
+    def __init__(self, indata, procs=None, expectSignal=None, allowNegativeParam=False, **kwargs):
+        self.indata = indata
+
+        if procs is None:
+            targets = np.asarray(self.indata.signals)
+        else:
+            targets = np.array(procs).astype("S")
+            missing = [p for p in targets if p not in self.indata.procs]
+            if missing:
+                raise ValueError(f"{missing} not found in processes {self.indata.procs}")
+        if len(targets) == 0:
+            raise ValueError("SharedMu: no processes to scale")
+
+        # 1 for the tied processes, 0 otherwise -- independent of process ordering
+        self.mask = tf.constant(
+            np.isin(self.indata.procs, targets).astype(np.float64), dtype=self.indata.dtype
+        )
+
+        self.npoi = 1
+        self.npou = 0
+        self.params = np.array([b"r"])  # bytes: set_param_default compares signal.encode()
+
+        self.allowNegativeParam = allowNegativeParam
+        self.is_linear = self.nparams == 0 or self.allowNegativeParam
+
+        self.set_param_default(expectSignal, allowNegativeParam)
+
+    def compute(self, param, full=False):
+        # r on the tied processes, 1 everywhere else
+        rnorm = 1.0 + (param[0] - 1.0) * self.mask
+        return tf.reshape(rnorm, [1, -1])
 
 class Mixture(ParamModel):
     """
