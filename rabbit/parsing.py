@@ -811,6 +811,59 @@ def common_parser():
         "docs/mcstat/RESULTS.md §7d, §9p). Default 'sandwich'.",
     )
     parser.add_argument(
+        "--mcStatFoldBound",
+        default=0.0,
+        type=float,
+        help="--mcStatDebias kfold with per-fold systematic variations (split logk, "
+        "log_normal systematics): scale kappa of the bound on the deviation x of "
+        "each fold's exponent from the full-sample one, per (fold, bin, process). "
+        "The jackknife objective, a bias correction valid for small x, is "
+        "otherwise unbounded below where a fold template outgrows the full one (a "
+        "few MC events with large weights in one fold). Value, gradient and "
+        "curvature at the nominal point are unchanged, and at x << kappa the change "
+        "is of order x^3 / kappa^2 (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a). 0, the "
+        "default, disables it; 0.5 bounds the W-mass fits.",
+    )
+    parser.add_argument(
+        "--mcStatFoldMaxDeviation",
+        default=0.0,
+        type=float,
+        help="--mcStatDebias kfold with per-fold systematic variations (split logk): "
+        "the (bin, process) templates whose fold deviation norm, the largest over "
+        "the folds of |logk_fold - logk|_2 over all systematics, exceeds this take "
+        "the shared logk (the full-sample variation in every fold). Along the most "
+        "unfavourable combination of nuisances a fold's exponent deviates by that "
+        "norm times |theta|; above it the jackknife's noise-floor estimate is not "
+        "reliable (templates of a few MC events with large weights), and the fit "
+        "can drift along such directions. The decision depends on the templates "
+        "only; the number of templates concerned is logged. 0, the default, "
+        "disables it; 0.1 is used for the W-mass fits.",
+    )
+    parser.add_argument(
+        "--mcStatFoldMinKstat",
+        default=0.0,
+        type=float,
+        help="--mcStatDebias kfold: the (bin, process) templates with fewer "
+        "effective MC events, kstat = (sum w)^2 / sum w^2, than this are taken out "
+        "of the fold structure: every fold gets the full-sample template (nominal, "
+        "MC-stat variance and logk), so they enter the de-biased objective like the "
+        "ordinary likelihood, without bias correction. With a few events a fold "
+        "estimate is noise (with negative weights a fold can cancel to zero while "
+        "its variations do not), which the jackknife cannot correct and which makes "
+        "the objective unbounded below. 0 disables it. Default 0.",
+    )
+    parser.add_argument(
+        "--mcStatFoldBoundForm",
+        default="taper",
+        choices=["taper", "tanh"],
+        help="Form of the --mcStatFoldBound bound: 'taper' x / (1 + x^2 / kappa^2), "
+        "which hands a fold back to the full template (the shared logk) for "
+        "|x| >> kappa, so that far out the objective is the ordinary likelihood; "
+        "'tanh' kappa tanh(x / kappa), which keeps the deviation at kappa and makes "
+        "the fit favour templates held there (kept for comparison). Default "
+        "'taper'.",
+    )
+    parser.add_argument(
         "--covMode",
         default="observed",
         choices=["observed", "fisher"],
