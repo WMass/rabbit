@@ -24,6 +24,7 @@ is what pins both scalars; asserting only the postfit parameter value (as
 test_external_term.py does) cannot see a constant at all.
 """
 
+import logging
 import os
 import tempfile
 
@@ -253,6 +254,66 @@ def test_scalars_do_not_move_the_fit():
             abs(dhess - 1.0 / sigma**2) < 1e-8
         ), f"term changed the hessian by {dhess}, expected {1.0 / sigma**2}"
     print("  test_scalars_do_not_move_the_fit OK")
+
+
+SPARSE_GRAD = [0.3, -0.2]
+
+
+def _sparse_raw_term(grad=None, const=None, lognorm=None):
+    """A raw term, as read_external_terms_from_h5 returns it, with a sparse
+    Hessian over the parameters a and b."""
+    import tensorflow as tf
+
+    hess = tf.sparse.from_dense(tf.constant([[4.0, 1.0], [1.0, 3.0]], tf.float64))
+    return dict(
+        name="ext",
+        params=np.array(["a", "b"]),
+        grad_values=None if grad is None else np.asarray(grad, dtype=np.float64),
+        hess_dense=None,
+        hess_sparse=hess,
+        const=const,
+        lognorm=lognorm,
+    )
+
+
+@pytest.mark.parametrize(
+    "stored,missing",
+    [
+        (dict(grad=SPARSE_GRAD), {"centering constant", "log-normalization"}),
+        # what mean= stores: const, but no lognorm
+        (dict(grad=SPARSE_GRAD, const=0.1), {"log-normalization"}),
+        (dict(grad=SPARSE_GRAD, lognorm=0.2), {"centering constant"}),
+        # no linear part: centered at the origin, const is exactly 0
+        (dict(), {"log-normalization"}),
+        (dict(grad=SPARSE_GRAD, const=0.1, lognorm=0.2), set()),
+    ],
+    ids=["neither", "const", "lognorm", "no_grad", "both"],
+)
+def test_sparse_term_warning_names_what_is_missing(caplog, stored, missing):
+    """Neither scalar is derived from a sparse Hessian at load time, and the
+    warning must name the one that is missing. It used to read "no stored
+    const/lognorm, so it cannot be centered" whenever either was absent,
+    including for a term written with mean= (only lognorm missing) and for one
+    with no linear part (nothing to center)."""
+    import tensorflow as tf
+
+    name = external_likelihood.logger.name
+    with caplog.at_level(logging.WARNING, logger=name):
+        (built,) = external_likelihood.build_tf_external_terms(
+            [_sparse_raw_term(**stored)], np.array(["a", "b"]), tf.float64
+        )
+    msgs = [r.getMessage() for r in caplog.records if r.name == name]
+    named = {
+        what
+        for what in ("centering constant", "log-normalization")
+        if any(what in m for m in msgs)
+    }
+    assert named == missing and len(msgs) == len(missing), msgs
+    if "centering constant" not in missing:
+        assert not any("center" in m for m in msgs), msgs
+    # what was stored is kept; a missing scalar is taken as 0
+    assert built["const"] == stored.get("const", 0.0)
+    assert built["lognorm"] == stored.get("lognorm", 0.0)
 
 
 def main():
