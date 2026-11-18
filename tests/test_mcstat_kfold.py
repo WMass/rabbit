@@ -554,6 +554,44 @@ def test_folded_pair_split_symmetrization(symmetrize, tmp_path):
     )
 
 
+@pytest.mark.parametrize("symmetrize", ["linear", "quadratic"])
+def test_folded_pair_split_symmetrization_sparse_equals_dense(symmetrize, tmp_path):
+    """The SymAvg and SymDiff systematics of a folded linear/quadratic pair give
+    the same fold predictions with sparse storage (per-fold delta against the
+    full logk) as with dense storage (per-fold logk)."""
+    k, nb = 2, 12
+    rng = np.random.default_rng(9)
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    folds = split_into_folds(rng, rng.poisson(np.full(nb, 500.0)), k).astype(float)
+    w = 1.0 + 0.2 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    up = np.stack([rng.poisson(f * w) for f in folds]).astype(float)
+    down = np.stack([rng.poisson(f / w**0.5) for f in folds]).astype(float)
+    preds = []
+    for sparse in (False, True):
+        tw = TensorWriter(sparse=sparse)
+        tw.add_channel([ax], "ch0")
+        tw.add_data(_hist1d(ax, folds.sum(0)), "ch0")
+        tw.add_process(
+            _fold_hist(ax, folds), "sig", "ch0", signal=True, fold_axis="mcfold"
+        )
+        tw.add_systematic(
+            [_fold_hist(ax, up), _fold_hist(ax, down)],
+            "pair",
+            "sig",
+            "ch0",
+            mirror=False,
+            symmetrize=symmetrize,
+            fold_axis="mcfold",
+        )
+        name = f"pair_{symmetrize}_{'sp' if sparse else 'de'}.hdf5"
+        f = _fold_fitter(_write(tw, tmp_path, name), tmp_path)
+        _set_param(f, "pairSymAvg", 1.5)
+        _set_param(f, "pairSymDiff", -2.0)
+        preds.append(np.asarray(f._compute_fold_yields(halves=False)))
+    assert np.abs(preds[0] / folds - 1.0).max() > 0.02
+    np.testing.assert_allclose(preds[1], preds[0], rtol=1e-10)
+
+
 def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
     """In the bins a folded process is written without fold structure (here a
     negative fold), and everywhere for an MC-stat-exempt process, a folded
