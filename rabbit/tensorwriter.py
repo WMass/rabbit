@@ -75,6 +75,10 @@ class TensorWriter:
         # mcstat_fold_min_kstat: a folded systematic gets the full logk there,
         # the ratio of two of their sums being dominated by noise (e.g.
         # cancelling negative weights). [channel][process] -> bool [k, nbinschan]
+        # On by default (3; 0 disables it). It acts per fold and on the folded
+        # systematics only; the fitter's --mcStatFoldMinKstat instead takes whole
+        # (bin, process) templates with a small full-sample kstat out of the fold
+        # structure (nominal and logk), and is off by default.
         self.mcstat_fold_min_kstat = mcstat_fold_min_kstat
         self.dict_low_kstat_folds = {}
         # Split-logk fold templates (only for systematics added with fold_axis):

@@ -2144,13 +2144,14 @@ class Fitter:
                     "k-fold de-biasing with split logk and --mcStatFoldBound 0: the "
                     "objective is unbounded below wherever a fold's variation "
                     "outgrows the full-sample one (e.g. --mcStatFoldBound 0.5 bounds "
-                    "it)"
+                    "its expectation term)"
                 )
             elif self.mcstat_fold_bound >= kappa_max:
                 logger.warning(
                     f"--mcStatFoldBound {self.mcstat_fold_bound} >= {kappa_max:.3f} "
-                    f"for k = {k} ({self.mcstat_fold_bound_form}): the split-logk "
-                    "objective is not guaranteed to be bounded below"
+                    f"for k = {k} ({self.mcstat_fold_bound_form}): the expectation "
+                    "term of the split-logk objective is not guaranteed to be "
+                    "bounded below"
                 )
             else:
                 logger.info(
@@ -2418,17 +2419,22 @@ class Fitter:
         taper (default): d = x / (1 + x^2 / kappa^2). Slope 1 and no curvature at
         x = 0, so value, gradient and curvature at the nominal point are
         unchanged and the change at small x is O(x^3 / kappa^2); |d| <= kappa/2,
-        at |x| = kappa, and d -> 0 for |x| >> kappa: far out the halves are the
-        full template, the shared logk, and the objective is the ordinary
-        likelihood. tanh: d = kappa tanh(x / kappa), the same at small x, but it
-        keeps |d| = kappa for all |x| >> kappa; a template held there enters the
-        objective as nu (2 - cosh kappa) - n log nu, which favours nu =
-        n / (2 - cosh kappa), so the fit gains by pushing templates into the
+        at |x| = kappa, and d -> 0 for |x| >> kappa: far out each fold follows the
+        full-sample variation, as with the shared logk (the nominal folds still
+        differ, so the objective is that of a shared systematic, not the
+        ordinary likelihood). tanh: d = kappa tanh(x / kappa), the same at small
+        x, but it keeps |d| = kappa for all |x| >> kappa; a template held there
+        enters the objective as nu (2 - cosh kappa) - n log nu, which favours
+        nu = n / (2 - cosh kappa), so the fit gains by pushing templates into the
         bound (kept for comparison).
 
-        For any k the expectation term is at least (k/2a) [k/b - e^dmax] N e^E
-        (a = k//2, b = k - a, dmax the largest |d|): bounded below for
-        dmax < log(k/b) (log 2 for even k).
+        For any k the Poisson expectation term of non-negative templates is at
+        least (k/2a) [k/b - e^dmax] N e^E (a = k//2, b = k - a, dmax the largest
+        |d|): bounded below for dmax < log(k/b) (log 2 for even k). The log terms
+        are not bounded: + a/(2b) n log n_A + b/(2a) n log n_B goes to -inf where
+        a half's prediction vanishes and the full one does not, e.g. when a free
+        normalisation sends a process alone in one half to zero. That holds for
+        the nominal folds alone too, with or without split logk.
         (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a)
         """
         kappa = self.mcstat_fold_bound

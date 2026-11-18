@@ -1110,7 +1110,8 @@ def test_fold_bound_keeps_each_fold_near_the_full_template(form, bound, dmax, tm
 def test_fold_taper_hands_the_fold_back_to_the_full_template(tmp_path):
     """The taper returns to the shared logk for |x| >> kappa: very far along the
     systematic the folds follow the full-sample variation, d ~ kappa^2 / x, so
-    the objective there is the ordinary likelihood with no gain for the fit."""
+    the objective there is that of a shared systematic, with no gain for the
+    fit."""
     f = _fold_fitter(
         make_one_fold_variation_toy(tmp_path), tmp_path, *BOUND, *NO_SHARING
     )

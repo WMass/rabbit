@@ -243,11 +243,15 @@ into `SymAvg` and `SymDiff` in every fold, as for the full pair
 (1/`k` of it for the additive `normal` form) in every fold of the bins where its
 process has no fold structure (a negative fold, or no MC-stat variance), and in
 the folds with fewer effective MC events `sumw^2/sumw2` than
-`TensorWriter(mcstat_fold_min_kstat=3)`: there the per-fold variation is the
-ratio of two sums dominated by their noise (e.g. cancelling negative weights),
-and its logk can be arbitrarily large. An empty fold has no `log_normal`
-variation (its logk is 0); an additive `normal` variation of an empty fold is
-kept, since it is part of the full one, unless the full template is empty.
+`TensorWriter(mcstat_fold_min_kstat=3)` (on by default, 0 disables it): there the
+per-fold variation is the ratio of two sums dominated by their noise (e.g.
+cancelling negative weights), and its logk can be arbitrarily large. This
+threshold is per fold and changes the folded systematics only; the fitter's
+`--mcStatFoldMinKstat` (off by default, below) instead uses the full-sample kstat
+of a (bin, process) template and takes the whole template, nominal and logk, out
+of the fold structure. An empty fold has no `log_normal` variation (its logk is
+0); an additive `normal` variation of an empty fold is kept, since it is part of
+the full one, unless the full template is empty.
 
 **On `write()`** — extra HDF5 datasets (attribute `mcstat_fold_k` = `k`):
 - `hnorm_folds`: dense mode `[k, nbinsfull, nproc]`; sparse mode `[k, nnz]`, the
@@ -301,8 +305,9 @@ folded.
     and no curvature at `x = 0`, so value, gradient and curvature at the nominal
     point are unchanged and the change at small `x` is `O(x³/κ²)`; `|d| ≤ κ/2`,
     reached at `|x| = κ`, and `d → κ²/x → 0` for `|x| ≫ κ`: far out a fold follows
-    the full-sample variation (the shared logk) and the objective is the ordinary
-    likelihood.
+    the full-sample variation, as with the shared logk. The nominal folds still
+    differ, so the objective there is that of a shared systematic, not the
+    ordinary likelihood.
   - `tanh` (for comparison): `d(x) = κ tanh(x/κ)` keeps `|d| = κ` for all
     `|x| ≫ κ`. A template held there enters the objective as
     `ν (2 − cosh κ) − n log ν` instead of `ν − n log ν`, which favours
@@ -310,12 +315,17 @@ folded.
     the bound. On the W-mass fit the `recoil_stat` pulls grew with κ (rms 0.19,
     0.34, 0.73 for κ = 0.3, 0.5, 0.6 against 0.065 with shared logk) and σ(mW)
     moved by 15%.
-  For any k the expectation term is at least `(k/2a)[k/b − e^{d_max}] N e^E`
-  (`a = ⌊k/2⌋`, `b = k − a`, `d_max` the largest `|d|`): bounded below for
-  `d_max < log(k/b)` (`log 2` for even k), i.e. `κ < 2 log(k/b)` for the taper,
-  `κ < log(k/b)` for tanh. At the ordinary minimum of the W-mass fit `|x| ≤ 0.11`
-  everywhere (99.99% of the templates below 0.024). The additive `normal` form is
-  not bounded.
+  For any k the Poisson expectation term of non-negative templates is at least
+  `(k/2a)[k/b − e^{d_max}] N e^E` (`a = ⌊k/2⌋`, `b = k − a`, `d_max` the largest
+  `|d|`): bounded below for `d_max < log(k/b)` (`log 2` for even k), i.e.
+  `κ < 2 log(k/b)` for the taper, `κ < log(k/b)` for tanh. This is what the bound
+  guarantees: the log terms of the halves, `+ a/(2b) n log n_A + b/(2a) n log n_B`,
+  still go to −∞ where a half's prediction vanishes and the full one does not, e.g.
+  when a free normalisation sends a process that is alone in one half to zero
+  (two processes with folds `[100, 0]` and `[0, 100]` in a bin). That holds for the
+  jackknife of the nominal folds alone too, with or without split logk. At the
+  ordinary minimum of the W-mass fit `|x| ≤ 0.11` everywhere (99.99% of the
+  templates below 0.024). The additive `normal` form is not bounded.
 - Shared logk for noisy templates (`--mcStatFoldMaxDeviation τ`, off by default,
   0.1 for the W-mass fits). The bound keeps the objective bounded but does not
   make the noise-floor

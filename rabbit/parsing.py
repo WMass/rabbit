@@ -819,10 +819,13 @@ def common_parser():
         "each fold's exponent from the full-sample one, per (fold, bin, process). "
         "The jackknife objective, a bias correction valid for small x, is "
         "otherwise unbounded below where a fold template outgrows the full one (a "
-        "few MC events with large weights in one fold). Value, gradient and "
-        "curvature at the nominal point are unchanged, and at x << kappa the change "
-        "is of order x^3 / kappa^2 (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a). 0, the "
-        "default, disables it; 0.5 bounds the W-mass fits.",
+        "few MC events with large weights in one fold); the bound keeps its "
+        "expectation term bounded below (its log terms still diverge where a "
+        "half's prediction vanishes, as for the nominal folds alone). Value, "
+        "gradient and curvature at the nominal point are unchanged, and at "
+        "x << kappa the change is of order x^3 / kappa^2 "
+        "(docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a). 0, the default, disables it; "
+        "0.5 bounds the W-mass fits.",
     )
     parser.add_argument(
         "--mcStatFoldMaxDeviation",
@@ -864,8 +867,9 @@ def common_parser():
         default="taper",
         choices=["taper", "tanh"],
         help="Form of the --mcStatFoldBound bound: 'taper' x / (1 + x^2 / kappa^2), "
-        "which hands a fold back to the full template (the shared logk) for "
-        "|x| >> kappa, so that far out the objective is the ordinary likelihood; "
+        "which hands a fold back to the full-sample variation (the shared logk) "
+        "for |x| >> kappa, so that far out the template enters as with a shared "
+        "systematic; "
         "'tanh' kappa tanh(x / kappa), which keeps the deviation at kappa and makes "
         "the fit favour templates held there (kept for comparison). Default "
         "'taper'.",
