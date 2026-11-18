@@ -624,6 +624,24 @@ def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
     )
 
 
+def test_empty_fold_keeps_its_additive_variation(tmp_path):
+    """An additive (normal) variation of an empty fold is part of the full one
+    (e.g. events migrating into the bin), so it is kept and the folds sum to
+    the full variation; it is dropped only where the full template is empty,
+    as for the full logk."""
+    ax = hist.axis.Regular(2, 0.0, 1.0, name="x")
+    folds = np.array([[0.0, 0.0], [10.0, 0.0]])
+    up = np.array([[2.0, 1.0], [12.0, 1.0]])
+    tw = TensorWriter(systematic_type="normal")
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, np.array([10.0, 1.0])), "ch0")
+    tw.add_process(_fold_hist(ax, folds), "sig", "ch0", fold_axis="mcfold")
+    tw.add_systematic(_fold_hist(ax, up), "mig", "sig", "ch0", fold_axis="mcfold")
+    _, _, logk, logk_folds = _read_logk(_write(tw, tmp_path, "empty_normal.hdf5"))
+    np.testing.assert_allclose(logk[:, 0, 0], [4.0, 0.0])
+    np.testing.assert_allclose(logk_folds[:, :, 0, 0], [[2.0, 0.0], [2.0, 0.0]])
+
+
 # ---------------------------------------------------------------------------
 # bin-by-bin stat: separately profiled jackknife terms, compensator
 # ---------------------------------------------------------------------------
@@ -1314,3 +1332,121 @@ def test_low_kstat_opt_out_keeps_the_objective_bounded(tmp_path):
         vals[kmin] = np.array(out)
     assert vals["0"][-1] < vals["0"][0] - 1e3
     assert np.all(np.diff(vals["10"]) > 0.0)
+
+
+def make_additive_fold_toy(path, scale=1.0, noisy=False):
+    """'sig' with two equal folds of 50 * scale per bin and additive ('normal')
+    variations: a folded 'shift' of +2 * scale in each fold (+4 * scale in full)
+    and a shared 'shared' of +4 * scale; with `noisy` a folded 'noisy' whose
+    fold shifts differ: [+12, -4] * scale in the first bin (fold deviation 0.16
+    relative to the fold-scale nominal) and [+4, 0] * scale in the others (0.04).
+    Asimov data. Returns the filename."""
+    nb, k = 3, 2
+    folds = np.full((k, nb), 50.0 * scale)
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    tw = TensorWriter(systematic_type="normal")
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, folds.sum(0)), "ch0")
+    tw.add_process(_fold_hist(ax, folds), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_systematic(
+        _fold_hist(ax, folds + 2.0 * scale), "shift", "sig", "ch0", fold_axis="mcfold"
+    )
+    tw.add_systematic(_hist1d(ax, folds.sum(0) + 4.0 * scale), "shared", "sig", "ch0")
+    if noisy:
+        shifts = np.array([[12.0, 4.0, 4.0], [-4.0, 0.0, 0.0]]) * scale
+        tw.add_systematic(
+            _fold_hist(ax, folds + shifts), "noisy", "sig", "ch0", fold_axis="mcfold"
+        )
+    name = f"additive_folds_s{scale}{'_noisy' if noisy else ''}.hdf5"
+    return _write(tw, path, name)
+
+
+@pytest.mark.parametrize(
+    "protection",
+    [("--mcStatFoldMinKstat", "1000"), ("--mcStatFoldMaxDeviation", "0.1")],
+    ids=["min-kstat", "max-deviation"],
+)
+def test_fold_protections_keep_additive_variations_at_fold_scale(protection, tmp_path):
+    """With additive (normal) systematics a variation shared across folds is 1/k
+    of the full one in each fold. Both protections hand the folds that shared
+    variation: the rescaled halves follow the full prediction (104 for a +4
+    shift of 100), not k times the shift (108). A shared systematic and a folded
+    one without fold noise are no noisy templates."""
+    f = _fold_fitter(make_additive_fold_toy(tmp_path), tmp_path, *protection)
+    if protection[0] == "--mcStatFoldMaxDeviation":
+        assert not np.asarray(f.mcstat_fold_shared_templates).any()
+    else:
+        assert np.asarray(f.mcstat_fold_optout_templates)[: f.indata.nbins].all()
+    for syst in ("shift", "shared"):
+        _set_param(f, "shift", 0.0)
+        _set_param(f, "shared", 0.0)
+        _set_param(f, syst, 1.0)
+        halves = np.asarray(f._compute_fold_yields(halves=True))
+        np.testing.assert_allclose(halves, 104.0, rtol=1e-12)
+
+
+@pytest.mark.parametrize("scale", [1.0, 10.0])
+def test_noisy_additive_fold_templates_take_the_shared_logk(scale, tmp_path):
+    """The fold deviation of an additive variation is relative to the fold-scale
+    nominal, so the threshold means the same at any yield: the bin whose fold
+    shifts deviate by 8 events on 50 (0.16) takes the shared variation, the
+    others (0.04) keep their own, for 10x the yields as well. A shared
+    template's halves then follow the full prediction."""
+    fn = make_additive_fold_toy(tmp_path, scale=scale, noisy=True)
+    f = _fold_fitter(fn, tmp_path, "--mcStatFoldMaxDeviation", "0.1")
+    flags = np.asarray(f.mcstat_fold_shared_templates)[: f.indata.nbins, 0]
+    assert flags.tolist() == [True, False, False]
+    _set_param(f, "noisy", 1.0)
+    halves = np.asarray(f._compute_fold_yields(halves=True))
+    full = np.asarray(f._compute_yields_noBBB(full=False)[0])
+    np.testing.assert_allclose(halves[:, 0], full[0], rtol=1e-12)
+    assert np.abs(halves[:, 1:] - full[None, 1:]).max() > scale
+
+
+def make_asymmetric_fold_toy(path):
+    """One bin, two folds of 1000 events, an asymmetric folded pair (up
+    [e^0.12, e^-0.12] times the folds, down the nominal, symmetrize=None):
+    the (logkavg, logkhalfdiff) deviations of a fold are equal, so their L2
+    norm (0.090) understates the deviation of the exponent at theta = 1
+    (0.127). Asimov data. Returns the filename."""
+    ax = hist.axis.Regular(1, 0.0, 1.0, name="x")
+    nom = np.full((2, 1), 1000.0)
+    up = nom * np.exp([[0.12], [-0.12]])
+    tw = TensorWriter()
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, nom.sum(0)), "ch0")
+    tw.add_process(_fold_hist(ax, nom), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_systematic(
+        [_fold_hist(ax, up), _fold_hist(ax, nom)],
+        "asym",
+        "sig",
+        "ch0",
+        fold_axis="mcfold",
+        mirror=False,
+        symmetrize=None,
+    )
+    return _write(tw, path, "asymmetric_folds.hdf5")
+
+
+@pytest.mark.parametrize("tau, shared", [("0.1", True), ("0.13", False)])
+def test_fold_deviation_norm_of_asymmetric_systematics(tau, shared, tmp_path):
+    """For an asymmetric systematic the deviation norm adds the logkavg and
+    logkhalfdiff deviations (theta and theta alpha(theta) multiply them), so it
+    bounds the change of each fold's exponent per unit |theta| and is reached at
+    theta = 1 here (0.1272): above the threshold of 0.1, not above 0.13."""
+    fn = make_asymmetric_fold_toy(tmp_path)
+    f = _fold_fitter(fn, tmp_path, "--mcStatFoldMaxDeviation", tau)
+    assert bool(np.asarray(f.mcstat_fold_shared_templates).any()) == shared
+    if shared:
+        return
+    # per fold |delta logkavg| + |delta logkhalfdiff| = |log(up_f / n_f) -
+    # log(up / n)|, the down variation being the nominal
+    norm = np.abs(np.array([0.12, -0.12]) - np.log(np.cosh(0.12)))
+    worst = 0.0
+    for theta in np.linspace(-3.0, 3.0, 25):
+        _set_param(f, "asym", theta)
+        d = np.abs(_fold_log_ratios(f)[:, 0, 0])
+        assert np.all(d <= norm * abs(theta) * (1 + 1e-9) + 1e-12), (theta, d)
+        if theta != 0:
+            worst = max(worst, (d / (norm * abs(theta))).max())
+    assert worst > 1 - 1e-6

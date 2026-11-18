@@ -830,14 +830,17 @@ def common_parser():
         type=float,
         help="--mcStatDebias kfold with per-fold systematic variations (split logk): "
         "the (bin, process) templates whose fold deviation norm, the largest over "
-        "the folds of |logk_fold - logk|_2 over all systematics, exceeds this take "
-        "the shared logk (the full-sample variation in every fold). Along the most "
-        "unfavourable combination of nuisances a fold's exponent deviates by that "
-        "norm times |theta|; above it the jackknife's noise-floor estimate is not "
-        "reliable (templates of a few MC events with large weights), and the fit "
-        "can drift along such directions. The decision depends on the templates "
-        "only; the number of templates concerned is logged. 0, the default, "
-        "disables it; 0.1 is used for the W-mass fits.",
+        "the folds of |logk_fold - logk|_2 over all systematics (an asymmetric "
+        "systematic contributing |delta logkavg| + |delta logkhalfdiff|), exceeds "
+        "this take the shared logk (the full-sample variation in every fold). "
+        "Along any combination of nuisances a fold's exponent deviates by at most "
+        "that norm times |theta|; above it the jackknife's noise-floor estimate is "
+        "not reliable (templates of a few MC events with large weights), and the "
+        "fit can drift along such directions. For normal systematics the deviation "
+        "of a fold's additive variation is taken relative to the fold-scale "
+        "nominal, (k logk_fold - logk) / |nominal|. The decision depends on the "
+        "templates only; the number of templates concerned is logged. 0, the "
+        "default, disables it; 0.1 is used for the W-mass fits.",
     )
     parser.add_argument(
         "--mcStatFoldMinKstat",

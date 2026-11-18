@@ -245,7 +245,9 @@ process has no fold structure (a negative fold, or no MC-stat variance), and in
 the folds with fewer effective MC events `sumw^2/sumw2` than
 `TensorWriter(mcstat_fold_min_kstat=3)`: there the per-fold variation is the
 ratio of two sums dominated by their noise (e.g. cancelling negative weights),
-and its logk can be arbitrarily large.
+and its logk can be arbitrarily large. An empty fold has no `log_normal`
+variation (its logk is 0); an additive `normal` variation of an empty fold is
+kept, since it is part of the full one, unless the full template is empty.
 
 **On `write()`** — extra HDF5 datasets (attribute `mcstat_fold_k` = `k`):
 - `hnorm_folds`: dense mode `[k, nbinsfull, nproc]`; sparse mode `[k, nnz]`, the
@@ -324,12 +326,21 @@ folded.
   the bound stops it, so the result depends on κ (W-mass fit with split
   `recoil_stat`, taper: mW −17.7 ± 10.4, −16.9 ± 11.0, −15.5 ± 13.3 MeV for
   κ = 0.3, 0.5, 1.0; tanh worse, with `recoil_stat` pulls up to rms 0.73). The
-  (bin, process) templates whose fold deviation norm `max_f |logk_f − logk|₂` over
-  all systematics, the largest change of a fold exponent per unit `|θ|` along the
-  most unfavourable combination of nuisances, exceeds τ therefore take the shared
-  logk in every fold (`Fitter._share_noisy_fold_templates`, dense: `logk_folds`,
-  sparse: the per-fold delta set to 0); the decision depends on the templates
-  only and is logged. The norm has no gap but a tail of low-statistics templates:
+  (bin, process) templates whose fold deviation norm `max_f |c_f|₂` over all
+  systematics exceeds τ therefore take the shared logk in every fold
+  (`Fitter._share_noisy_fold_templates`, dense: `logk_folds`, sparse: the per-fold
+  delta set to 0); the decision depends on the templates only and is logged. For
+  a symmetric systematic `c_f,s = logk_f,s − logk_s`; for an asymmetric one
+  `c_f,s = |Δlogkavg| + |Δlogkhalfdiff|`, since they enter the exponent with `θ`
+  and `θ α(θ)`, `|α| ≤ 1`. The norm is then the largest change of a fold exponent
+  per unit `|θ|` along any combination of nuisances, reached along the most
+  unfavourable one (for an asymmetric systematic at `|θ| ≥ 1`). For the additive
+  `normal` form the shared logk is `1/k` of the full one in each fold, and the
+  deviation of a fold's variation from it is taken relative to the fold-scale
+  nominal: `c_f,s = (k logk_f,s − logk_s)/|n|`, the fractional change of a
+  rescaled fold per unit `θ`, which is the `log_normal` exponent deviation to
+  first order (an absolute deviation would make τ a number of events). The norm
+  has no gap but a tail of low-statistics templates:
   in the W-mass fit 95% of the MC yield is below 0.003, and above 0.1 lie 96
   templates (6·10⁻⁵ of the MC yield; W→τν and Z→ττ) without the sidebands and
   12281 (2·10⁻⁴, median kstat ~16) with the isolation/mT sidebands; the runaway

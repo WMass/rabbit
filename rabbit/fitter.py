@@ -2166,11 +2166,22 @@ class Fitter:
         # even k (a = b) they reduce to the familiar (2, 1/2, 1/2).
         self.jackknife_weights = (k * k / (2.0 * a * b), a / (2.0 * b), b / (2.0 * a))
 
+    def _shared_fold_logk(self, k):
+        """The dense per-fold logk of a variation shared across the k folds, as
+        the writer stores it in logk_folds: the full logk for the multiplicative
+        log_normal form, 1/k of it for the additive normal form, which is split
+        evenly so that the folds sum to the full variation (the dense split-logk
+        fold yields take logk_folds at fold scale)."""
+        if self.indata.systematic_type == "normal":
+            return self.indata.logk / k
+        return self.indata.logk
+
     def _opt_out_low_kstat_fold_templates(self):
         """Take the (bin, process) templates with fewer effective MC events than
         --mcStatFoldMinKstat, kstat = (sum w)^2 / sum w^2, out of the fold
         structure: every fold gets 1/k of the full-sample nominal and MC-stat
-        variance and the full-sample logk. The halves then equal the full template,
+        variance and the logk of a variation shared across folds
+        (_shared_fold_logk). The halves then equal the full template,
         so such a template enters 2 L_full - 1/2 L_A - 1/2 L_B like the ordinary
         likelihood and gets no bias correction.
 
@@ -2239,7 +2250,7 @@ class Fitter:
                 red = len(lf.shape) - 3
                 shape = [1, nbf, int(lf.shape[2])] + [1] * red
                 self.logk_folds = tf.where(
-                    tf.reshape(flag, shape), self.indata.logk[None], lf
+                    tf.reshape(flag, shape), self._shared_fold_logk(k)[None], lf
                 )
                 self.indata.logk_folds = self.logk_folds
             flag_np = np.asarray(flag)
@@ -2258,13 +2269,23 @@ class Fitter:
         )
 
     def _share_noisy_fold_templates(self):
-        """The shared logk (the full-sample one in every fold) for the (bin,
-        process) templates whose fold deviation norm, max over folds of
-        |logk_f - logk|_2 over the systematics, exceeds --mcStatFoldMaxDeviation.
+        """The shared logk (that of a variation shared across folds,
+        _shared_fold_logk) in every fold for the (bin, process) templates whose
+        fold deviation norm exceeds --mcStatFoldMaxDeviation.
 
-        Along the most unfavourable combination of nuisances a fold's exponent
-        deviates from the full-sample one by that norm times |theta|. The
-        jackknife combination is a bias correction to second order in that
+        The norm is the largest over the folds of |c_f|_2 over the systematics,
+        with c_f,s = logk_f,s - logk_s for a symmetric systematic and
+        |delta logkavg| + |delta logkhalfdiff| for an asymmetric one (they enter
+        the exponent with theta and theta alpha(theta), |alpha| <= 1). Along any
+        combination of nuisances a fold's exponent deviates from the full-sample
+        one by at most that norm times |theta|, which is reached along the most
+        unfavourable one (for an asymmetric systematic at |theta| >= 1). For the
+        additive normal form the deviation of a fold's variation from the shared
+        one (1/k of the full) is taken relative to the fold-scale nominal |n|/k,
+        i.e. (k logk_f - logk) / |n|: the fractional change of a rescaled fold
+        per unit theta, the exponent deviation of log_normal to first order.
+
+        The jackknife combination is a bias correction to second order in that
         deviation, so above the threshold its noise-floor estimate (with k = 2 a
         single fold difference per template, as large as the noise itself) is not
         reliable: on templates of a few MC events with large weights the de-biased
@@ -2276,7 +2297,8 @@ class Fitter:
         """
         tau = self.mcstat_fold_max_dev
         if self.logk_folds_delta is not None:
-            # sparse: the per-fold delta against the full logk, [k, nnz, nfolded]
+            # sparse (log_normal, symmetric folded systematics only): the
+            # per-fold delta against the full logk, [k, nnz, nfolded]
             delta = self.logk_folds_delta
             dev = tf.reduce_max(tf.norm(delta, axis=-1), axis=0)  # [nnz]
             flag = dev > tau
@@ -2294,21 +2316,29 @@ class Fitter:
             share = vals[flag_np].sum() / max(vals.sum(), 1e-300)
             dev_np = np.asarray(dev)
         else:
-            logk = self.indata.logk
             lf = self.logk_folds
             k, nbf, nproc = (int(n) for n in lf.shape[:3])
-            red = list(range(3, len(lf.shape)))
+            logk = self._shared_fold_logk(k)
+            # [k, nbins, nproc, 2, nsyst] for an asymmetric tensor
+            asym = len(lf.shape) == 5
+            normal = self.indata.systematic_type == "normal"
+            norm = self.indata.norm
             per_bin = k * int(np.prod(lf.shape[2:]))
             chunk = max(1, int(6e7 // per_bin))  # ~0.5 GB temporaries
             devs = []
             for b0 in range(0, nbf, chunk):
                 d = lf[:, b0 : b0 + chunk] - logk[None, b0 : b0 + chunk]
-                devs.append(
-                    tf.reduce_max(tf.sqrt(tf.reduce_sum(tf.square(d), axis=red)), 0)
-                )
+                if asym:
+                    d = tf.reduce_sum(tf.abs(d), axis=3)
+                dev_f = tf.sqrt(tf.reduce_sum(tf.square(d), axis=-1))
+                if normal:
+                    dev_f = tf.math.divide_no_nan(
+                        dev_f, tf.abs(norm[None, b0 : b0 + chunk]) / k
+                    )
+                devs.append(tf.reduce_max(dev_f, axis=0))
             dev = tf.concat(devs, axis=0)  # [nbinsfull, nproc]
             flag = dev > tau
-            shape = [1, nbf, nproc] + [1] * len(red)
+            shape = [1, nbf, nproc] + [1] * (len(lf.shape) - 3)
             self.logk_folds = tf.where(tf.reshape(flag, shape), logk[None], lf)
             # drop the unmodified copy
             self.indata.logk_folds = self.logk_folds

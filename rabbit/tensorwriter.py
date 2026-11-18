@@ -1681,10 +1681,13 @@ class TensorWriter:
         SparseHist). The 'linear'/'quadratic' symmetrize modes split the pair into
         the SymAvg and SymDiff systematics in every fold, as for the full one. In
         the bins the process was written without fold structure (a negative fold,
-        or no MC-stat variance) every fold gets the full logk, so that the
-        systematic adds no fold structure there either; so does a fold with fewer
-        effective MC events than mcstat_fold_min_kstat, whose own variation is the
-        ratio of two sums dominated by their noise."""
+        or no MC-stat variance) every fold gets the full logk (1/k of it for the
+        additive normal form), so that the systematic adds no fold structure
+        there either; so does a fold with fewer effective MC events (its own
+        sumw^2 / sumw2) than mcstat_fold_min_kstat (3 by default), whose own
+        variation is the ratio of two sums dominated by their noise. An empty
+        fold has no log_normal variation; an additive one keeps its own, as long
+        as the full template is not empty."""
         is_pair = isinstance(h, (list, tuple))
         h0 = h[0] if is_pair else h
         if self.sparse and self._issparse(h0):
@@ -1820,10 +1823,17 @@ class TensorWriter:
                 logk2_folds = np.where(
                     shared, shared_scale * logk2_full[None, :], logk2_folds
                 )
-        # no variation of an empty fold, as book_logk does for an empty template
-        # (get_logk gives it the sign-flip value)
-        logkavg_folds = np.where(norm_folds == 0.0, 0.0, logkavg_folds)
-        logk2_folds = np.where(norm_folds == 0.0, 0.0, logk2_folds)
+        # no variation of an empty template, as book_logk does for the full one:
+        # for log_normal an empty fold (get_logk gives it the sign-flip value,
+        # 0 * exp(logk theta) overflows to NaN at large theta); an additive
+        # (normal) variation of an empty fold is finite and part of the full one,
+        # so only an empty full template drops it
+        if systematic_type == "normal":
+            empty = np.broadcast_to(norm_full == 0.0, norm_folds.shape)
+        else:
+            empty = norm_folds == 0.0
+        logkavg_folds = np.where(empty, 0.0, logkavg_folds)
+        logk2_folds = np.where(empty, 0.0, logk2_folds)
 
         # register the FULL systematic by projecting the fold axis out
         if is_pair:
