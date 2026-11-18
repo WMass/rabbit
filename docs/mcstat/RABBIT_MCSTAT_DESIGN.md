@@ -237,6 +237,22 @@ logk · norm^{A/B}`, so the cross product `norm^A·norm^B` already de-biases the
 nominal noise. Split logk only for systematics whose up/down histograms reuse the
 nominal MC sample.
 
+A folded up/down pair takes any `symmetrize` mode; `linear`/`quadratic` split it
+into `SymAvg` and `SymDiff` in every fold, as for the full pair
+(`TensorWriter.fold_symmetrize_modes`). A folded systematic gets the full logk
+(1/`k` of it for the additive `normal` form) in every fold of the bins where its
+process has no fold structure (a negative fold, or no MC-stat variance), and in
+the folds with fewer effective MC events `sumw^2/sumw2` than
+`TensorWriter(mcstat_fold_min_kstat=3)` (on by default, 0 disables it): there the
+per-fold variation is the ratio of two sums dominated by their noise (e.g.
+cancelling negative weights), and its logk can be arbitrarily large. This
+threshold is per fold and changes the folded systematics only; the fitter's
+`--mcStatFoldMinKstat` (off by default, below) instead uses the full-sample kstat
+of a (bin, process) template and takes the whole template, nominal and logk, out
+of the fold structure. An empty fold has no `log_normal` variation (its logk is
+0); an additive `normal` variation of an empty fold is kept, since it is part of
+the full one, unless the full template is empty.
+
 **On `write()`** — extra HDF5 datasets (attribute `mcstat_fold_k` = `k`):
 - `hnorm_folds`: dense mode `[k, nbinsfull, nproc]`; sparse mode `[k, nnz]`, the
   fold values on the sparsity pattern of the sparse `hnorm_sparse` (so the folds
@@ -270,6 +286,89 @@ folded.
   one batched contraction, dense or sparse.
 - k-fold averaging: the complete pairwise U-statistic over all `k` folds in
   `--covMode fisher` (§2b), which averages over every fold pair in `O(k)`.
+- Bounded fold deviations (`--mcStatFoldBound κ`, off by default, 0.5 for the
+  W-mass fits; `log_normal` split logk). Per (fold, bin, process) the fold
+  exponent `E_f = Σ_s logk_f,s θ_s` is
+  replaced by `E + d(E_f − E)` about the full-sample `E = Σ_s logk_s θ_s`. The
+  jackknife combination is a bias correction to second order in the fold
+  deviations `x = E_f − E`: for two equal halves deviating by `±x` the expectation
+  term of a template is `N e^E [2 − cosh x] = N e^E [1 − x²/2 − x⁴/24 − …]`, the
+  noise-floor subtraction being the `x²` term. The higher orders, the exponential
+  extrapolation of one fold's fluctuation, make it negative at `|x| = acosh 2` and
+  unbounded beyond. A template of a few MC events with large weights in one fold
+  gets there at `|θ| ~ 1`, and coherently many nuisances sharing one fold's
+  fluctuation at small `θ` each, and the minimizer runs away (W-mass fit:
+  `recoil_stat` on Z→ττ and W→τν templates of a few MC events; with the
+  isolation/mT sidebands the recoil calibration systematics and the isolation
+  efficiency stat variations on W→τν templates of ~7 effective MC events).
+  - `taper` (default, `--mcStatFoldBoundForm`): `d(x) = x/(1 + x²/κ²)`. Slope 1
+    and no curvature at `x = 0`, so value, gradient and curvature at the nominal
+    point are unchanged and the change at small `x` is `O(x³/κ²)`; `|d| ≤ κ/2`,
+    reached at `|x| = κ`, and `d → κ²/x → 0` for `|x| ≫ κ`: far out a fold follows
+    the full-sample variation, as with the shared logk. The nominal folds still
+    differ, so the objective there is that of a shared systematic, not the
+    ordinary likelihood.
+  - `tanh` (for comparison): `d(x) = κ tanh(x/κ)` keeps `|d| = κ` for all
+    `|x| ≫ κ`. A template held there enters the objective as
+    `ν (2 − cosh κ) − n log ν` instead of `ν − n log ν`, which favours
+    `ν = n/(2 − cosh κ)` (+15% at κ = 0.5): the fit gains by pushing templates into
+    the bound. On the W-mass fit the `recoil_stat` pulls grew with κ (rms 0.19,
+    0.34, 0.73 for κ = 0.3, 0.5, 0.6 against 0.065 with shared logk) and σ(mW)
+    moved by 15%.
+  For any k the Poisson expectation term of non-negative templates is at least
+  `(k/2a)[k/b − e^{d_max}] N e^E` (`a = ⌊k/2⌋`, `b = k − a`, `d_max` the largest
+  `|d|`): bounded below for `d_max < log(k/b)` (`log 2` for even k), i.e.
+  `κ < 2 log(k/b)` for the taper, `κ < log(k/b)` for tanh. This is what the bound
+  guarantees: the log terms of the halves, `+ a/(2b) n log n_A + b/(2a) n log n_B`,
+  still go to −∞ where a half's prediction vanishes and the full one does not, e.g.
+  when a free normalisation sends a process that is alone in one half to zero
+  (two processes with folds `[100, 0]` and `[0, 100]` in a bin). That holds for the
+  jackknife of the nominal folds alone too, with or without split logk. At the
+  ordinary minimum of the W-mass fit `|x| ≤ 0.11` everywhere (99.99% of the
+  templates below 0.024). The additive `normal` form is not bounded.
+- Shared logk for noisy templates (`--mcStatFoldMaxDeviation τ`, off by default,
+  0.1 for the W-mass fits). The bound keeps the objective bounded but does not
+  make the noise-floor
+  estimate reliable: on templates of a few MC events with large weights the k = 2
+  estimate (one fold difference per template, as large as the noise itself)
+  over-subtracts, the de-biased curvature along the coherent direction of their
+  nuisances is flat or negative at the ordinary minimum, and the fit drifts until
+  the bound stops it, so the result depends on κ (W-mass fit with split
+  `recoil_stat`, taper: mW −17.7 ± 10.4, −16.9 ± 11.0, −15.5 ± 13.3 MeV for
+  κ = 0.3, 0.5, 1.0; tanh worse, with `recoil_stat` pulls up to rms 0.73). The
+  (bin, process) templates whose fold deviation norm `max_f |c_f|₂` over all
+  systematics exceeds τ therefore take the shared logk in every fold
+  (`Fitter._share_noisy_fold_templates`, dense: `logk_folds`, sparse: the per-fold
+  delta set to 0); the decision depends on the templates only and is logged. For
+  a symmetric systematic `c_f,s = logk_f,s − logk_s`; for an asymmetric one
+  `c_f,s = |Δlogkavg| + |Δlogkhalfdiff|`, since they enter the exponent with `θ`
+  and `θ α(θ)`, `|α| ≤ 1`. The norm is then the largest change of a fold exponent
+  per unit `|θ|` along any combination of nuisances, reached along the most
+  unfavourable one (for an asymmetric systematic at `|θ| ≥ 1`). For the additive
+  `normal` form the shared logk is `1/k` of the full one in each fold, and the
+  deviation of a fold's variation from it is taken relative to the fold-scale
+  nominal: `c_f,s = (k logk_f,s − logk_s)/|n|`, the fractional change of a
+  rescaled fold per unit `θ`, which is the `log_normal` exponent deviation to
+  first order (an absolute deviation would make τ a number of events). The norm
+  has no gap but a tail of low-statistics templates:
+  in the W-mass fit 95% of the MC yield is below 0.003, and above 0.1 lie 96
+  templates (6·10⁻⁵ of the MC yield; W→τν and Z→ττ) without the sidebands and
+  12281 (2·10⁻⁴, median kstat ~16) with the isolation/mT sidebands; the runaway
+  templates had 0.75 (Z→ττ, `recoil_stat`) and 1.0–1.2 (W→τν, ~7 effective MC
+  events).
+- Templates out of the fold structure (`--mcStatFoldMinKstat n`, off by default;
+  3 with the photon-induced samples in the W-mass fits). The (bin, process)
+  templates whose full-sample kstat `(Σw)²/Σw²` is below `n`
+  (`Fitter._opt_out_low_kstat_fold_templates`) get `1/k` of the full nominal in
+  every fold, the shared logk (`1/k` of the full one for `normal`) and no split
+  variance (`sumw2_folds = 0`): they enter like the templates of a process added
+  without folds, MC-stat-exempt, without bias correction and without a split-meat
+  contribution. Only templates with a fold structure (a non-zero per-fold
+  variance) are concerned; processes added without folds and the bins written
+  without fold structure already enter that way. A fold estimate of a few events
+  is noise (W-mass fit with photon-induced samples: single-event templates, all
+  in one fold, made the de-biased curvature non-positive-definite), which the
+  jackknife cannot correct.
 
 This needs **no `nparams²` moment** — only first-moment fold templates,
 `O(k·nparams·nbins)`.

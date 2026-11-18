@@ -378,6 +378,37 @@ class Fitter:
         # init_fit_parms below and docs/mcstat/RABBIT_MCSTAT_DESIGN.md)
         self.mcStatDebias = getattr(options, "mcStatDebias", "none")
         self.mcStatDebiasCov = getattr(options, "mcStatDebiasCov", "sandwich")
+        # bound on a fold's exponent deviation with split logk, see
+        # _bound_fold_deviation; 0 disables it
+        self.mcstat_fold_bound = float(getattr(options, "mcStatFoldBound", 0.0) or 0.0)
+        self.mcstat_fold_bound_form = getattr(options, "mcStatFoldBoundForm", "taper")
+        if self.mcstat_fold_bound_form not in ("taper", "tanh"):
+            raise ValueError(
+                f"--mcStatFoldBoundForm must be taper or tanh, got "
+                f"{self.mcstat_fold_bound_form}"
+            )
+        if self.mcstat_fold_bound < 0.0:
+            raise ValueError(
+                f"--mcStatFoldBound must be >= 0, got {self.mcstat_fold_bound}"
+            )
+        # split logk: the templates whose fold deviation norm exceeds this take
+        # the shared logk, see _share_noisy_fold_templates; 0 disables it
+        self.mcstat_fold_max_dev = float(
+            getattr(options, "mcStatFoldMaxDeviation", 0.0) or 0.0
+        )
+        if self.mcstat_fold_max_dev < 0.0:
+            raise ValueError(
+                f"--mcStatFoldMaxDeviation must be >= 0, got {self.mcstat_fold_max_dev}"
+            )
+        # templates with fewer effective MC events leave the fold structure, see
+        # _opt_out_low_kstat_fold_templates; 0 disables it
+        self.mcstat_fold_min_kstat = float(
+            getattr(options, "mcStatFoldMinKstat", 0.0) or 0.0
+        )
+        if self.mcstat_fold_min_kstat < 0.0:
+            raise ValueError(
+                f"--mcStatFoldMinKstat must be >= 0, got {self.mcstat_fold_min_kstat}"
+            )
         self.covMode = getattr(options, "covMode", "observed")
         # the --covMode asked for; set_mcstat_asimov switches self.covMode to
         # fisher for an Asimov dataset of a de-biased fit
@@ -2051,6 +2082,19 @@ class Fitter:
         norm_folds = getattr(self.indata, "norm_folds", None)
         if norm_folds is None:
             return
+        # (bin, process) templates given the shared logk, [nbinsfull, nproc]
+        # dense or [nnz] sparse; None = none
+        self.mcstat_fold_shared_templates = None
+        # (bin, process) templates taken out of the fold structure, same layout
+        self.mcstat_fold_optout_templates = None
+        # the fold templates enter only the k-fold de-biased objective and its
+        # curvature (_fold_debias_active)
+        split = self.logk_folds is not None or self.logk_folds_delta is not None
+        if self.mcStatDebias == "kfold" and self.mcstat_fold_min_kstat > 0.0:
+            self._opt_out_low_kstat_fold_templates()
+            norm_folds = self.indata.norm_folds
+        if split and self.mcStatDebias == "kfold" and self.mcstat_fold_max_dev > 0.0:
+            self._share_noisy_fold_templates()
         k = int(norm_folds.shape[0])
         a = k // 2
         b = k - a
@@ -2084,6 +2128,37 @@ class Fitter:
             self._mcstat_empty_half_bins = np.asarray(
                 tf.reduce_any(tot[:, :nb] == 0.0, axis=0)
             )
+        if (
+            split
+            and self.mcStatDebias == "kfold"
+            and self.indata.systematic_type == "log_normal"
+        ):
+            # the bounded jackknife expectation term is at least
+            # (k/2a) [k/b - e^dmax] N e^E with dmax = kappa/2 (taper) or kappa
+            # (tanh), see _bound_fold_deviation
+            kappa_max = float(np.log(k / b)) * (
+                2.0 if self.mcstat_fold_bound_form == "taper" else 1.0
+            )
+            if self.mcstat_fold_bound <= 0.0:
+                logger.warning(
+                    "k-fold de-biasing with split logk and --mcStatFoldBound 0: the "
+                    "objective is unbounded below wherever a fold's variation "
+                    "outgrows the full-sample one (e.g. --mcStatFoldBound 0.5 bounds "
+                    "its expectation term)"
+                )
+            elif self.mcstat_fold_bound >= kappa_max:
+                logger.warning(
+                    f"--mcStatFoldBound {self.mcstat_fold_bound} >= {kappa_max:.3f} "
+                    f"for k = {k} ({self.mcstat_fold_bound_form}): the expectation "
+                    "term of the split-logk objective is not guaranteed to be "
+                    "bounded below"
+                )
+            else:
+                logger.info(
+                    "k-fold de-biasing with split logk: fold exponent deviations "
+                    f"bounded ({self.mcstat_fold_bound_form}, kappa = "
+                    f"{self.mcstat_fold_bound}, --mcStatFoldBound)"
+                )
         # L_cf = w_full L_full - w_A L_A - w_B L_B. With raw half sums S_A, S_B
         # (J_full = S_A + S_B, J_A = k/a S_A, J_B = k/b S_B) these are the unique
         # weights whose Gauss-Newton Hessian is the pure cross term
@@ -2091,6 +2166,199 @@ class Fitter:
         # and whose score is the half average 1/2 (J_A + J_B)^T D (y - n). For
         # even k (a = b) they reduce to the familiar (2, 1/2, 1/2).
         self.jackknife_weights = (k * k / (2.0 * a * b), a / (2.0 * b), b / (2.0 * a))
+
+    def _shared_fold_logk(self, k):
+        """The dense per-fold logk of a variation shared across the k folds, as
+        the writer stores it in logk_folds: the full logk for the multiplicative
+        log_normal form, 1/k of it for the additive normal form, which is split
+        evenly so that the folds sum to the full variation (the dense split-logk
+        fold yields take logk_folds at fold scale)."""
+        if self.indata.systematic_type == "normal":
+            return self.indata.logk / k
+        return self.indata.logk
+
+    def _opt_out_low_kstat_fold_templates(self):
+        """Take the (bin, process) templates with fewer effective MC events than
+        --mcStatFoldMinKstat, kstat = (sum w)^2 / sum w^2 of the full sample, out
+        of the fold structure: every fold gets 1/k of the full-sample nominal, the
+        logk of a variation shared across folds (_shared_fold_logk) and no split
+        variance, since its folds are now identical by construction. Such a
+        template then enters as one of a process added without folds
+        (MC-stat-exempt): its halves equal the full template, it gets no bias
+        correction and adds nothing to the split meat.
+
+        Only templates with a fold structure (a non-zero per-fold MC-stat
+        variance) are concerned: the processes added without folds and the bins
+        the writer wrote without fold structure already enter that way.
+
+        With a few events a fold estimate is noise: with k = 2 the folds of a
+        template of kstat ~ 1 often hold zero and all of it, and with negative
+        weights a fold can cancel to zero (or below) while its variations do not.
+        The jackknife cannot correct such templates, and the large per-fold logk
+        they carry make the objective unbounded below. Their own MC-stat bias is
+        of the order of their share of the bin."""
+        kmin = self.mcstat_fold_min_kstat
+        dtype = self.indata.dtype
+        sumw = self.indata.sumw
+        sumw2 = self.indata.sumw2
+        # no MC-stat variance (e.g. a data-driven process): no MC-stat noise
+        kstat = tf.where(
+            sumw2 > 0.0,
+            tf.math.divide_no_nan(tf.square(sumw), sumw2),
+            tf.constant(np.inf, dtype),
+        )  # [nbinsfull, nproc]
+        nf = self.indata.norm_folds
+        sw2f = self.indata.sumw2_folds
+        k = int(nf.shape[0])
+        # templates with a fold structure; the others have identical folds and
+        # sumw2_folds = 0 already
+        has_folds = tf.reduce_any(sw2f > 0.0, axis=0)
+        if self.indata.sparse:
+            rows = self.indata.norm.indices
+            kstat_nz = tf.gather_nd(kstat, rows)  # [nnz]
+            flag = (kstat_nz < kmin) & has_folds
+            full = self.indata.norm.values
+            flag_b = flag[None, :]
+            self.indata.norm_folds = tf.where(
+                flag_b, tf.broadcast_to(full[None] / k, nf.shape), nf
+            )
+            self.indata.sumw2_folds = tf.where(flag_b, tf.zeros_like(sw2f), sw2f)
+            if self.logk_folds_delta is not None:
+                self.logk_folds_delta = tf.where(
+                    flag[None, :, None],
+                    tf.zeros_like(self.logk_folds_delta),
+                    self.logk_folds_delta,
+                )
+                self.indata.logk_folds_delta = self.logk_folds_delta
+            procs_of = np.asarray(rows[:, 1])
+            flag_np = np.asarray(flag)
+            nflag_proc = np.bincount(
+                procs_of[flag_np], minlength=self.indata.nproc
+            ).astype(int)
+            vals = np.abs(np.asarray(full))
+        else:
+            norm = self.indata.norm
+            nbf = int(nf.shape[1])
+            flag = (kstat[:nbf] < kmin) & has_folds  # [nbinsfull, nproc]
+            flag_b = flag[None]
+            self.indata.norm_folds = tf.where(
+                flag_b, tf.broadcast_to(norm[None] / k, nf.shape), nf
+            )
+            self.indata.sumw2_folds = tf.where(flag_b, tf.zeros_like(sw2f), sw2f)
+            if self.logk_folds is not None:
+                lf = self.logk_folds
+                red = len(lf.shape) - 3
+                shape = [1, nbf, int(lf.shape[2])] + [1] * red
+                self.logk_folds = tf.where(
+                    tf.reshape(flag, shape), self._shared_fold_logk(k)[None], lf
+                )
+                self.indata.logk_folds = self.logk_folds
+            flag_np = np.asarray(flag)
+            nflag_proc = flag_np.sum(axis=0).astype(int)
+            vals = np.abs(np.asarray(norm))
+        self.mcstat_fold_optout_templates = flag_np
+        procs = [
+            p.decode() if isinstance(p, bytes) else str(p) for p in self.indata.procs
+        ]
+        byproc = ", ".join(f"{procs[i]} {n}" for i, n in enumerate(nflag_proc) if n > 0)
+        share = vals[flag_np].sum() / max(vals.sum(), 1e-300)
+        logger.info(
+            f"k-fold de-biasing: {int(flag_np.sum())} (bin, process) templates with "
+            f"kstat < {kmin} (--mcStatFoldMinKstat) taken out of the fold structure, "
+            f"{share:.2e} of the yield" + (f": {byproc}" if byproc else "")
+        )
+
+    def _share_noisy_fold_templates(self):
+        """The shared logk (that of a variation shared across folds,
+        _shared_fold_logk) in every fold for the (bin, process) templates whose
+        fold deviation norm exceeds --mcStatFoldMaxDeviation.
+
+        The norm is the largest over the folds of |c_f|_2 over the systematics,
+        with c_f,s = logk_f,s - logk_s for a symmetric systematic and
+        |delta logkavg| + |delta logkhalfdiff| for an asymmetric one (they enter
+        the exponent with theta and theta alpha(theta), |alpha| <= 1). Along any
+        combination of nuisances a fold's exponent deviates from the full-sample
+        one by at most that norm times |theta|, which is reached along the most
+        unfavourable one (for an asymmetric systematic at |theta| >= 1). For the
+        additive normal form the deviation of a fold's variation from the shared
+        one (1/k of the full) is taken relative to the fold-scale nominal |n|/k,
+        i.e. (k logk_f - logk) / |n|: the fractional change of a rescaled fold
+        per unit theta, the exponent deviation of log_normal to first order.
+
+        The jackknife combination is a bias correction to second order in that
+        deviation, so above the threshold its noise-floor estimate (with k = 2 a
+        single fold difference per template, as large as the noise itself) is not
+        reliable: on templates of a few MC events with large weights the de-biased
+        curvature along such directions comes out flat or negative and the fit
+        drifts (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a). Those templates are a
+        small part of the yield (W-mass fit: 6e-5 of the MC yield above 0.1, 2e-4
+        with the isolation/mT sidebands); everywhere else the folds keep their own
+        variations. The decision depends on the templates only.
+        """
+        tau = self.mcstat_fold_max_dev
+        if self.logk_folds_delta is not None:
+            # sparse (log_normal, symmetric folded systematics only): the
+            # per-fold delta against the full logk, [k, nnz, nfolded]
+            delta = self.logk_folds_delta
+            dev = tf.reduce_max(tf.norm(delta, axis=-1), axis=0)  # [nnz]
+            flag = dev > tau
+            self.logk_folds_delta = tf.where(
+                flag[None, :, None], tf.zeros_like(delta), delta
+            )
+            self.indata.logk_folds_delta = self.logk_folds_delta
+            rows = self.indata.norm.indices
+            procs_of = np.asarray(rows[:, 1])
+            vals = np.asarray(self.indata.norm.values)
+            flag_np = np.asarray(flag)
+            nflag_proc = np.bincount(
+                procs_of[flag_np], minlength=self.indata.nproc
+            ).astype(int)
+            share = vals[flag_np].sum() / max(vals.sum(), 1e-300)
+            dev_np = np.asarray(dev)
+        else:
+            lf = self.logk_folds
+            k, nbf, nproc = (int(n) for n in lf.shape[:3])
+            logk = self._shared_fold_logk(k)
+            # [k, nbins, nproc, 2, nsyst] for an asymmetric tensor
+            asym = len(lf.shape) == 5
+            normal = self.indata.systematic_type == "normal"
+            norm = self.indata.norm
+            per_bin = k * int(np.prod(lf.shape[2:]))
+            chunk = max(1, int(6e7 // per_bin))  # ~0.5 GB temporaries
+            devs = []
+            for b0 in range(0, nbf, chunk):
+                d = lf[:, b0 : b0 + chunk] - logk[None, b0 : b0 + chunk]
+                if asym:
+                    d = tf.reduce_sum(tf.abs(d), axis=3)
+                dev_f = tf.sqrt(tf.reduce_sum(tf.square(d), axis=-1))
+                if normal:
+                    dev_f = tf.math.divide_no_nan(
+                        dev_f, tf.abs(norm[None, b0 : b0 + chunk]) / k
+                    )
+                devs.append(tf.reduce_max(dev_f, axis=0))
+            dev = tf.concat(devs, axis=0)  # [nbinsfull, nproc]
+            flag = dev > tau
+            shape = [1, nbf, nproc] + [1] * (len(lf.shape) - 3)
+            self.logk_folds = tf.where(tf.reshape(flag, shape), logk[None], lf)
+            # drop the unmodified copy
+            self.indata.logk_folds = self.logk_folds
+            flag_np = np.asarray(flag)
+            nflag_proc = flag_np.sum(axis=0).astype(int)
+            norm = np.asarray(self.indata.norm)
+            share = norm[flag_np].sum() / max(norm.sum(), 1e-300)
+            dev_np = np.asarray(dev)
+        self.mcstat_fold_shared_templates = flag_np
+        procs = [
+            p.decode() if isinstance(p, bytes) else str(p) for p in self.indata.procs
+        ]
+        byproc = ", ".join(f"{procs[i]} {n}" for i, n in enumerate(nflag_proc) if n > 0)
+        logger.info(
+            f"k-fold de-biasing with split logk: shared logk for {int(flag_np.sum())} "
+            f"(bin, process) templates whose fold deviation norm exceeds {tau} "
+            f"(--mcStatFoldMaxDeviation), {share:.2e} of the yield"
+            + (f": {byproc}" if byproc else "")
+            + f"; largest norm {dev_np.max() if dev_np.size else 0.0:.3g}"
+        )
 
     def _fold_debias_active(self):
         return (
@@ -2135,6 +2403,47 @@ class Fitter:
             ]
         )
 
+    def _bound_fold_deviation(self, x):
+        """The bounded deviation d(x) of a fold's exponent from the full-sample
+        one with split logk, per (fold, bin, process); x itself without
+        --mcStatFoldBound.
+
+        The jackknife objective is a bias correction to second order in the fold
+        deviations: for two equal halves deviating by +-x its expectation term is
+        N e^E [2 - cosh x] = N e^E [1 - x^2/2 - x^4/24 - ...], the x^2 term being
+        the noise-floor subtraction. The higher orders, the exponential
+        extrapolation of one fold's fluctuation, make it negative at |x| = acosh 2
+        and unbounded beyond, which a template of a few MC events with large
+        weights in one fold reaches at |theta| ~ 1.
+
+        taper (default): d = x / (1 + x^2 / kappa^2). Slope 1 and no curvature at
+        x = 0, so value, gradient and curvature at the nominal point are
+        unchanged and the change at small x is O(x^3 / kappa^2); |d| <= kappa/2,
+        at |x| = kappa, and d -> 0 for |x| >> kappa: far out each fold follows the
+        full-sample variation, as with the shared logk (the nominal folds still
+        differ, so the objective is that of a shared systematic, not the
+        ordinary likelihood). tanh: d = kappa tanh(x / kappa), the same at small
+        x, but it keeps |d| = kappa for all |x| >> kappa; a template held there
+        enters the objective as nu (2 - cosh kappa) - n log nu, which favours
+        nu = n / (2 - cosh kappa), so the fit gains by pushing templates into the
+        bound (kept for comparison).
+
+        For any k the Poisson expectation term of non-negative templates is at
+        least (k/2a) [k/b - e^dmax] N e^E (a = k//2, b = k - a, dmax the largest
+        |d|): bounded below for dmax < log(k/b) (log 2 for even k). The log terms
+        are not bounded: + a/(2b) n log n_A + b/(2a) n log n_B goes to -inf where
+        a half's prediction vanishes and the full one does not, e.g. when a free
+        normalisation sends a process alone in one half to zero. That holds for
+        the nominal folds alone too, with or without split logk.
+        (docs/mcstat/RABBIT_MCSTAT_DESIGN.md §2a)
+        """
+        kappa = self.mcstat_fold_bound
+        if kappa <= 0.0:
+            return x
+        if self.mcstat_fold_bound_form == "tanh":
+            return kappa * tf.math.tanh(x / kappa)
+        return x / (1.0 + tf.square(x / kappa))
+
     def _compute_fold_yields(self, halves=False, full=False, return_norm=False):
         """Predicted yields of the MC-stat folds, without bin-by-bin stat.
 
@@ -2147,7 +2456,9 @@ class Fitter:
         fold: the multiplicative (log_normal) factor unchanged, the additive
         (normal) variation split evenly -- 1/k per raw fold, so the folds sum to
         the full prediction, and the full variation for a rescaled half. Folded
-        systematics (split logk) use each fold's own variation.
+        systematics (split logk) use each fold's own variation; with log_normal
+        systematics the deviation of a fold's exponent from the full-sample one
+        is bounded (_bound_fold_deviation).
 
         All folds are evaluated in one batched contraction, so the graph does not
         grow with k.
@@ -2201,8 +2512,8 @@ class Fitter:
             if log_normal:
                 if self.logk_folds_delta is not None:
                     theta_folded = tf.gather(theta, self.mcstat_folded_syst_idx)
-                    logsnorm = logsnorm + tf.einsum(
-                        "knj,j->kn", self.logk_folds_delta, theta_folded
+                    logsnorm = logsnorm + self._bound_fold_deviation(
+                        tf.einsum("knj,j->kn", self.logk_folds_delta, theta_folded)
                     )
                 vals = norm * rnorm * tf.exp(logsnorm)
             else:
@@ -2238,6 +2549,15 @@ class Fitter:
             logk = self.logk_folds[:, :nbins]
             mlogk = tf.reshape(logk, [k * nbins * nproc, -1])
             logsnorm = tf.reshape(tf.matmul(mlogk, mthetaalpha), [k, nbins, nproc])
+            if log_normal and self.mcstat_fold_bound > 0.0:
+                # each fold's deviation from the full-sample exponent, bounded
+                mlogk_full = tf.reshape(self.logk[:nbins], [nbins * nproc, -1])
+                logsnorm_full = tf.reshape(
+                    tf.matmul(mlogk_full, mthetaalpha), [1, nbins, nproc]
+                )
+                logsnorm = logsnorm_full + self._bound_fold_deviation(
+                    logsnorm - logsnorm_full
+                )
             add_scale = 1.0
         else:
             mlogk = tf.reshape(self.logk[:nbins], [nbins * nproc, -1])
