@@ -1450,3 +1450,80 @@ def test_fold_deviation_norm_of_asymmetric_systematics(tau, shared, tmp_path):
         if theta != 0:
             worst = max(worst, (d / (norm * abs(theta))).max())
     assert worst > 1 - 1e-6
+
+
+def _proc_index(f, name):
+    procs = [p.decode() if isinstance(p, bytes) else str(p) for p in f.indata.procs]
+    return procs.index(name)
+
+
+def make_low_kstat_toy(path, folded, systematic_type="log_normal", k=3):
+    """'sig' (~300 unit-weight MC events per bin and fold, folded 'tilt') and
+    'few', a background of a few weighted events per bin (full-sample kstat
+    between 1 and 3) with a variation 'onefew' carried by part of its events.
+    With `folded`, 'few' and 'onefew' carry the fold axis (all bins below a
+    kstat of 10); otherwise they are added without folds. Data fluctuate about
+    the nominal. Returns the filename."""
+    nb = 6
+    rng = np.random.default_rng(17)
+    sig = rng.poisson(300.0, size=(k, nb)).astype(float)
+    w = 1.0 + 0.1 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    sig_up = np.stack([rng.poisson(sig[i] * w) for i in range(k)]).astype(float)
+    # unit-weight events of 'few' per fold; 'onefew' scales those of fold 0
+    few = np.array(
+        [[1, 0, 2, 1, 0, 1], [0, 2, 1, 0, 1, 1], [1, 1, 0, 2, 1, 0]], dtype=float
+    )[:k]
+    few_up = few.copy()
+    few_up[0] *= 1.5
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    tw = TensorWriter(systematic_type=systematic_type)
+    tw.add_channel([ax], "ch0")
+    data = sig.sum(0) + few.sum(0) + rng.normal(0.0, 15.0, nb).round()
+    tw.add_data(_hist1d(ax, data), "ch0")
+    tw.add_process(_fold_hist(ax, sig), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_systematic(_fold_hist(ax, sig_up), "tilt", "sig", "ch0", fold_axis="mcfold")
+    if folded:
+        tw.add_process(_fold_hist(ax, few), "few", "ch0", fold_axis="mcfold")
+        tw.add_systematic(
+            _fold_hist(ax, few_up), "onefew", "few", "ch0", fold_axis="mcfold"
+        )
+    else:
+        tw.add_process(_hist1d(ax, few.sum(0)), "few", "ch0")
+        tw.add_systematic(_hist1d(ax, few_up.sum(0)), "onefew", "few", "ch0")
+    name = f"low_kstat_{'folded' if folded else 'flat'}_{systematic_type}.hdf5"
+    return _write(tw, path, name)
+
+
+@pytest.mark.parametrize("systematic_type", ["log_normal", "normal"])
+def test_low_kstat_opt_out_equals_a_process_without_folds(systematic_type, tmp_path):
+    """A template taken out of the fold structure by --mcStatFoldMinKstat enters
+    exactly as one of a process added without folds: the same objective, de-
+    biased curvature and sandwich covariance, so no split variance is left on
+    it, and the logk of an additive systematic is the shared 1/k of the full
+    one. A process added without folds is not touched by the option."""
+    kmin = ("--mcStatFoldMinKstat", "10")
+    folded = make_low_kstat_toy(tmp_path, True, systematic_type)
+    flat = make_low_kstat_toy(tmp_path, False, systematic_type)
+
+    def state(fn, *extra):
+        # away from the nominal point, where the split meat and the halves'
+        # residuals do not vanish
+        f = _fold_fitter(fn, tmp_path, *extra)
+        _set_param(f, "tilt", 0.7)
+        _set_param(f, "onefew", -1.2)
+        val, grad, h = f.loss_val_grad_hess()
+        cov = np.asarray(f.cov_twohalf_sandwich(h))
+        return f, (float(val), np.asarray(grad), np.asarray(h), cov)
+
+    f_out, got_out = state(folded, *kmin)
+    ifew = _proc_index(f_out, "few")
+    flags = np.asarray(f_out.mcstat_fold_optout_templates)[: f_out.indata.nbins]
+    assert flags[:, ifew].all() and not flags[:, _proc_index(f_out, "sig")].any()
+    assert not np.any(np.asarray(f_out.indata.sumw2_folds)[:, :, ifew])
+
+    f_flat, got_flat = state(flat, *kmin)
+    assert not np.asarray(f_flat.mcstat_fold_optout_templates).any()
+    _, ref = state(flat)
+    for got in (got_out, got_flat):
+        for g, r in zip(got, ref):
+            np.testing.assert_allclose(g, r, rtol=1e-10, atol=1e-12)

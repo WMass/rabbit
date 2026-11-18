@@ -847,13 +847,17 @@ def common_parser():
         default=0.0,
         type=float,
         help="--mcStatDebias kfold: the (bin, process) templates with fewer "
-        "effective MC events, kstat = (sum w)^2 / sum w^2, than this are taken out "
-        "of the fold structure: every fold gets the full-sample template (nominal, "
-        "MC-stat variance and logk), so they enter the de-biased objective like the "
-        "ordinary likelihood, without bias correction. With a few events a fold "
-        "estimate is noise (with negative weights a fold can cancel to zero while "
-        "its variations do not), which the jackknife cannot correct and which makes "
-        "the objective unbounded below. 0 disables it. Default 0.",
+        "effective MC events in the full sample, kstat = (sum w)^2 / sum w^2, than "
+        "this are taken out of the fold structure: every fold gets 1/k of the "
+        "full-sample nominal and the shared logk, with no split variance, so they "
+        "enter as templates of a process without folds (MC-stat-exempt), without "
+        "bias correction. With a few events a fold estimate is noise (with "
+        "negative weights a fold can cancel to zero while its variations do not), "
+        "which the jackknife cannot correct and which makes the objective "
+        "unbounded below. Not to be confused with the TensorWriter's "
+        "mcstat_fold_min_kstat (default 3), which gives a folded systematic the "
+        "full variation in the single folds with too few events and leaves the "
+        "nominal folds alone. 0 disables it. Default 0.",
     )
     parser.add_argument(
         "--mcStatFoldBoundForm",

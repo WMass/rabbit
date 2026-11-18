@@ -2178,12 +2178,17 @@ class Fitter:
 
     def _opt_out_low_kstat_fold_templates(self):
         """Take the (bin, process) templates with fewer effective MC events than
-        --mcStatFoldMinKstat, kstat = (sum w)^2 / sum w^2, out of the fold
-        structure: every fold gets 1/k of the full-sample nominal and MC-stat
-        variance and the logk of a variation shared across folds
-        (_shared_fold_logk). The halves then equal the full template,
-        so such a template enters 2 L_full - 1/2 L_A - 1/2 L_B like the ordinary
-        likelihood and gets no bias correction.
+        --mcStatFoldMinKstat, kstat = (sum w)^2 / sum w^2 of the full sample, out
+        of the fold structure: every fold gets 1/k of the full-sample nominal, the
+        logk of a variation shared across folds (_shared_fold_logk) and no split
+        variance, since its folds are now identical by construction. Such a
+        template then enters as one of a process added without folds
+        (MC-stat-exempt): its halves equal the full template, it gets no bias
+        correction and adds nothing to the split meat.
+
+        Only templates with a fold structure (a non-zero per-fold MC-stat
+        variance) are concerned: the processes added without folds and the bins
+        the writer wrote without fold structure already enter that way.
 
         With a few events a fold estimate is noise: with k = 2 the folds of a
         template of kstat ~ 1 often hold zero and all of it, and with negative
@@ -2204,20 +2209,19 @@ class Fitter:
         nf = self.indata.norm_folds
         sw2f = self.indata.sumw2_folds
         k = int(nf.shape[0])
+        # templates with a fold structure; the others have identical folds and
+        # sumw2_folds = 0 already
+        has_folds = tf.reduce_any(sw2f > 0.0, axis=0)
         if self.indata.sparse:
             rows = self.indata.norm.indices
             kstat_nz = tf.gather_nd(kstat, rows)  # [nnz]
-            folds_nz = tf.reduce_any(nf != 0.0, axis=0)
-            flag = (kstat_nz < kmin) & folds_nz
+            flag = (kstat_nz < kmin) & has_folds
             full = self.indata.norm.values
-            full_sw2 = tf.gather_nd(sumw2, rows)
             flag_b = flag[None, :]
             self.indata.norm_folds = tf.where(
                 flag_b, tf.broadcast_to(full[None] / k, nf.shape), nf
             )
-            self.indata.sumw2_folds = tf.where(
-                flag_b, tf.broadcast_to(full_sw2[None] / k, sw2f.shape), sw2f
-            )
+            self.indata.sumw2_folds = tf.where(flag_b, tf.zeros_like(sw2f), sw2f)
             if self.logk_folds_delta is not None:
                 self.logk_folds_delta = tf.where(
                     flag[None, :, None],
@@ -2234,17 +2238,12 @@ class Fitter:
         else:
             norm = self.indata.norm
             nbf = int(nf.shape[1])
-            folds_nz = tf.reduce_any(nf != 0.0, axis=0)  # [nbinsfull, nproc]
-            flag = (kstat[:nbf] < kmin) & folds_nz
+            flag = (kstat[:nbf] < kmin) & has_folds  # [nbinsfull, nproc]
             flag_b = flag[None]
             self.indata.norm_folds = tf.where(
                 flag_b, tf.broadcast_to(norm[None] / k, nf.shape), nf
             )
-            self.indata.sumw2_folds = tf.where(
-                flag_b,
-                tf.broadcast_to(tf.cast(sumw2[None], dtype) / k, sw2f.shape),
-                sw2f,
-            )
+            self.indata.sumw2_folds = tf.where(flag_b, tf.zeros_like(sw2f), sw2f)
             if self.logk_folds is not None:
                 lf = self.logk_folds
                 red = len(lf.shape) - 3

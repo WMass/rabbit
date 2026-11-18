@@ -346,6 +346,19 @@ folded.
   12281 (2·10⁻⁴, median kstat ~16) with the isolation/mT sidebands; the runaway
   templates had 0.75 (Z→ττ, `recoil_stat`) and 1.0–1.2 (W→τν, ~7 effective MC
   events).
+- Templates out of the fold structure (`--mcStatFoldMinKstat n`, off by default;
+  3 with the photon-induced samples in the W-mass fits). The (bin, process)
+  templates whose full-sample kstat `(Σw)²/Σw²` is below `n`
+  (`Fitter._opt_out_low_kstat_fold_templates`) get `1/k` of the full nominal in
+  every fold, the shared logk (`1/k` of the full one for `normal`) and no split
+  variance (`sumw2_folds = 0`): they enter like the templates of a process added
+  without folds, MC-stat-exempt, without bias correction and without a split-meat
+  contribution. Only templates with a fold structure (a non-zero per-fold
+  variance) are concerned; processes added without folds and the bins written
+  without fold structure already enter that way. A fold estimate of a few events
+  is noise (W-mass fit with photon-induced samples: single-event templates, all
+  in one fold, made the de-biased curvature non-positive-definite), which the
+  jackknife cannot correct.
 
 This needs **no `nparams²` moment** — only first-moment fold templates,
 `O(k·nparams·nbins)`.
