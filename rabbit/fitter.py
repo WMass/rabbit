@@ -2099,6 +2099,17 @@ class Fitter:
             and not self._mcstat_debias_suspended
         )
 
+    def _logk_csr_matmul(self, m):
+        """The sparse logk [nnz, nsyst] times m [nsyst, B], via the CSR kernel.
+
+        Without systematics (nsyst = 0) the product is zeros. It is returned
+        directly: TF's GPU SparseMatrixMatMul does not write its output for an
+        empty inner dimension, so the result would be whatever was left in
+        that GPU memory (the CPU kernel gives zeros)."""
+        if self.logk.shape[1] == 0:
+            return tf.zeros([self.logk.shape[0], tf.shape(m)[1]], dtype=m.dtype)
+        return tf_sparse_csr.matmul(self.logk_csr, m)
+
     def _mthetaalpha(self, theta):
         """Systematic coefficient columns contracted with logk: theta for a
         symmetric tensor, [theta, theta*alpha] for the asymmetric interpolation.
@@ -2195,9 +2206,7 @@ class Fitter:
             rnorm = tf.gather_nd(
                 tf.broadcast_to(rnorm, [nbinsfull, self.indata.nproc]), idx
             )
-            logsnorm = tf.squeeze(
-                tf_sparse_csr.matmul(self.logk_csr, mthetaalpha), axis=-1
-            )[None, :]
+            logsnorm = tf.squeeze(self._logk_csr_matmul(mthetaalpha), axis=-1)[None, :]
             if log_normal:
                 if self.logk_folds_delta is not None:
                     theta_folded = tf.gather(theta, self.mcstat_folded_syst_idx)
@@ -4124,7 +4133,7 @@ class Fitter:
             if forward_mode:
                 logsnorm = tf.sparse.sparse_dense_matmul(self.logk, mthetaalpha)
             else:
-                logsnorm = tf_sparse_csr.matmul(self.logk_csr, mthetaalpha)
+                logsnorm = self._logk_csr_matmul(mthetaalpha)
             # logsnorm: [nnz, B]
 
             # The values of a [nbinsfull, nproc] sparse tensor with the sparsity
