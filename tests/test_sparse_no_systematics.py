@@ -84,3 +84,34 @@ def test_sparse_fit_without_systematics_matches_dense(dirty):
         np.testing.assert_allclose(
             sparse.reduced_nll().numpy(), dense.reduced_nll().numpy(), rtol=1e-8
         )
+
+
+def _strict_csr_matmul(monkeypatch):
+    """Make the CSR matmul fail loudly on an empty inner dimension, as it
+    silently does on a GPU, so that the guard is pinned on a CPU too."""
+    orig = fitter.tf_sparse_csr.matmul
+
+    def strict(a, b, *args, **kwargs):
+        if b.shape[0] == 0:
+            raise AssertionError("CSR matmul with an empty inner dimension")
+        return orig(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(fitter.tf_sparse_csr, "matmul", strict)
+
+
+def test_sparse_fit_without_systematics_skips_csr_matmul(monkeypatch):
+    _strict_csr_matmul(monkeypatch)
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fit(_write(tmp, sparse=True))
+        f.loss_val_grad_hess()
+        assert np.isfinite(f.reduced_nll().numpy())
+
+
+def test_sparse_kfold_without_systematics_skips_csr_matmul(monkeypatch, tmp_path):
+    from tests.mcstat_helpers import LINEAR_CHISQ, fit_toy, make_small_fold_toy
+
+    _strict_csr_matmul(monkeypatch)
+    fn, _ = make_small_fold_toy(tmp_path, 2, sparse=True)
+    f = fit_toy(fn, tmp_path, *LINEAR_CHISQ, "--mcStatDebias", "kfold")
+    f.loss_val_grad_hess()
+    assert np.all(np.isfinite(f.x.numpy()))
