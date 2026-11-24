@@ -166,11 +166,34 @@ jobs:
           # Point it at a fresh empty dir so detection declines and hodor
           # clones + gh-pr-checkouts the real PR head instead.
           export GITHUB_WORKSPACE="$RUNNER_TEMP/hodor-workspace"
+          # Keep that clone off the shared CERN host's /tmp and on the runner
+          # volume, which is wiped after every job. hodor removes its mkdtemp
+          # workspace only on a normal exit, so every cancelled review left a
+          # checkout in /tmp, and the agent's searches there read other
+          # reviews' stale trees.
+          export TMPDIR="$RUNNER_TEMP"
+          # The dependencies are pip-installed in the runner's Python, outside
+          # the review workspace, and PRs here use wums internals (SparseHist's
+          # flat buffers). Not told where wums is, the agent looked for
+          # wums/sparse_hist.py with `find /`, which on these runners walks
+          # AFS, CVMFS and EOS and never returns: the review of #209 hung that
+          # way three times (4h17, 2h56, 1h17, each until cancelled).
+          # WRemnants hit the same with empty submodules.
+          WUMS_DIR="$(python3 -c 'import os, wums; print(os.path.dirname(wums.__file__))' 2>/dev/null || true)"
+          if [ -n "$WUMS_DIR" ]; then
+            DEPS_NOTE="This repository's dependencies are pip-installed outside the workspace. The installed wums package (SparseHist, ioutils, logging, ...) is at $WUMS_DIR: read wums code there."
+            SEARCH_ROOTS="the workspace directory and $WUMS_DIR"
+          else
+            DEPS_NOTE="This repository's dependencies are pip-installed outside the workspace, and wums is not importable on this runner."
+            SEARCH_ROOTS="the workspace directory"
+          fi
+          REVIEW_NOTES="$DEPS_NOTE Confine every search to $SEARCH_ROOTS. To read another installed package, locate it with python3 -c 'import NAME; print(NAME.__file__)' instead of searching for it. This runner mounts AFS, CVMFS and EOS, so a filesystem-wide search such as \"find /\" will hang until the job times out."
           # "cern" selects the provider defined in models.cern.json
           # (HODOR_MODELS_JSON); the prefix is not a pi builtin.
           bun run "$RUNNER_TEMP/hodor-src/src/cli.ts" \
             "https://github.com/${{ github.repository }}/pull/$PR" \
             --model "cern/$HODOR_MODEL" \
             --reasoning-effort max \
+            --additional-instructions "$REVIEW_NOTES" \
             --post \
             --require-delivery
