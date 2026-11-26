@@ -25,7 +25,7 @@ import pytest
 import scipy.sparse
 from wums.sparse_hist import SparseHist
 
-from rabbit import fitter, inputdata, tensorwriter
+from rabbit import external_likelihood, fitter, inputdata, tensorwriter
 from rabbit.param_models.helpers import load_model
 
 
@@ -97,9 +97,10 @@ def run_fit(filename):
     }
 
 
-def loss_grad_hess_at(filename, x_override=None):
+def loss_grad_hess_at(filename, x_override=None, shifts=None):
     """Return (loss, grad, hess) for the loaded tensor evaluated at x_override
-    (or the default starting x if None). Uses Asimov data."""
+    (or the default starting x if None), with the parameters named in
+    ``shifts`` moved by the given amounts. Uses Asimov data."""
     import tensorflow as tf
 
     indata_obj = inputdata.FitInputData(filename)
@@ -109,6 +110,11 @@ def loss_grad_hess_at(filename, x_override=None):
     f.set_nobs(f.expected_yield())
     if x_override is not None:
         f.x.assign(tf.constant(x_override, dtype=f.x.dtype))
+    if shifts:
+        x = f.x.numpy().copy()
+        for name, dx in shifts.items():
+            x[get_param_index(f.parms.astype(str), name)] += dx
+        f.x.assign(tf.constant(x, dtype=f.x.dtype))
     val, grad, hess = f.loss_val_grad_hess()
     return (
         f.parms.astype(str),
@@ -144,15 +150,17 @@ def make_hess_hist(values, param_names):
     return h
 
 
-def make_hess_sparsehist(values, param_names):
+def make_hess_sparsehist(values, param_names, flow=True):
     """Same as make_hess_hist but using a wums.SparseHist.
 
-    StrCategory axes have an overflow bin by default, so SparseHist's
-    with-flow layout has shape (n+1, n+1). The user data goes in the
-    first n x n block; the overflow row/col is filled with zeros.
+    A SparseHist is laid out over its axes' flow bins. With ``flow`` the
+    StrCategory axes keep their default overflow bin, so the layout has shape
+    (n+1, n+1): the user data goes in the first n x n block and the overflow
+    row/col is left empty. Without it the axes are built with
+    ``overflow=False`` and the layout is the (n, n) matrix itself.
     """
-    ax0 = hist.axis.StrCategory(param_names, name="params0")
-    ax1 = hist.axis.StrCategory(param_names, name="params1")
+    ax0 = hist.axis.StrCategory(param_names, name="params0", overflow=flow)
+    ax1 = hist.axis.StrCategory(param_names, name="params1", overflow=flow)
     n = len(param_names)
     full = np.zeros((ax0.extent, ax1.extent), dtype=np.float64)
     full[:n, :n] = np.asarray(values, dtype=np.float64)
@@ -247,6 +255,117 @@ def test_positive_gradient_pulls_the_fit_negative(baseline):
         run_fit(os.path.join(baseline.tmpdir, "grad_only_fit.hdf5")), SHAPE
     )
     assert value < -1e-3, f"expected {SHAPE} to pull negative, got {value}"
+
+
+# build_writer's model has a single nuisance; terms over n >= 2 parameters
+# use these, the other two added as norm systematics (_multi_param_writer)
+MULTI = [SHAPE, "norm_a", "norm_b"]
+
+
+def _multi_param_writer():
+    writer = build_writer()
+    for name in MULTI[1:]:
+        writer.add_norm_systematic(name, "bkg", "ch0", 1.05)
+    return writer
+
+
+def _sparse_hess_dense(rows, cols, vals, n):
+    """Densify (rows, cols, values); an index outside the n parameters fails
+    here, before it can reach TF."""
+    rows, cols = np.asarray(rows), np.asarray(cols)
+    inside = (rows >= 0) & (rows < n) & (cols >= 0) & (cols < n)
+    assert inside.all(), f"indices outside {n} parameters: {list(zip(rows, cols))}"
+    H = np.zeros((n, n))
+    np.add.at(H, (rows, cols), vals)
+    return H
+
+
+def _stored_hess(path):
+    """The sparse Hessian of the file's external term, as stored."""
+    import h5py
+
+    with h5py.File(path, "r") as f:
+        (term,) = external_likelihood.read_external_terms_from_h5(f["external_terms"])
+    idx = term["hess_sparse"].indices.numpy()
+    vals = term["hess_sparse"].values.numpy()
+    return _sparse_hess_dense(idx[:, 0], idx[:, 1], vals, len(term["params"]))
+
+
+@pytest.mark.parametrize("flow", [False, True], ids=["no_flow", "flow"])
+@pytest.mark.parametrize("n", [1, 2, 3])
+def test_sparsehist_hess_matches_dense(tmp_path, n, flow):
+    """A SparseHist Hessian must store, and give the likelihood, the matrix the
+    same dense hist gives. Its flat indices run over the with-flow layout,
+    (n+1) x (n+1) with the default overflow bin, and were unravelled as n x n:
+    for n >= 2 every entry after the first row moved, some out of range."""
+    params = MULTI[:n]
+    A = np.arange(1.0, n * n + 1).reshape(n, n)
+    H = A @ A.T + np.eye(n)  # symmetric, no zero entry
+    paths = {}
+    for storage in ("dense", "sparse"):
+        hess = (
+            make_hess_sparsehist(H, params, flow=flow)
+            if storage == "sparse"
+            else make_hess_hist(H, params)
+        )
+        writer = _multi_param_writer()
+        writer.add_external_likelihood_term(hess=hess)
+        writer.write(outfolder=str(tmp_path), outfilename=storage)
+        paths[storage] = os.path.join(str(tmp_path), f"{storage}.hdf5")
+
+    np.testing.assert_array_equal(_stored_hess(paths["sparse"]), H)
+
+    # off the origin, so that the term enters the loss and gradient too
+    shifts = dict(zip(MULTI, (0.3, -0.2, 0.1)))
+    dense = loss_grad_hess_at(paths["dense"], shifts=shifts)
+    sparse = loss_grad_hess_at(paths["sparse"], shifts=shifts)
+    for a, b in zip(dense[1:], sparse[1:]):
+        np.testing.assert_allclose(b, a, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("what", ["sparse hess", "dense hess", "grad", "mean"])
+def test_values_in_flow_bins_are_refused(what):
+    """A flow bin is not a parameter, so a value there cannot be stored; with
+    the default overflow bin, a label missing from the axes lands in it. A
+    dense hist used to lose it silently (values() drops flow bins), a
+    SparseHist to mis-index it."""
+    params = MULTI[:2]
+    H = np.array([[2.0, 0.4], [0.4, 1.0]])
+    full = np.zeros((3, 3))
+    full[:2, :2] = H
+    full[2, 0] = 0.7  # the overflow row
+    axes = [hist.axis.StrCategory(params, name=f"params{i}") for i in range(2)]
+    kwargs = {}
+    if what == "sparse hess":
+        kwargs["hess"] = SparseHist(scipy.sparse.csr_array(full), axes)
+    elif what == "dense hess":
+        kwargs["hess"] = hist.Hist(*axes, storage=hist.storage.Double())
+        kwargs["hess"].view(flow=True)[...] = full
+    else:
+        h = hist.Hist(hist.axis.StrCategory(params, name="params"))
+        h.fill(params + ["not_a_parameter"], weight=[0.1, 0.2, 0.3])
+        kwargs[what] = h
+        if what == "mean":
+            kwargs["hess"] = make_hess_hist(H, params)
+    with pytest.raises(ValueError, match="flow"):
+        _multi_param_writer().add_external_likelihood_term(**kwargs)
+
+
+def test_explicit_zeros_in_sparsehist_flow_bins_are_dropped():
+    """A stored zero in a flow bin carries nothing, so it is not an error."""
+    H = np.array([[2.0, 0.4], [0.4, 1.0]])
+    # the last entry is an explicitly stored zero in the overflow row
+    full = scipy.sparse.coo_array(
+        ([2.0, 0.4, 0.4, 1.0, 0.0], ([0, 0, 1, 1, 2], [0, 1, 0, 1, 0])),
+        shape=(3, 3),
+    ).tocsr()
+    axes = [hist.axis.StrCategory(MULTI[:2], name=f"params{i}") for i in range(2)]
+    hess = SparseHist(full, axes)
+    assert hess.nnz == 5, "the explicit zero must reach the writer"
+    writer = _multi_param_writer()
+    writer.add_external_likelihood_term(hess=hess)
+    rows, cols, vals = writer.external_terms[-1]["hess_sparse"]
+    np.testing.assert_array_equal(_sparse_hess_dense(rows, cols, vals, 2), H)
 
 
 def test_partial_external_covariance_leaves_uncovered_variances_nan():
