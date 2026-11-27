@@ -491,6 +491,195 @@ def test_sparse_fold_storage_follows_norm_sparsity(tmp_path):
     )
 
 
+def _read_logk(fn):
+    """(process names, syst names, hlogk [nbins, nproc, nsyst], hlogk_folds
+    [k, nbins, nproc, nsyst]) of a symmetric dense tensor."""
+    import h5py
+
+    def read(d):
+        return d[...].reshape(d.attrs["original_shape"])
+
+    def names(d):
+        return [x.decode() if isinstance(x, bytes) else x for x in d[...]]
+
+    with h5py.File(fn) as h5:
+        logk_folds = read(h5["hlogk_folds"]) if "hlogk_folds" in h5 else None
+        return names(h5["hprocs"]), names(h5["hsysts"]), read(h5["hlogk"]), logk_folds
+
+
+@pytest.mark.parametrize("symmetrize", ["linear", "quadratic"])
+def test_folded_pair_split_symmetrization(symmetrize, tmp_path):
+    """A folded up/down pair with the 'linear'/'quadratic' symmetrization is split
+    into SymAvg and SymDiff in every fold, as for the full pair: per fold
+    SymAvg = (lu + ld) / 2 and SymDiff = c (lu - ld) / 2 (c = sqrt(3) for
+    quadratic) with lu = log(up/n), ld = -log(down/n) of that fold. The full
+    systematics are those of the pair without folds."""
+    k, nb = 4, 30
+    rng = np.random.default_rng(3)
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    folds = split_into_folds(rng, rng.poisson(np.full(nb, 2000.0)), k).astype(float)
+    w = 1.0 + 0.2 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    up = np.stack([rng.poisson(f * w) for f in folds]).astype(float)
+    down = np.stack([rng.poisson(f / w**0.5) for f in folds]).astype(float)
+
+    fns = {}
+    for folded in (True, False):
+        tw = TensorWriter()
+        tw.add_channel([ax], "ch0")
+        tw.add_data(_hist1d(ax, folds.sum(0)), "ch0")
+        tw.add_process(_fold_hist(ax, folds), "sig", "ch0", fold_axis="mcfold")
+        if folded:
+            pair = [_fold_hist(ax, up), _fold_hist(ax, down)]
+            kwargs = {"fold_axis": "mcfold"}
+        else:
+            pair = [_hist1d(ax, up.sum(0)), _hist1d(ax, down.sum(0))]
+            kwargs = {}
+        tw.add_systematic(
+            pair, "pair", "sig", "ch0", mirror=False, symmetrize=symmetrize, **kwargs
+        )
+        fns[folded] = _write(tw, tmp_path, f"pair_{symmetrize}_{folded}.hdf5")
+
+    _, systs, logk, logk_folds = _read_logk(fns[True])
+    _, systs_ref, logk_ref, _ = _read_logk(fns[False])
+    assert systs == systs_ref
+    assert sorted(systs) == ["pairSymAvg", "pairSymDiff"]
+    np.testing.assert_allclose(logk, logk_ref, rtol=1e-12)
+
+    c = np.sqrt(3.0) if symmetrize == "quadratic" else 1.0
+    lu, ld = np.log(up / folds), -np.log(down / folds)
+    iavg, idiff = systs.index("pairSymAvg"), systs.index("pairSymDiff")
+    np.testing.assert_allclose(logk_folds[:, :, 0, iavg], 0.5 * (lu + ld), rtol=1e-10)
+    np.testing.assert_allclose(
+        logk_folds[:, :, 0, idiff], 0.5 * c * (lu - ld), rtol=1e-10
+    )
+
+
+@pytest.mark.parametrize("symmetrize", ["linear", "quadratic"])
+def test_folded_pair_split_symmetrization_sparse_equals_dense(symmetrize, tmp_path):
+    """The SymAvg and SymDiff systematics of a folded linear/quadratic pair give
+    the same fold predictions with sparse storage (per-fold delta against the
+    full logk) as with dense storage (per-fold logk)."""
+    k, nb = 2, 12
+    rng = np.random.default_rng(9)
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    folds = split_into_folds(rng, rng.poisson(np.full(nb, 500.0)), k).astype(float)
+    w = 1.0 + 0.2 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    up = np.stack([rng.poisson(f * w) for f in folds]).astype(float)
+    down = np.stack([rng.poisson(f / w**0.5) for f in folds]).astype(float)
+    preds = []
+    for sparse in (False, True):
+        tw = TensorWriter(sparse=sparse)
+        tw.add_channel([ax], "ch0")
+        tw.add_data(_hist1d(ax, folds.sum(0)), "ch0")
+        tw.add_process(
+            _fold_hist(ax, folds), "sig", "ch0", signal=True, fold_axis="mcfold"
+        )
+        tw.add_systematic(
+            [_fold_hist(ax, up), _fold_hist(ax, down)],
+            "pair",
+            "sig",
+            "ch0",
+            mirror=False,
+            symmetrize=symmetrize,
+            fold_axis="mcfold",
+        )
+        name = f"pair_{symmetrize}_{'sp' if sparse else 'de'}.hdf5"
+        f = _fold_fitter(_write(tw, tmp_path, name), tmp_path)
+        _set_param(f, "pairSymAvg", 1.5)
+        _set_param(f, "pairSymDiff", -2.0)
+        preds.append(np.asarray(f._compute_fold_yields(halves=False)))
+    assert np.abs(preds[0] / folds - 1.0).max() > 0.02
+    np.testing.assert_allclose(preds[1], preds[0], rtol=1e-10)
+
+
+def test_folded_syst_has_no_fold_structure_where_the_process_has_none(tmp_path):
+    """In the bins a folded process is written without fold structure (here a
+    negative fold), and everywhere for an MC-stat-exempt process, a folded
+    systematic gets the full logk in every fold, so that the fold prediction
+    stays the full one / k at any value of the nuisance. So does a single fold
+    with too few effective MC events (here cancelling weights), whose own
+    variation would be the ratio of two noise-dominated sums. An empty fold has
+    no variation, as an empty full template."""
+    k, nb, bad, low, empty = 4, 20, 7, 12, 15
+    rng = np.random.default_rng(5)
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    axf = hist.axis.IntCategory(list(range(k)), name="mcfold")
+    folds = split_into_folds(rng, rng.poisson(np.full(nb, 1000.0)), k).astype(float)
+    folds[0, bad] = -5.0  # negative weights
+    up = np.stack([rng.poisson(np.abs(f) * 1.05) * np.sign(f) for f in folds]).astype(
+        float
+    )
+
+    def fold_hist(values, variances):
+        h = hist.Hist(ax, axf, storage=hist.storage.Weight())
+        h.view()["value"] = values.T
+        h.view()["variance"] = variances.T
+        return h
+
+    tw = TensorWriter()
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, np.abs(folds).sum(0)), "ch0")
+    variances = np.abs(folds)
+    folds[1, low] = 0.5  # a near-cancellation: kstat = 0.25 / 100
+    variances[1, low] = 100.0
+    folds[2, empty] = variances[2, empty] = 0.0  # an empty fold
+    tw.add_process(fold_hist(folds, variances), "neg", "ch0", fold_axis="mcfold")
+    # MC-stat-exempt: no MC-stat variance at all
+    tw.add_process(
+        fold_hist(np.abs(folds), 0 * folds), "exempt", "ch0", fold_axis="mcfold"
+    )
+    for proc in ("neg", "exempt"):
+        tw.add_systematic(
+            fold_hist(np.abs(up) if proc == "exempt" else up, np.abs(up)),
+            f"tilt_{proc}",
+            proc,
+            "ch0",
+            fold_axis="mcfold",
+        )
+    procs, systs, logk, logk_folds = _read_logk(_write(tw, tmp_path, "flat.hdf5"))
+
+    ineg, iexempt = procs.index("neg"), procs.index("exempt")
+    isyst = systs.index("tilt_neg")
+    # the flattened bin: every fold the full logk; elsewhere the folds differ
+    np.testing.assert_allclose(
+        logk_folds[:, bad, ineg, isyst], logk[bad, ineg, isyst], rtol=1e-12
+    )
+    others = np.arange(nb) != bad
+    assert np.all(np.ptp(logk_folds[:, others, ineg, isyst], axis=0) > 0)
+    # the fold with too few effective events: the full logk, the others their own
+    np.testing.assert_allclose(
+        logk_folds[1, low, ineg, isyst], logk[low, ineg, isyst], rtol=1e-12
+    )
+    assert np.all(logk_folds[[0, 2, 3], low, ineg, isyst] != logk[low, ineg, isyst])
+    # an empty fold has no variation
+    assert logk_folds[2, empty, ineg, isyst] == 0.0
+    # the exempt process: every bin the full logk
+    isyst = systs.index("tilt_exempt")
+    np.testing.assert_allclose(
+        logk_folds[:, :, iexempt, isyst],
+        np.broadcast_to(logk[:, iexempt, isyst], (k, nb)),
+        rtol=1e-12,
+    )
+
+
+def test_empty_fold_keeps_its_additive_variation(tmp_path):
+    """An additive (normal) variation of an empty fold is part of the full one
+    (e.g. events migrating into the bin), so it is kept and the folds sum to
+    the full variation; it is dropped only where the full template is empty,
+    as for the full logk."""
+    ax = hist.axis.Regular(2, 0.0, 1.0, name="x")
+    folds = np.array([[0.0, 0.0], [10.0, 0.0]])
+    up = np.array([[2.0, 1.0], [12.0, 1.0]])
+    tw = TensorWriter(systematic_type="normal")
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, np.array([10.0, 1.0])), "ch0")
+    tw.add_process(_fold_hist(ax, folds), "sig", "ch0", fold_axis="mcfold")
+    tw.add_systematic(_fold_hist(ax, up), "mig", "sig", "ch0", fold_axis="mcfold")
+    _, _, logk, logk_folds = _read_logk(_write(tw, tmp_path, "empty_normal.hdf5"))
+    np.testing.assert_allclose(logk[:, 0, 0], [4.0, 0.0])
+    np.testing.assert_allclose(logk_folds[:, :, 0, 0], [[2.0, 0.0], [2.0, 0.0]])
+
+
 # ---------------------------------------------------------------------------
 # bin-by-bin stat: separately profiled jackknife terms, compensator
 # ---------------------------------------------------------------------------
@@ -849,3 +1038,531 @@ def test_split_meat_stays_finite_for_odd_k_unbalanced_folds(bbb, tmp_path):
     assert np.all(np.isfinite(B))
     S = np.asarray(f.mcstat_postfit_covariances(*f.loss_val_grad_hess()[1:])[3])
     assert np.all(np.isfinite(S))
+
+
+# ---------------------------------------------------------------------------
+# bounded fold deviations (--mcStatFoldBound)
+# ---------------------------------------------------------------------------
+
+
+def _fold_fitter(fn, tmp_path, *extra):
+    """The Fitter `rabbit_fit.py fn -t 0 --mcStatDebias kfold *extra` builds, at
+    its default point with the data set (not minimized)."""
+    options = (
+        _driver()
+        .make_parser()
+        .parse_args(
+            [str(fn), "-o", str(tmp_path), "-t", "0", "--mcStatDebias", "kfold"]
+            + list(extra)
+        )
+    )
+    indata = inputdata.FitInputData(str(fn), None)
+    pm = ph.load_models([["Mu"]], indata, **vars(options))
+    f = fitter.Fitter(indata, pm, options, do_blinding=False)
+    f.defaultassign()
+    f.set_nobs(indata.data_obs)
+    return f
+
+
+def _set_param(f, name, value):
+    names = [p.decode() if isinstance(p, bytes) else str(p) for p in f.parms]
+    x = f.x.numpy()
+    x[names.index(name)] = value
+    f.x.assign(x)
+
+
+def make_one_fold_variation_toy(path, k=2, sparse=False):
+    """A process 'sig' of ~100 unit-weight MC events per bin and fold, with a
+    folded systematic 'onefold' that varies fold 0 only (+50%), as a variation
+    carried by a few events of one fold would: its fold logk differ by log 1.5
+    in every bin. Asimov data = the nominal. Returns the filename."""
+    nb = 5
+    folds = np.random.default_rng(3).poisson(100.0, size=(k, nb)).astype(float)
+    up = folds.copy()
+    up[0] *= 1.5
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    tw = TensorWriter(sparse=sparse)
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, folds.sum(0)), "ch0")
+    tw.add_process(_fold_hist(ax, folds), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_systematic(_fold_hist(ax, up), "onefold", "sig", "ch0", fold_axis="mcfold")
+    return _write(tw, path, f"onefold_k{k}_{'sp' if sparse else 'de'}.hdf5")
+
+
+FORMS = ["taper", "tanh"]
+# the bound alone, without the shared-logk fallback for noisy templates (the
+# one-fold toy's fold deviation norm, ~0.2, is above the threshold of 0.1)
+NO_SHARING = ("--mcStatFoldMaxDeviation", "0")
+# the protections are off by default
+BOUND = ("--mcStatFoldBound", "0.5")
+
+
+@pytest.mark.parametrize("form", FORMS)
+@pytest.mark.parametrize("sparse", [False, True], ids=["dense", "sparse"])
+def test_fold_bound_leaves_the_nominal_point_unchanged(sparse, form, tmp_path):
+    """Both bounds have value 0, slope 1 and curvature 0 at x = 0: the de-biased
+    loss, gradient and Hessian at the nominal point (where every fold deviation x
+    vanishes) are those of the unbounded objective, i.e. the noise-floor
+    subtraction is untouched."""
+    fn = make_folded_syst_toy(tmp_path, k=2, sparse=sparse, split=True)
+    bound = ("--mcStatFoldBound", "0.5", "--mcStatFoldBoundForm", form)
+    got = _fold_fitter(fn, tmp_path, *bound).loss_val_grad_hess()
+    ref = _fold_fitter(fn, tmp_path, "--mcStatFoldBound", "0").loss_val_grad_hess()
+    for g, r in zip(got, ref):
+        np.testing.assert_allclose(np.asarray(g), np.asarray(r), rtol=1e-12, atol=1e-9)
+
+
+def _fold_log_ratios(f):
+    """log of (fold prediction / fold nominal) over (full prediction / full
+    nominal) per (fold, bin, process): the bounded deviation d of each fold."""
+    _, norm_full = f._compute_yields_noBBB(full=False, compute_norm=True)
+    _, norm_folds = f._compute_fold_yields(halves=False, return_norm=True)
+    nominal_folds = np.asarray(f.indata.norm_folds)[:, : f.indata.nbins]
+    nominal = np.asarray(f.indata.norm)[: f.indata.nbins]
+    ratio = (np.asarray(norm_folds) / nominal_folds) / (
+        np.asarray(norm_full) / nominal
+    )[None]
+    return np.log(ratio)
+
+
+@pytest.mark.parametrize(
+    "form, bound, dmax",
+    [("taper", 0.5, 0.25), ("tanh", 0.5, 0.5), ("taper", 0.0, None)],
+    ids=["taper", "tanh", "unbounded"],
+)
+def test_fold_bound_keeps_each_fold_near_the_full_template(form, bound, dmax, tmp_path):
+    """Far along the systematic each fold's template stays within e^(+-dmax) of
+    the full-sample variation (dmax = kappa/2 for the taper, kappa for tanh);
+    unbounded, fold 0 runs ahead by e^(x)."""
+    fn = make_one_fold_variation_toy(tmp_path)
+    args = ("--mcStatFoldBound", str(bound), "--mcStatFoldBoundForm", form)
+    f = _fold_fitter(fn, tmp_path, *args, *NO_SHARING)
+    _set_param(f, "onefold", 30.0)
+    d = _fold_log_ratios(f)
+    if dmax is None:
+        assert np.abs(d).max() > 1.0
+    else:
+        assert np.abs(d).max() <= dmax * (1 + 1e-9)
+
+
+def test_fold_taper_hands_the_fold_back_to_the_full_template(tmp_path):
+    """The taper returns to the shared logk for |x| >> kappa: very far along the
+    systematic the folds follow the full-sample variation, d ~ kappa^2 / x, so
+    the objective there is that of a shared systematic, with no gain for the
+    fit."""
+    f = _fold_fitter(
+        make_one_fold_variation_toy(tmp_path), tmp_path, *BOUND, *NO_SHARING
+    )
+    _set_param(f, "onefold", 1000.0)  # |x| ~ 400 kappa in every bin
+    assert np.abs(_fold_log_ratios(f)).max() < 0.01 * 0.5
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_fold_bound_keeps_the_objective_bounded(form, tmp_path):
+    """The one-fold variation drives the unbounded jackknife objective to -inf
+    along the systematic (the half that carries it outgrows the full template:
+    turnover at theta ~ 8 here); bounded it rises like an ordinary likelihood."""
+    fn = make_one_fold_variation_toy(tmp_path)
+    for bound in (0.5, 0.0):
+        f = _fold_fitter(
+            fn,
+            tmp_path,
+            "--mcStatFoldBound",
+            str(bound),
+            "--mcStatFoldBoundForm",
+            form,
+            "--noBinByBinStat",
+            *NO_SHARING,
+        )
+        losses = []
+        for theta in (0.0, 10.0, 30.0):
+            _set_param(f, "onefold", theta)
+            losses.append(float(f.loss_val_grad()[0]))
+        if bound > 0:
+            assert losses[0] < losses[1] < losses[2], losses
+        else:
+            assert losses[2] < losses[0] - 1e6, losses
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_fold_bound_dense_equals_sparse(form, tmp_path):
+    """The bound acts on the dense per-fold logk and on the sparse per-fold delta
+    alike: the same fold predictions where it is active."""
+    preds = []
+    for sparse in (False, True):
+        fn = make_one_fold_variation_toy(tmp_path, sparse=sparse)
+        f = _fold_fitter(
+            fn, tmp_path, *BOUND, "--mcStatFoldBoundForm", form, *NO_SHARING
+        )
+        _set_param(f, "onefold", 30.0)
+        preds.append(np.asarray(f._compute_fold_yields(halves=False)))
+    np.testing.assert_allclose(preds[1], preds[0], rtol=1e-10)
+
+
+def make_mixed_noise_toy(path, sparse=False):
+    """'sig' (~1000 unit-weight MC events per bin and fold) with a folded 'tilt'
+    whose fold variations differ by their MC noise only (fold deviation norm
+    ~0.03), and 'bkg' (~100 per bin and fold) with a folded 'onefold' varying
+    fold 0 only (+50%, fold deviation norm ~0.2). Asimov data. Returns the
+    filename."""
+    nb, k = 5, 2
+    rng = np.random.default_rng(5)
+    sig = rng.poisson(1000.0, size=(k, nb)).astype(float)
+    w = 1.0 + 0.1 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    sig_up = np.stack([rng.poisson(sig[i] * w) for i in range(k)]).astype(float)
+    bkg = rng.poisson(100.0, size=(k, nb)).astype(float)
+    bkg_up = bkg.copy()
+    bkg_up[0] *= 1.5
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    tw = TensorWriter(sparse=sparse)
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, sig.sum(0) + bkg.sum(0)), "ch0")
+    tw.add_process(_fold_hist(ax, sig), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_process(_fold_hist(ax, bkg), "bkg", "ch0", fold_axis="mcfold")
+    tw.add_systematic(_fold_hist(ax, sig_up), "tilt", "sig", "ch0", fold_axis="mcfold")
+    tw.add_systematic(
+        _fold_hist(ax, bkg_up), "onefold", "bkg", "ch0", fold_axis="mcfold"
+    )
+    return _write(tw, path, f"mixed_noise_{'sp' if sparse else 'de'}.hdf5")
+
+
+def test_noisy_fold_templates_take_the_shared_logk(tmp_path):
+    """Templates whose fold deviation norm exceeds --mcStatFoldMaxDeviation follow
+    the full-sample variation in every fold (shared logk); the others keep their
+    own fold variations."""
+    fn = make_mixed_noise_toy(tmp_path)
+    for tau, bkg_shared in (("0.1", True), ("0", False)):
+        f = _fold_fitter(fn, tmp_path, "--mcStatFoldMaxDeviation", tau)
+        procs = [p.decode() if isinstance(p, bytes) else str(p) for p in f.indata.procs]
+        isig, ibkg = procs.index("sig"), procs.index("bkg")
+        _set_param(f, "onefold", 30.0)
+        _set_param(f, "tilt", 3.0)
+        d = _fold_log_ratios(f)
+        assert np.abs(d[:, :, isig]).max() > 1e-3  # split logk kept
+        if bkg_shared:
+            flags = f.mcstat_fold_shared_templates[: f.indata.nbins]
+            assert flags[:, ibkg].all() and not flags[:, isig].any()
+            np.testing.assert_allclose(d[:, :, ibkg], 0.0, atol=1e-12)
+        else:
+            assert f.mcstat_fold_shared_templates is None
+            assert np.abs(d[:, :, ibkg]).max() > 1e-3
+
+
+def test_fold_templates_below_the_threshold_are_untouched(tmp_path):
+    """No template of a well-measured systematic crosses the threshold: the
+    de-biased loss, gradient and Hessian away from the nominal point are those
+    without --mcStatFoldMaxDeviation."""
+    fn = make_folded_syst_toy(tmp_path, k=2, split=True)
+    res = []
+    for tau in ("0.1", "0"):
+        f = _fold_fitter(fn, tmp_path, "--mcStatFoldMaxDeviation", tau)
+        if tau != "0":
+            assert not f.mcstat_fold_shared_templates.any()
+        _set_param(f, "tilt", 1.5)
+        res.append(f.loss_val_grad_hess())
+    for g, r in zip(*res):
+        np.testing.assert_allclose(np.asarray(g), np.asarray(r), rtol=1e-12, atol=1e-9)
+
+
+def test_noisy_fold_templates_dense_equals_sparse(tmp_path):
+    """The shared logk is given in dense (per-fold logk) and sparse (per-fold
+    delta) storage alike: the same fold predictions."""
+    preds = []
+    for sparse in (False, True):
+        f = _fold_fitter(
+            make_mixed_noise_toy(tmp_path, sparse=sparse),
+            tmp_path,
+            *BOUND,
+            "--mcStatFoldMaxDeviation",
+            "0.1",
+        )
+        _set_param(f, "onefold", 30.0)
+        _set_param(f, "tilt", 3.0)
+        preds.append(np.asarray(f._compute_fold_yields(halves=False)))
+    np.testing.assert_allclose(preds[1], preds[0], rtol=1e-10)
+
+
+def make_few_event_toy(path, sparse=False, local=False):
+    """'sig' (~1000 unit-weight MC events per bin and fold, folded 'tilt' with
+    fold variations that differ by their MC noise only) and 'few', a background
+    of a few unit-weight events per bin (kstat ~2, one fold often empty) with a
+    folded 'onefew' that varies the events of one fold (+50%). With `local`,
+    'few' is a single bin with four events per fold (above the writer's floor of
+    3 for a fold's own variation, kstat 8 for the template), as a local nuisance
+    (e.g. a scale factor of one eta-pt cell) sees it. Asimov data. Returns the
+    filename."""
+    nb, k = 5, 2
+    rng = np.random.default_rng(7)
+    sig = rng.poisson(1000.0, size=(k, nb)).astype(float)
+    w = 1.0 + 0.1 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    sig_up = np.stack([rng.poisson(sig[i] * w) for i in range(k)]).astype(float)
+    if local:
+        few = np.zeros((k, nb))
+        few[:, 1] = 4.0
+    else:
+        few = np.array([[0.0, 1.0, 2.0, 0.0, 1.0], [2.0, 1.0, 0.0, 3.0, 2.0]])
+    few_up = few.copy()
+    few_up[1] *= 1.5
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    tw = TensorWriter(sparse=sparse)
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, sig.sum(0) + few.sum(0)), "ch0")
+    tw.add_process(_fold_hist(ax, sig), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_process(_fold_hist(ax, few), "few", "ch0", fold_axis="mcfold")
+    tw.add_systematic(_fold_hist(ax, sig_up), "tilt", "sig", "ch0", fold_axis="mcfold")
+    tw.add_systematic(
+        _fold_hist(ax, few_up), "onefew", "few", "ch0", fold_axis="mcfold"
+    )
+    name = f"few_event_{'local_' if local else ''}{'sp' if sparse else 'de'}.hdf5"
+    return _write(tw, path, name)
+
+
+@pytest.mark.parametrize("sparse", [False, True], ids=["dense", "sparse"])
+def test_low_kstat_templates_leave_the_fold_structure(sparse, tmp_path):
+    """With --mcStatFoldMinKstat, the few-event templates get 1/k of the full
+    nominal in every fold and follow the full-sample variation: their half
+    predictions equal the full one at any parameter values. The well-measured
+    templates keep their folds and their own fold variations."""
+    fn = make_few_event_toy(tmp_path, sparse=sparse)
+    f = _fold_fitter(fn, tmp_path, "--mcStatFoldMinKstat", "10", *NO_SHARING)
+    procs = [p.decode() if isinstance(p, bytes) else str(p) for p in f.indata.procs]
+    isig, ifew = procs.index("sig"), procs.index("few")
+    flags = np.asarray(f.mcstat_fold_optout_templates)
+    if sparse:
+        rows = np.asarray(f.indata.norm.indices)
+        flagged_procs = set(rows[flags, 1].tolist())
+        assert flagged_procs == {ifew}
+    else:
+        flags = flags[: f.indata.nbins]
+        assert flags[:, ifew].all() and not flags[:, isig].any()
+    _set_param(f, "onefew", 2.0)
+    _set_param(f, "tilt", 3.0)
+    _, norm_full = f._compute_yields_noBBB(full=False, compute_norm=True)
+    _, norm_halves = f._compute_fold_yields(halves=True, return_norm=True)
+    nb = f.indata.nbins
+    full = np.asarray(norm_full)[:nb]
+    halves = np.asarray(norm_halves)[:, :nb]
+    np.testing.assert_allclose(
+        halves[:, :, ifew], np.broadcast_to(full[None, :, ifew], (2, nb)), rtol=1e-12
+    )
+    assert np.abs(halves[:, :, isig] / full[None, :, isig] - 1.0).max() > 1e-4
+
+
+def test_low_kstat_opt_out_keeps_the_objective_bounded(tmp_path):
+    """Without protection the few-event template's fold variation makes the
+    de-biased objective fall without bound along 'onefew'; once the template has
+    left the fold structure the objective grows there like the ordinary one."""
+    fn = make_few_event_toy(tmp_path, local=True)
+    vals = {}
+    for kmin in ("0", "10"):
+        f = _fold_fitter(
+            fn,
+            tmp_path,
+            "--mcStatFoldMinKstat",
+            kmin,
+            "--mcStatFoldBound",
+            "0",
+            *NO_SHARING,
+        )
+        out = []
+        for th in (0.0, 5.0, 10.0, 20.0):
+            _set_param(f, "onefew", th)
+            out.append(float(f.loss_val_grad_hess()[0]))
+        vals[kmin] = np.array(out)
+    assert vals["0"][-1] < vals["0"][0] - 1e3
+    assert np.all(np.diff(vals["10"]) > 0.0)
+
+
+def make_additive_fold_toy(path, scale=1.0, noisy=False):
+    """'sig' with two equal folds of 50 * scale per bin and additive ('normal')
+    variations: a folded 'shift' of +2 * scale in each fold (+4 * scale in full)
+    and a shared 'shared' of +4 * scale; with `noisy` a folded 'noisy' whose
+    fold shifts differ: [+12, -4] * scale in the first bin (fold deviation 0.16
+    relative to the fold-scale nominal) and [+4, 0] * scale in the others (0.04).
+    Asimov data. Returns the filename."""
+    nb, k = 3, 2
+    folds = np.full((k, nb), 50.0 * scale)
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    tw = TensorWriter(systematic_type="normal")
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, folds.sum(0)), "ch0")
+    tw.add_process(_fold_hist(ax, folds), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_systematic(
+        _fold_hist(ax, folds + 2.0 * scale), "shift", "sig", "ch0", fold_axis="mcfold"
+    )
+    tw.add_systematic(_hist1d(ax, folds.sum(0) + 4.0 * scale), "shared", "sig", "ch0")
+    if noisy:
+        shifts = np.array([[12.0, 4.0, 4.0], [-4.0, 0.0, 0.0]]) * scale
+        tw.add_systematic(
+            _fold_hist(ax, folds + shifts), "noisy", "sig", "ch0", fold_axis="mcfold"
+        )
+    name = f"additive_folds_s{scale}{'_noisy' if noisy else ''}.hdf5"
+    return _write(tw, path, name)
+
+
+@pytest.mark.parametrize(
+    "protection",
+    [("--mcStatFoldMinKstat", "1000"), ("--mcStatFoldMaxDeviation", "0.1")],
+    ids=["min-kstat", "max-deviation"],
+)
+def test_fold_protections_keep_additive_variations_at_fold_scale(protection, tmp_path):
+    """With additive (normal) systematics a variation shared across folds is 1/k
+    of the full one in each fold. Both protections hand the folds that shared
+    variation: the rescaled halves follow the full prediction (104 for a +4
+    shift of 100), not k times the shift (108). A shared systematic and a folded
+    one without fold noise are no noisy templates."""
+    f = _fold_fitter(make_additive_fold_toy(tmp_path), tmp_path, *protection)
+    if protection[0] == "--mcStatFoldMaxDeviation":
+        assert not np.asarray(f.mcstat_fold_shared_templates).any()
+    else:
+        assert np.asarray(f.mcstat_fold_optout_templates)[: f.indata.nbins].all()
+    for syst in ("shift", "shared"):
+        _set_param(f, "shift", 0.0)
+        _set_param(f, "shared", 0.0)
+        _set_param(f, syst, 1.0)
+        halves = np.asarray(f._compute_fold_yields(halves=True))
+        np.testing.assert_allclose(halves, 104.0, rtol=1e-12)
+
+
+@pytest.mark.parametrize("scale", [1.0, 10.0])
+def test_noisy_additive_fold_templates_take_the_shared_logk(scale, tmp_path):
+    """The fold deviation of an additive variation is relative to the fold-scale
+    nominal, so the threshold means the same at any yield: the bin whose fold
+    shifts deviate by 8 events on 50 (0.16) takes the shared variation, the
+    others (0.04) keep their own, for 10x the yields as well. A shared
+    template's halves then follow the full prediction."""
+    fn = make_additive_fold_toy(tmp_path, scale=scale, noisy=True)
+    f = _fold_fitter(fn, tmp_path, "--mcStatFoldMaxDeviation", "0.1")
+    flags = np.asarray(f.mcstat_fold_shared_templates)[: f.indata.nbins, 0]
+    assert flags.tolist() == [True, False, False]
+    _set_param(f, "noisy", 1.0)
+    halves = np.asarray(f._compute_fold_yields(halves=True))
+    full = np.asarray(f._compute_yields_noBBB(full=False)[0])
+    np.testing.assert_allclose(halves[:, 0], full[0], rtol=1e-12)
+    assert np.abs(halves[:, 1:] - full[None, 1:]).max() > scale
+
+
+def make_asymmetric_fold_toy(path):
+    """One bin, two folds of 1000 events, an asymmetric folded pair (up
+    [e^0.12, e^-0.12] times the folds, down the nominal, symmetrize=None):
+    the (logkavg, logkhalfdiff) deviations of a fold are equal, so their L2
+    norm (0.090) understates the deviation of the exponent at theta = 1
+    (0.127). Asimov data. Returns the filename."""
+    ax = hist.axis.Regular(1, 0.0, 1.0, name="x")
+    nom = np.full((2, 1), 1000.0)
+    up = nom * np.exp([[0.12], [-0.12]])
+    tw = TensorWriter()
+    tw.add_channel([ax], "ch0")
+    tw.add_data(_hist1d(ax, nom.sum(0)), "ch0")
+    tw.add_process(_fold_hist(ax, nom), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_systematic(
+        [_fold_hist(ax, up), _fold_hist(ax, nom)],
+        "asym",
+        "sig",
+        "ch0",
+        fold_axis="mcfold",
+        mirror=False,
+        symmetrize=None,
+    )
+    return _write(tw, path, "asymmetric_folds.hdf5")
+
+
+@pytest.mark.parametrize("tau, shared", [("0.1", True), ("0.13", False)])
+def test_fold_deviation_norm_of_asymmetric_systematics(tau, shared, tmp_path):
+    """For an asymmetric systematic the deviation norm adds the logkavg and
+    logkhalfdiff deviations (theta and theta alpha(theta) multiply them), so it
+    bounds the change of each fold's exponent per unit |theta| and is reached at
+    theta = 1 here (0.1272): above the threshold of 0.1, not above 0.13."""
+    fn = make_asymmetric_fold_toy(tmp_path)
+    f = _fold_fitter(fn, tmp_path, "--mcStatFoldMaxDeviation", tau)
+    assert bool(np.asarray(f.mcstat_fold_shared_templates).any()) == shared
+    if shared:
+        return
+    # per fold |delta logkavg| + |delta logkhalfdiff| = |log(up_f / n_f) -
+    # log(up / n)|, the down variation being the nominal
+    norm = np.abs(np.array([0.12, -0.12]) - np.log(np.cosh(0.12)))
+    worst = 0.0
+    for theta in np.linspace(-3.0, 3.0, 25):
+        _set_param(f, "asym", theta)
+        d = np.abs(_fold_log_ratios(f)[:, 0, 0])
+        assert np.all(d <= norm * abs(theta) * (1 + 1e-9) + 1e-12), (theta, d)
+        if theta != 0:
+            worst = max(worst, (d / (norm * abs(theta))).max())
+    assert worst > 1 - 1e-6
+
+
+def _proc_index(f, name):
+    procs = [p.decode() if isinstance(p, bytes) else str(p) for p in f.indata.procs]
+    return procs.index(name)
+
+
+def make_low_kstat_toy(path, folded, systematic_type="log_normal", k=3):
+    """'sig' (~300 unit-weight MC events per bin and fold, folded 'tilt') and
+    'few', a background of a few weighted events per bin (full-sample kstat
+    between 1 and 3) with a variation 'onefew' carried by part of its events.
+    With `folded`, 'few' and 'onefew' carry the fold axis (all bins below a
+    kstat of 10); otherwise they are added without folds. Data fluctuate about
+    the nominal. Returns the filename."""
+    nb = 6
+    rng = np.random.default_rng(17)
+    sig = rng.poisson(300.0, size=(k, nb)).astype(float)
+    w = 1.0 + 0.1 * (np.linspace(0.0, 1.0, nb) - 0.5)
+    sig_up = np.stack([rng.poisson(sig[i] * w) for i in range(k)]).astype(float)
+    # unit-weight events of 'few' per fold; 'onefew' scales those of fold 0
+    few = np.array(
+        [[1, 0, 2, 1, 0, 1], [0, 2, 1, 0, 1, 1], [1, 1, 0, 2, 1, 0]], dtype=float
+    )[:k]
+    few_up = few.copy()
+    few_up[0] *= 1.5
+    ax = hist.axis.Regular(nb, 0.0, 1.0, name="x")
+    tw = TensorWriter(systematic_type=systematic_type)
+    tw.add_channel([ax], "ch0")
+    data = sig.sum(0) + few.sum(0) + rng.normal(0.0, 15.0, nb).round()
+    tw.add_data(_hist1d(ax, data), "ch0")
+    tw.add_process(_fold_hist(ax, sig), "sig", "ch0", signal=True, fold_axis="mcfold")
+    tw.add_systematic(_fold_hist(ax, sig_up), "tilt", "sig", "ch0", fold_axis="mcfold")
+    if folded:
+        tw.add_process(_fold_hist(ax, few), "few", "ch0", fold_axis="mcfold")
+        tw.add_systematic(
+            _fold_hist(ax, few_up), "onefew", "few", "ch0", fold_axis="mcfold"
+        )
+    else:
+        tw.add_process(_hist1d(ax, few.sum(0)), "few", "ch0")
+        tw.add_systematic(_hist1d(ax, few_up.sum(0)), "onefew", "few", "ch0")
+    name = f"low_kstat_{'folded' if folded else 'flat'}_{systematic_type}.hdf5"
+    return _write(tw, path, name)
+
+
+@pytest.mark.parametrize("systematic_type", ["log_normal", "normal"])
+def test_low_kstat_opt_out_equals_a_process_without_folds(systematic_type, tmp_path):
+    """A template taken out of the fold structure by --mcStatFoldMinKstat enters
+    exactly as one of a process added without folds: the same objective, de-
+    biased curvature and sandwich covariance, so no split variance is left on
+    it, and the logk of an additive systematic is the shared 1/k of the full
+    one. A process added without folds is not touched by the option."""
+    kmin = ("--mcStatFoldMinKstat", "10")
+    folded = make_low_kstat_toy(tmp_path, True, systematic_type)
+    flat = make_low_kstat_toy(tmp_path, False, systematic_type)
+
+    def state(fn, *extra):
+        # away from the nominal point, where the split meat and the halves'
+        # residuals do not vanish
+        f = _fold_fitter(fn, tmp_path, *extra)
+        _set_param(f, "tilt", 0.7)
+        _set_param(f, "onefew", -1.2)
+        val, grad, h = f.loss_val_grad_hess()
+        cov = np.asarray(f.cov_twohalf_sandwich(h))
+        return f, (float(val), np.asarray(grad), np.asarray(h), cov)
+
+    f_out, got_out = state(folded, *kmin)
+    ifew = _proc_index(f_out, "few")
+    flags = np.asarray(f_out.mcstat_fold_optout_templates)[: f_out.indata.nbins]
+    assert flags[:, ifew].all() and not flags[:, _proc_index(f_out, "sig")].any()
+    assert not np.any(np.asarray(f_out.indata.sumw2_folds)[:, :, ifew])
+
+    f_flat, got_flat = state(flat, *kmin)
+    assert not np.asarray(f_flat.mcstat_fold_optout_templates).any()
+    _, ref = state(flat)
+    for got in (got_out, got_flat):
+        for g, r in zip(got, ref):
+            np.testing.assert_allclose(g, r, rtol=1e-10, atol=1e-12)
