@@ -738,6 +738,9 @@ class TensorWriter:
             raise RuntimeError(
                 f"uncertainty must be either a scalar or list with the same length as the list of processes but len(process) = {len(process)} and len(uncertainty) = {len(uncertainty)}"
             )
+        # a single uncertainty applies to every process
+        if len(uncertainty) == 1:
+            uncertainty = list(uncertainty) * len(process)
 
         var_name_out = name
 
