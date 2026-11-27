@@ -8,6 +8,7 @@ baseline_models = {
     "Mixture": "param_model",
     "AxisNormModel": "param_model",
     "AxisExpModel": "param_model",
+    "AxisExpPolyModel": "param_model",
     "AxisBernsteinModel": "param_model",
     "ABCD": "abcd_model",
     "ExtendedABCD": "extended_abcd_model",
