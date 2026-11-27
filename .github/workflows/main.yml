@@ -178,6 +178,23 @@ jobs:
           echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
           echo "PATH=$GITHUB_WORKSPACE/bin:$PATH" >> $GITHUB_ENV
 
+      # The tests run in the runner's own environment, not in the analysis
+      # container, so log the versions they run against: a test that fails
+      # locally but passes here (or the reverse) is often a version difference.
+      - name: print package versions
+        run: |
+          python - <<'EOF'
+          import sys
+          from importlib.metadata import PackageNotFoundError, version
+          print("python", sys.version.split()[0], sys.executable)
+          for pkg in ("numpy", "scipy", "tensorflow", "tensorflow-probability",
+                      "h5py", "hist", "boost-histogram", "wums"):
+              try:
+                  print(pkg, version(pkg))
+              except PackageNotFoundError:
+                  print(pkg, "not installed")
+          EOF
+
       # pytest collects tests/ (so discovery, not a list, decides what runs;
       # see tests/test_ci_registration.py), then runs every collected file in
       # its own process. XLA keeps the code it compiles for every fitter

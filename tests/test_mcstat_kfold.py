@@ -2,8 +2,10 @@
 
 * k = 2: point, curvature and sandwich equal the numpy jackknife.
 * any k: the --covMode fisher curvature equals the complete pairwise
-  U-statistic A_k = k/(k-1) [F_full - sum_i F_i]; over an ensemble it is
-  unbiased and its scatter shrinks as k grows.
+  U-statistic A_k = k/(k-1) [F_full - sum_i F_i]. Over random fold splits of
+  one MC sample its mean is the continuous-M curvature and its variance falls
+  as 1/(k-1) (closed form); over an MC ensemble sigma(dif) is centred on
+  sigma_inf.
 * Separately profiled jackknife terms, the compensator, the split-contrast
   meat and the Gauss-Newton marginal term against their closed forms.
 * Sparse-mode fold storage gives exactly the dense result; the writer's
@@ -262,8 +264,8 @@ def test_kfold_fisher_curvature_matches_ustatistic(tmp_path_factory):
     np.testing.assert_allclose(curv, ref, rtol=1e-4)
 
 
-def _ustatistic_sigma_ensemble(k, ntoy, seed):
-    """sigma(dif) from the U-statistic curvature over `ntoy` fresh MC
+def _ustatistic_sigma_median(k, ntoy, seed):
+    """Median sigma(dif) from the U-statistic curvature over `ntoy` fresh MC
     realizations of the degenerate toy split into k folds (pure numpy)."""
     rng = np.random.default_rng(seed)
     base = degenerate_toy_arrays()
@@ -275,22 +277,69 @@ def _ustatistic_sigma_ensemble(k, ntoy, seed):
         v = DDIF @ np.linalg.inv(kfold_ustatistic(Ti, base["data"])) @ DDIF
         if v > 0:
             sig.append(np.sqrt(v))
-    return np.median(sig), np.std(sig)
+    return np.median(sig)
+
+
+def _fold_split_moments(counts, V, k, u):
+    """Mean and variance of u^T A_k u over random k-fold splits of one fixed MC
+    sample of unit-weight events (counts [nbins, nparams]), in closed form.
+
+    Mean: the continuous-M curvature u^T (F_full - M) u of that sample, with
+    M = diag(sum_b counts[b, j] / V_b) as in make_mcstat_moment_toy. A_k sums
+    the cross-fold event pairs; two distinct events land in different folds
+    with probability (k-1)/k, which the factor k/(k-1) undoes.
+    Variance: 2/(k-1) sum_b [(sum_j n_bj u_j^2)^2 - sum_j n_bj u_j^4] / V_b^2.
+    This is exact because the indicators "e and e' in different folds" are
+    pairwise uncorrelated, also for two pairs that share an event.
+    """
+    n = counts.astype(float)
+    M = np.diag(np.sum(n / V[:, None], axis=0))
+    mean = u @ (_fisher(n, V) - M) @ u
+    var = 2.0 / (k - 1) * np.sum(((n @ u**2) ** 2 - n @ u**4) / V**2)
+    return mean, var
 
 
 def test_kfold_ustatistic_unbiased_and_variance_reducing():
-    """Over an ensemble (300 toys per k, fixed seeds) the U-statistic sigma(dif)
-    has median within 0.02 of sigma_inf for k=4, 8, 16, and its RMS does not
-    increase with k (k-fold averaging approaches the continuous-M floor)."""
+    """The U-statistic curvature is unbiased, and its scatter shrinks with k
+    towards the continuous-M floor.
+
+    * Over 1000 random k-fold splits of one MC sample, u^T A_k u has the mean
+      and variance of _fold_split_moments (k = 2, 4, 8, 16; three directions
+      u). The variance over MC samples is therefore that of the continuous-M
+      curvature plus a term that falls as 1/(k-1).
+    * Over an ensemble (300 fresh MC realizations per k, fixed seeds) the
+      median sigma(dif) is within 0.02 of sigma_inf for k = 4, 8, 16.
+
+    The k dependence is checked at a fixed sample on purpose. Between
+    independent ensembles the RMS of sigma(dif) changes by a few percent per
+    step in k, within the noise of 300 toys, and a single toy with a nearly
+    singular A_k reverses the order (numpy 2.5's Generator.multinomial stream
+    produces one at k = 8).
+    """
     base = degenerate_toy_arrays()
+    counts, V = base["sumw"].T.astype(np.int64), base["data"]
+    rng = np.random.default_rng(1)
+    nsplit = 1000
+    # 5 standard errors, on the mean and on the variance: the relative standard
+    # error of a variance over nsplit near-Gaussian values is sqrt(2 / nsplit)
+    tol = 5.0 * np.sqrt(2.0 / nsplit)
+    for k in (2, 4, 8, 16):
+        A = np.empty((nsplit, 2, 2))
+        for r in range(nsplit):
+            folds = np.stack([split_into_folds(rng, c, k) for c in counts.T], -1)
+            A[r] = kfold_ustatistic(list(folds.astype(float)), V)  # [k][nb, 2]
+        for u in (DDIF, np.array([1.0, 0.0]), np.array([1.0, 1.0]) / np.sqrt(2.0)):
+            c = np.einsum("i,rij,j->r", u, A, u)
+            mean, var = _fold_split_moments(counts, V, k, u)
+            pull = (c.mean() - mean) / np.sqrt(var / nsplit)
+            ratio = c.var(ddof=1) / var
+            assert abs(pull) < 5.0, f"k={k}, u={u}: mean off by {pull:.1f} sigma"
+            assert abs(ratio - 1) < tol, f"k={k}, u={u}: variance ratio {ratio:.3f}"
+
     sinf = sigma(np.linalg.inv(_fisher(base["n_true"].T, base["data"])))
-    prev = None
     for k in (4, 8, 16):
-        med, rms = _ustatistic_sigma_ensemble(k, ntoy=300, seed=100 + k)
+        med = _ustatistic_sigma_median(k, ntoy=300, seed=100 + k)
         assert abs(med - sinf) < 0.02, f"k={k}: median {med} vs sigma_inf {sinf}"
-        if prev is not None:
-            assert rms < prev + 1e-9, f"k={k}: RMS {rms} grew from {prev}"
-        prev = rms
 
 
 def test_twohalf_with_bblite_inflates_tilt(tmp_path):
