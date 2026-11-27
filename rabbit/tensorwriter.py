@@ -731,6 +731,10 @@ class TensorWriter:
         if not isinstance(process, (list, tuple, np.ndarray)):
             process = [process]
 
+        # for a single process, a flat [up, down] is one asymmetric uncertainty
+        if len(process) == 1 and np.ndim(uncertainty) == 1 and len(uncertainty) == 2:
+            uncertainty = [uncertainty]
+
         if not isinstance(uncertainty, (list, tuple, np.ndarray)):
             uncertainty = [uncertainty]
 
@@ -767,7 +771,7 @@ class TensorWriter:
                         logkup_proc,
                         logkdown_proc,
                         name,
-                        process,
+                        p,
                         channel,
                         symmetrize=symmetrize,
                         add_to_data_covariance=add_to_data_covariance,
@@ -803,7 +807,7 @@ class TensorWriter:
                         logkup_proc,
                         logkdown_proc,
                         name,
-                        process,
+                        p,
                         channel,
                         symmetrize=symmetrize,
                         add_to_data_covariance=add_to_data_covariance,
