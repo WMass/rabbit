@@ -142,6 +142,13 @@ By default these nuisance parameters are multiplied to the expected events and f
 Gaussian uncertainties can also be used with `--binByBinStatType normal-additive` for an additive scaling or `--binByBinStatType normal-multiplicative` for a multiplicative scaling.
 In the case of `--binByBinStatMode full` and `--binByBinStatType gamma` no analytic solution is available and in each bin a 1D minimization is performed using Newton's method which can significantly increase the time required in the fit. 
 
+### Chi-square fits
+`--chisqFit` replaces the Poisson likelihood by a diagonal chi-square, $\sum_b (n_b - \nu_b)^2 / V_b$, and `--chisqVariance` chooses the variances $V_b$:
+- `data` (default): the data variances of the dataset fitted, i.e. those stored with the data (`TensorWriter.add_data` keeps the variances of a weighted histogram) or with a pseudodata set, or those of a toy; otherwise the data themselves (Poisson), and so the expected yields for the Asimov dataset.
+- `mc`: the MC statistical variance of the nominal templates, $\sum_p \mathrm{sumw2}_{b,p}$, for every dataset (data, Asimov, toys, pseudodata). It is a constant, like a data variance, not the variance of the templates at the fit point. As the bin-by-bin statistical uncertainties profile the same MC statistics, it requires `--noBinByBinStat` (and no `--mcStatDebias`).
+
+`--covarianceFit` instead uses the full data covariance of the input.
+
 ### Mappings
 Perform mappings on the parameters and observables (the histogram bins in the (masked) channels). 
 Baseline mappings are defined in `rabbit/mappings/` and can be called in `rabbit_fit` with the `--mapping` or `-m` option e.g. `-m Select ch0 -m Project ch1 b`. 
