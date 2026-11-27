@@ -188,17 +188,44 @@ jobs:
       # --continue-on-collection-errors because an import failure in one file
       # (e.g. a missing PyYAML on this runner) would otherwise hide every
       # other file; the error is still reported and fails the job. Every file
-      # runs even if an earlier one fails; the job fails if any did.
+      # runs even if another one fails; the job fails if any did.
+      #
+      # The files run UNIT_TEST_JOBS at a time: one after the other they took
+      # ~55 min, and every fit job waits for this one. Each process is capped
+      # at a few threads; uncapped, every TensorFlow process would start one
+      # thread per core of the shared runner host. Each file's output goes to
+      # its own log, printed in one group after all files have run, and a line
+      # per file as it ends shows progress. A file still running after
+      # UNIT_TEST_TIMEOUT is killed and counts as failed (exit 124).
       - name: run the whole test suite
+        env:
+          UNIT_TEST_JOBS: 12
+          UNIT_TEST_TIMEOUT: 30m
+          OMP_NUM_THREADS: 4
+          OPENBLAS_NUM_THREADS: 4
+          MKL_NUM_THREADS: 4
+          TF_NUM_INTRAOP_THREADS: 4
+          TF_NUM_INTEROP_THREADS: 2
         run: |
           set -o pipefail  # a collection error must survive the tee
           failed=""
           python -m pytest tests/ --collect-only -qq --continue-on-collection-errors | tee collected.txt || failed="collection"
-          for f in $(grep -o '^tests/[^:]*\.py' collected.txt | sort -u); do
+          export LOGS=$RUNNER_TEMP/unit-tests
+          rm -rf "$LOGS" && mkdir -p "$LOGS"
+          grep -o '^tests/[^:]*\.py' collected.txt | sort -u > "$LOGS/files.txt" || true
+          xargs -P "$UNIT_TEST_JOBS" -I{} bash -c '
+            f=$1; b="$LOGS/${f//\//_}"; t0=$SECONDS
+            timeout --kill-after=1m "$UNIT_TEST_TIMEOUT" python -m pytest "$f" -q --capture=sys > "$b.log" 2>&1
+            rc=$?; echo "$rc" > "$b.rc"
+            echo "$f: exit $rc after $((SECONDS - t0)) s"
+          ' _ {} < "$LOGS/files.txt" || failed="$failed xargs"
+          while read -r f; do
+            b="$LOGS/${f//\//_}"
             echo "::group::$f"
-            python -m pytest "$f" -q --capture=sys || failed="$failed $f"
+            cat "$b.log" 2>/dev/null || echo "no log: the file did not run"
             echo "::endgroup::"
-          done
+            [ "$(cat "$b.rc" 2>/dev/null)" = 0 ] || failed="$failed $f"
+          done < "$LOGS/files.txt"
           if [ -n "$failed" ]; then
             echo "failed: $failed"
             exit 1
