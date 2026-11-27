@@ -1,9 +1,10 @@
 """The postfit chi2 of a mapping whose residual covariance is exactly singular.
 
 Bins that obey an exact linear relation (two projections of one channel, ABCD
-regions) give a singular residual covariance. The solve then fails or not
-depending on rounding; expected_events falls back to the pseudo inverse.
-Duplicating a projection makes the covariance singular for any rounding.
+regions) give a singular residual covariance. A solve then failed or not
+depending on rounding; the chi2 is now taken over the rank of the covariance
+(fitter.chi2_pseudo_inverse, more in tests/test_chi2_rank.py). Duplicating a
+projection makes the covariance singular for any rounding.
 """
 
 import os
@@ -58,33 +59,36 @@ def postfit():
         yield f
 
 
-def test_singular_covariance_uses_the_pseudo_inverse(postfit):
+def test_duplicated_projection_counts_once(postfit):
     f = postfit
     single = mh.load_mapping("Project", f.indata, "ch0", "x")
     twice = mp.CompositeMapping(
         [single, mh.load_mapping("Project", f.indata, "ch0", "x")]
     )
 
-    # the plain solve cannot invert the duplicated covariance
-    with pytest.raises(tf.errors.InvalidArgumentError):
-        f.chi2(twice.compute_flat, twice._get_data, twice.ndf_reduction, profile=True)
+    # the postfit residuals of all bins lose the direction the free signal
+    # strength absorbs, and the duplicated covariance [[C, C], [C, C]] has the
+    # rank of C
+    ndf = 20 - f.nfreeparms
+    _, cov = f.residuals(twice.compute_flat, twice._get_data, profile=True)
+    lam = np.linalg.eigvalsh(cov)
+    assert np.count_nonzero(lam > 1e-10 * lam[-1]) == ndf
 
     _, (*_, chi2_single, ndf_single) = f.expected_events(single, compute_chi2=True)
     _, (*_, chi2_twice, ndf_twice) = f.expected_events(twice, compute_chi2=True)
 
-    # [r, r]^T pinv([[C, C], [C, C]]) [r, r] = r^T C^-1 r
+    # [r, r]^T pinv([[C, C], [C, C]]) [r, r] = r^T C^+ r
     np.testing.assert_allclose(chi2_twice, chi2_single, rtol=1e-8)
-    assert int(ndf_single) == 20
-    assert int(ndf_twice) == 40  # the ndf is not changed by the fallback
+    assert int(ndf_single) == ndf == 19
+    assert int(ndf_twice) == ndf  # the rank: the duplicate adds no information
 
 
-def test_pseudo_inverse_fallback_still_fails_on_a_non_finite_covariance(postfit):
-    """The fallback covers an exactly singular covariance, not a NaN one."""
-    res = tf.ones([2], dtype=postfit.indata.dtype)
-    singular = tf.ones([2, 2], dtype=postfit.indata.dtype)
-    chi2, ndf = postfit._chi2(res, singular, pseudo_inverse=True)
+def test_a_singular_but_not_a_non_finite_covariance():
+    """An exactly singular covariance is handled, a NaN one refused."""
+    res = np.ones(2)
+    chi2, ndf = fitter.chi2_pseudo_inverse(res, np.ones([2, 2]))
     np.testing.assert_allclose(chi2, 1.0)  # [1, 1] pinv([[1, 1], [1, 1]]) [1, 1]
-    assert int(ndf) == 2
-    nan = tf.constant([[1.0, float("nan")], [float("nan"), 1.0]], dtype=res.dtype)
-    with pytest.raises(tf.errors.InvalidArgumentError, match="not finite"):
-        postfit._chi2(res, nan, pseudo_inverse=True)
+    assert ndf == 1
+    nan = np.array([[1.0, np.nan], [np.nan, 1.0]])
+    with pytest.raises(ValueError, match="covariance is not finite"):
+        fitter.chi2_pseudo_inverse(res, nan)

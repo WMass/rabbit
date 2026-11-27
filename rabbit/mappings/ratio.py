@@ -177,8 +177,6 @@ class Normratio(Ratio):
     Same as Ratio but the numerator and denominator are normalized
     """
 
-    ndf_reduction = 1
-
     def init(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
