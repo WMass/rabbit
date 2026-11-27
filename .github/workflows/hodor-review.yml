@@ -1,6 +1,6 @@
 name: Hodor AI review
 
-# Automated PR code review with hodor, driving Kimi K3 on the CERN AI
+# Automated PR code review with hodor, driving MiMo-V2.6-Pro on the CERN AI
 # gateway (aigw.cern.ch). aigw is firewalled to the CERN network, so this
 # job MUST run on the repository's CERN self-hosted runners; GitHub-hosted
 # runners cannot reach the endpoint (verified: TCP connect blackholed).
@@ -85,8 +85,8 @@ jobs:
       # HODOR_MODELS_JSON patch (upstream PR mr-karan/hodor#25) +
       # models.cern.json. Pinned by commit SHA.
       HODOR_SOURCE: https://github.com/WMass/hodor
-      HODOR_COMMIT: 8bb33632a5fe059815cab669a176c40fed404a0b
-      HODOR_MODEL: ${{ vars.HODOR_LLM_MODEL || 'Kimi-K3-FLATIRON' }}
+      HODOR_COMMIT: d4dd7bf0130fcb24b17cf7858cf27374a88d167a
+      HODOR_MODEL: ${{ vars.HODOR_LLM_MODEL || 'MiMo-V2.6-Pro-MOPD-FLATIRON' }}
       LLM_API_KEY: ${{ secrets.HODOR_LLM_API_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PI_OFFLINE: "1" # never download rg/fd binaries mid-review
